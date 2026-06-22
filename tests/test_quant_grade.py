@@ -50,3 +50,7 @@ def test_vol_target_reduces_drawdown():
     vt = Q.vol_target(eq, target_vol=0.15)
     assert vt["ann_vol"] < base["ann_vol"]       # de-risked
     assert 0 < vt["avg_exposure"] <= 1.0         # never levers
+    # exposure exposed for the picks cash-sleeve + per-rebalance timeline
+    assert len(vt["exposure"]) == len(vt["equity"])
+    assert 0 < vt["exposure_latest"] <= 1.0
+    assert (vt["exposure"].dropna() <= 1.0 + 1e-9).all()

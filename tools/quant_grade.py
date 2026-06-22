@@ -111,8 +111,11 @@ def vol_target(equity: pd.Series, target_vol: float = 0.15, lookback: int = 63,
     eq = (1 + scaled).cumprod()
     eq = eq / eq.iloc[0] * float(equity.dropna().iloc[0])
     m = perf_metrics(eq)
-    m.update(avg_exposure=float(w.reindex(scaled.index).mean()), target_vol=target_vol)
+    exposure = w.reindex(scaled.index)                  # daily deployed fraction, aligned to eq
+    m.update(avg_exposure=float(exposure.mean()), target_vol=target_vol)
     m["equity"] = eq
+    m["exposure"] = exposure                            # series — for the per-rebalance timeline
+    m["exposure_latest"] = float(exposure.iloc[-1])     # today's invested fraction (rest = cash)
     return m
 
 

@@ -1,13 +1,19 @@
 """The chosen production strategy — one config (the 'ultimate' extracted from the
-32-config grid), on the survivorship-corrected universe.
+32-config grid), on the survivorship-corrected universe, shown two ways:
 
-  python build_strategy_report.py            # writes local/strategy.html + docs/strategy.html
+  • Original     — the raw config, full-invested.
+  • Risk-conscious — the SAME selection, volatility-targeted (de-risk only).
+
+The two are presented side by side (picks, equity, performance, scorecard, yearly
+and every rebalance) as a head-to-head: the risk-conscious version is a valid
+alternative and gets the full analysis the original gets.
+
+  python build_strategy_report.py            # writes local/strategy.html
   python build_strategy_report.py --open
 
 Unlike the momentum *lab* (which renders the whole grid), this page commits to a
-single config and shows it cleanly: which strategy + why, current picks, equity vs
-benchmarks, train/validation/full performance, the PnL-colored monthly timeline,
-and the (now small) honest caveats.
+single config + its risk-conscious variation. The research lab (how the config was
+chosen) is appended on private/live builds only.
 """
 import argparse
 import webbrowser
@@ -20,7 +26,7 @@ import plotly.graph_objects as go
 from tools.report_html import pct as _pct, card as _card, page, fig_html
 from tools import theme, significance as sig, quant_grade as qg
 from tools.momentum import (run_momentum, winsorize_prices, to_xetra_calendar,
-                            precompute_eligibility)
+                            precompute_eligibility, benchmark_curves, equal_weight_curve)
 from tools.universe_pit import PITUniverse
 from tools.universe_assemble import delisting_map
 from tools.momentum_grid import MomentumConfig, _stats_slice, run_grid, ALL_CONFIGS
@@ -29,8 +35,8 @@ from tools.portfolio_analytics import build_roi_timeseries
 from tools.data_buffer import cached_price_history
 from build_momentum_report import (
     PRICES_CSV, META_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
-    FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG,
-    _slip, _broker, _disp, _pnl_color, sec_holdings, sec_curve,
+    FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG, K,
+    _slip, _broker, _disp, _name, _pnl_color, _equity_window,
     sec_grid, sec_feasibility, sec_timelines, sec_survivorship, sec_method,
 )
 
@@ -50,6 +56,11 @@ STRATEGY = MomentumConfig(vol_adjust=True, slots=15, freq="Q", lazy=True)
 # profile while lifting the Sharpe — the prudent way to actually run momentum.
 RISK_TARGET_VOL = 0.15
 
+# Head-to-head colors — gold = original (raw), teal = risk-conscious (vol-targeted).
+C_RAW = "#dcdcaa"
+C_RC = "#4ec9b0"
+_GRADE_COLOR = {"A": "#46c84e", "B": "#9acd32", "C": "#d7ba7d", "D": "#e8a04e", "F": "#ef4444"}
+
 
 def _desc(cfg: MomentumConfig) -> str:
     parts = []
@@ -64,6 +75,45 @@ def _desc(cfg: MomentumConfig) -> str:
     if cfg.lazy:
         parts.append("lazy-rebalanced")
     return ", ".join(parts)
+
+
+def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
+                   quant: dict, capital: float, *, dsr: float, mc_p: float, overlap: float,
+                   train_end=TRAIN_END, val_end=VAL_END) -> list[dict]:
+    """Two parallel 'variant bundles' of identical shape so every section can render
+    either: the raw strategy and its volatility-targeted (risk-conscious) twin.
+
+    Selection is IDENTICAL across both (same holdings_log / trades) — vol-targeting
+    scales the whole book, it does not change which names are picked. So the rc bundle
+    re-derives its windowed stats / quant metrics / grade from the vol-targeted equity
+    curve, but shares the picks and the per-name trade record."""
+    tr = res["runs"][1.0]["trades"]
+    raw = dict(
+        label=f"Original (raw, {STRATEGY.code})", short="Original", key="raw", color=C_RAW,
+        equity=res["runs"][1.0]["equity"], holdings_log=res["holdings_log"], trades=tr,
+        train=train, val=val, test=test, full=res["runs"][1.0]["stats"],
+        perf=quant["perf"], bench=quant["bench"], roll=quant["roll"], grade=quant["grade"],
+        exposure=None, exposure_latest=1.0)
+
+    rc_eq = vt["equity"]
+    te, ve = pd.Timestamp(train_end), pd.Timestamp(val_end)
+    one = pd.Timedelta(days=1)
+    rc_test = _stats_slice(rc_eq, tr, ve + one, rc_eq.index[-1], capital)
+    rc = dict(
+        label=f"Risk-conscious (vol-target {RISK_TARGET_VOL:.0%})", short="Risk-conscious",
+        key="rc", color=C_RC,
+        equity=rc_eq, holdings_log=res["holdings_log"], trades=tr,
+        train=_stats_slice(rc_eq, tr, rc_eq.index[0], te, capital),
+        val=_stats_slice(rc_eq, tr, te + one, ve, capital),
+        test=rc_test,
+        full=_stats_slice(rc_eq, tr, rc_eq.index[0], rc_eq.index[-1], capital),
+        perf=vt,
+        bench=qg.vs_benchmark(rc_eq, spx) if spx is not None else {},
+        roll=qg.rolling_sharpe(rc_eq),
+        grade=qg.grade(rc_test["sharpe"], dsr, mc_p, overlap),
+        exposure=vt.get("exposure"),
+        exposure_latest=vt.get("exposure_latest", vt.get("avg_exposure", 1.0)))
+    return [raw, rc]
 
 
 def gather(force: bool = False, refresh: bool | None = None) -> dict:
@@ -150,6 +200,10 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                  isin_overlap=overlap,
                  vol_target=qg.vol_target(eq, target_vol=RISK_TARGET_VOL))
 
+    # ── The two variant bundles (original + risk-conscious), full parity ──
+    variants = build_variants(res, quant["vol_target"], spx, train, val, test, quant, CAPITAL,
+                              dsr=dsr["dsr"], mc_p=mc["p_sharpe"], overlap=overlap)
+
     # ── Your real portfolio's ROI (cumulative %), for the head-to-head ──
     portfolio_roi = None
     pf_csv = ROOT / "input" / "portfolio.csv"
@@ -164,12 +218,19 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
 
     n_countries = len({m.get("country") for m in meta.values()} - {"—", None})
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
-                portfolio_roi=portfolio_roi,
+                portfolio_roi=portfolio_roi, variants=variants,
                 strategy=STRATEGY, train=train, val=val, test=test, graveyard_hits=hits,
                 grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
                 n_countries=n_countries,
                 n_live=n_live, bounds=bounds,
                 significance=dict(mc=mc, dsr=dsr, ci=ci, ppy=ppy))
+
+
+# ── Shared layout helper ────────────────────────────────────────────────────────
+
+def _cmp(left: str, right: str) -> str:
+    """Two-column side-by-side block (Original | Risk-conscious); collapses on mobile."""
+    return f"<div class='cmp'><div>{left}</div><div>{right}</div></div>"
 
 
 def sec_intro(d: dict) -> str:
@@ -188,33 +249,255 @@ def sec_intro(d: dict) -> str:
             "executable. Not advice.</div>")
 
 
-def sec_perf(d: dict, public: bool) -> str:
-    full = d["res"]["runs"][1.0]["stats"]
-    test = d["test"]
-    out = ["<h2>Performance</h2>",
-           "<p class='dim'>Train = 2018–21 (used to pick the config), validation = 2022–23 "
-           "(used to compare configs), <b>test = 2024→ (held out — never touched the "
-           "choice)</b>. The <b>test</b> column is the only truly out-of-sample number; "
-           "trust it over the eye-popping full-window total.</p>"]
+def sec_summary(d: dict) -> str:
+    """Both versions summarised on top, side by side, before the detailed compare."""
+    raw, rc = d["variants"]
+
+    def panel(v, blurb):
+        cards = "".join([
+            _card("Test return", _pct(v["test"]["net_return"] * 100)),
+            _card("Test Sharpe", f"{v['test']['sharpe']:.2f}"),
+            _card("Max DD", _pct(v["perf"]["max_dd"] * 100)),
+            _card("Grade", v["grade"]["letter"]),
+        ])
+        return (f"<div class='note' style='border-left-color:{v['color']}'>"
+                f"<b style='color:{v['color']}'>{v['label']}.</b> {blurb}"
+                f"<div class='cards' style='margin-top:8px'>{cards}</div></div>")
+
+    raw_blurb = ("The chosen config — buys the 12-1 winners and holds them full-invested. The "
+                 f"highest raw return, but the −{abs(raw['perf']['max_dd']) * 100:.0f}% drawdown and "
+                 f"~{raw['perf']['ann_vol'] * 100:.0f}% vol are the price.")
+    rc_blurb = (f"The same picks, but the book is volatility-targeted to {RISK_TARGET_VOL:.0%}: it "
+                "scales exposure toward that vol using the prior day’s realised vol (no look-ahead, "
+                "no leverage — it only ever de-risks) and parks the rest in cash. When momentum gets "
+                "turbulent the book shrinks automatically. This is how you’d actually run momentum.")
+    return ("<h2>Two ways to run it — side by side</h2>"
+            "<p class='dim'>This page compares the <b>original</b> strategy (raw, full-invested) "
+            "against a <b>risk-conscious</b> variation (same selection, volatility-targeted) as a "
+            "valid alternative — picks, equity, performance, scorecard, yearly P&amp;L and every "
+            "rebalance, head to head.</p>"
+            + _cmp(panel(raw, raw_blurb), panel(rc, rc_blurb)))
+
+
+# ── Picks (side by side) ────────────────────────────────────────────────────────
+
+def _picks_table(d: dict, v: dict) -> str:
+    log = v["holdings_log"]
+    cur = next((h for h in reversed(log) if h["picks"]), None)
+    head = f"<h3 style='color:{v['color']}'>{v['short']}</h3>"
+    if cur is None:
+        return head + "<p class='dim'>No eligible names at the latest rebalance.</p>"
+    picks = cur["picks"]
+    n = len(picks)
+    exp = v["exposure_latest"] if v["exposure_latest"] is not None else 1.0
+    invested = 100.0 * exp
+    w = invested / n if n else 0.0
+    rows = []
+    for t in picks:
+        m = d["meta"].get(t, {})
+        home = str(m.get("home") or t).split(".")[0]
+        isin = m.get("isin") if pd.notna(m.get("isin")) else ""
+        sc = cur["scores"].get(t, float("nan"))
+        rows.append(
+            f"<tr><td class='mono'>{home}</td><td>{_name(m, t)}</td>"
+            f"<td class='dim mono' style='font-size:0.72rem'>{isin}</td>"
+            f"<td>{m.get('country', '—')}</td>"
+            f"<td class='num mono'>{sc * 100:+.1f}%</td>"
+            f"<td class='num mono'>{w:.1f}%</td></tr>")
+    cash = 100.0 - invested
+    if v["key"] == "rc" and cash > 0.05:
+        rows.append(
+            f"<tr><td class='mono dim'>CASH</td><td class='dim'>de-risked sleeve</td>"
+            f"<td></td><td></td><td class='num dim'>—</td>"
+            f"<td class='num mono'>{cash:.1f}%</td></tr>")
+    if v["key"] == "rc":
+        sub = (f"<p class='dim'>top-{n} equal-weight, scaled to <b>{invested:.0f}% invested</b> "
+               f"({cash:.0f}% cash) at the current realised vol · {cur['date'].date()}</p>")
+    else:
+        sub = f"<p class='dim'>top-{n} equal-weight, full-invested · {cur['date'].date()}</p>"
+    return (head + sub +
+            "<table><tr><th>Ticker</th><th>Name</th><th>ISIN</th><th>Country</th>"
+            "<th class='num'>12-1 mom</th><th class='num'>Weight</th></tr>" + "".join(rows) + "</table>")
+
+
+def sec_picks_compare(d: dict) -> str:
+    raw, rc = d["variants"]
+    cur = next((h for h in reversed(raw["holdings_log"]) if h["picks"]), None)
+    n = len(cur["picks"]) if cur else 0
+    return ("<h2>Current top picks</h2>"
+            f"<p class='dim'>Identical selection — both versions hold the same equal-weight top-{n} "
+            "ranked by 12-1 momentum. The risk-conscious version simply scales the whole book toward "
+            "its vol target, parking the remainder in cash; the names are the same. Each leg shows "
+            "its home ticker, name and ISIN — search the ISIN or name in Trade Republic to trade "
+            "it.</p>"
+            + _cmp(_picks_table(d, raw), _picks_table(d, rc)))
+
+
+# ── Equity (one overlaid chart) ─────────────────────────────────────────────────
+
+def sec_curve_compare(d: dict) -> str:
+    res = d["res"]
+    window = _equity_window(res)
+    fig = go.Figure()
+    for v in d["variants"]:
+        eq = v["equity"].reindex(window).ffill()
+        fig.add_trace(go.Scatter(x=eq.index, y=eq / d["capital"] * 100.0, name=v["short"],
+                                 line=dict(color=v["color"], width=2.4)))
+    first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
+    if first_picks:
+        ew = equal_weight_curve(d["prices"], first_picks, window, d["capital"])
+        fig.add_trace(go.Scatter(x=ew.index, y=ew / d["capital"] * 100.0,
+                                 name="Equal-weight (initial picks, buy-hold)",
+                                 line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
+    for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():
+        fig.add_trace(go.Scatter(x=curve.index, y=curve / d["capital"] * 100.0,
+                                 name=name, line=dict(width=1.4)))
+    fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
+    fig.update_layout(height=480, yaxis_title="Index (start = 100)",
+                      hovermode="x unified", margin=dict(t=20))
+    return ("<h2>Walk-forward equity vs benchmarks</h2>"
+            "<p class='dim'>Both strategies since the first rebalance with enough history, vs a "
+            "buy-hold equal-weight basket of today's top picks (survivorship-honest baseline) and "
+            "the MSCI World / S&amp;P 500. "
+            f"<span style='color:{C_RAW}'>Gold</span> = original (raw), "
+            f"<span style='color:{C_RC}'>teal</span> = risk-conscious (vol-targeted). The teal line "
+            "rides lower in calm rallies (it holds cash) but falls far less in the drawdowns.</p>"
+            f"<div class='chart'>{fig_html(fig)}</div>")
+
+
+# ── Performance (merged compare table) ──────────────────────────────────────────
+
+def _perf_cells(s: dict) -> str:
+    return (f"<td class='num'>{_pct(s['net_return'] * 100)}</td>"
+            f"<td class='num mono'>{s['sharpe']:.2f}</td>"
+            f"<td class='num'>{_pct(s['max_drawdown'] * 100)}</td>")
+
+
+def sec_perf_compare(d: dict, public: bool) -> str:
+    raw, rc = d["variants"]
     cards = [
-        _card("Test net return", _pct(test["net_return"] * 100)),
-        _card("Test Sharpe", f"{test['sharpe']:.2f}"),
-        _card("Test max DD", _pct(test["max_drawdown"] * 100)),
-        _card("Full net return", _pct(full["net_return"] * 100)),
+        _card("Test return — orig", _pct(raw["test"]["net_return"] * 100)),
+        _card("Test return — risk-con", _pct(rc["test"]["net_return"] * 100)),
+        _card("Max DD — orig", _pct(raw["perf"]["max_dd"] * 100)),
+        _card("Max DD — risk-con", _pct(rc["perf"]["max_dd"] * 100)),
     ]
     if not public:
-        cards.append(_card("Net P&L", f"€{full['net_return'] * d['capital']:+,.0f}"))
-    out.append(f'<div class="cards">{"".join(cards)}</div>')
+        cards.append(_card("Net P&L — orig", f"€{raw['full']['net_return'] * d['capital']:+,.0f}"))
+        cards.append(_card("Net P&L — risk-con", f"€{rc['full']['net_return'] * d['capital']:+,.0f}"))
+    grp = ("<tr><th rowspan='2'>Window</th>"
+           f"<th class='num' colspan='3' style='text-align:center;color:{C_RAW}'>Original</th>"
+           f"<th class='num' colspan='3' style='text-align:center;color:{C_RC}'>Risk-conscious</th></tr>"
+           "<tr><th class='num'>Ret</th><th class='num'>Sharpe</th><th class='num'>Max DD</th>"
+           "<th class='num'>Ret</th><th class='num'>Sharpe</th><th class='num'>Max DD</th></tr>")
     rows = "".join(
-        f"<tr><td>{name}</td><td class='num'>{_pct(s['net_return'] * 100)}</td>"
-        f"<td class='num mono'>{s['sharpe']:.2f}</td>"
-        f"<td class='num'>{_pct(s['max_drawdown'] * 100)}</td></tr>"
-        for name, s in (("Train 2018–21", d["train"]), ("Validation 2022–23", d["val"]),
-                        ("Test 2024→ (held out)", test), ("Full 2018→", full)))
-    out.append("<table><tr><th>Window</th><th class='num'>Net return</th>"
-               "<th class='num'>Sharpe</th><th class='num'>Max DD</th></tr>" + rows + "</table>")
-    return "".join(out)
+        f"<tr><td>{label}</td>{_perf_cells(raw[k])}{_perf_cells(rc[k])}</tr>"
+        for label, k in (("Train 2018–21", "train"), ("Validation 2022–23", "val"),
+                         ("Test 2024→ (held out)", "test"), ("Full 2018→", "full")))
+    return ("<h2>Performance</h2>"
+            "<p class='dim'>Train = 2018–21 (used to pick the config), validation = 2022–23 "
+            "(used to compare configs), <b>test = 2024→ (held out — never touched the choice)</b>. "
+            "The test column is the only truly out-of-sample number; trust it over the eye-popping "
+            "full-window total. Both versions share the same selection — the risk-conscious curve is "
+            f"that selection scaled to a {RISK_TARGET_VOL:.0%} vol target.</p>"
+            f"<div class='cards'>{''.join(cards)}</div>"
+            f"<table>{grp}{rows}</table>")
 
+
+# ── Quant scorecard & grade (merged compare) ────────────────────────────────────
+
+def _grade_card(v: dict) -> str:
+    g = v["grade"]
+    color = _GRADE_COLOR[g["letter"]]
+    return (f"<div class='card'><div class='k'>{v['short']} grade</div>"
+            f"<div class='v' style='color:{color};font-size:2rem'>{g['letter']}</div></div>")
+
+
+def sec_grade_compare(d: dict, public: bool) -> str:
+    raw, rc = d["variants"]
+    rp, rcp = raw["perf"], rc["perf"]
+    rb, rcb = raw["bench"] or {}, rc["bench"] or {}
+    rr, rcr = raw["roll"] or {}, rc["roll"] or {}
+    tm = d["quant"]["trades"]                       # trade quality = selection (identical for both)
+
+    def mrow(k, a, b):
+        return (f"<tr><td>{k}</td><td class='num mono'>{a}</td><td class='num mono'>{b}</td></tr>")
+
+    hdr = ("<tr><th>Metric</th>"
+           f"<th class='num' style='color:{C_RAW}'>Original</th>"
+           f"<th class='num' style='color:{C_RC}'>Risk-conscious</th></tr>")
+    perf_rows = "".join([
+        mrow("Sharpe (full, daily)", f"{rp['sharpe']:.2f}", f"{rcp['sharpe']:.2f}"),
+        mrow("Sortino", f"{rp['sortino']:.2f}", f"{rcp['sortino']:.2f}"),
+        mrow("Calmar (CAGR/maxDD)", f"{rp['calmar']:.2f}", f"{rcp['calmar']:.2f}"),
+        mrow("Omega", f"{rp['omega']:.2f}", f"{rcp['omega']:.2f}"),
+        mrow("Ann. return", _pct(rp['ann_return'] * 100), _pct(rcp['ann_return'] * 100)),
+        mrow("Ann. vol", _pct(rp['ann_vol'] * 100), _pct(rcp['ann_vol'] * 100)),
+        mrow("Max drawdown", _pct(rp['max_dd'] * 100), _pct(rcp['max_dd'] * 100)),
+        mrow("Underwater (days)", f"{rp['dd_days']}", f"{rcp['dd_days']}"),
+        mrow("Skew / kurtosis", f"{rp['skew']:.2f} / {rp['kurtosis']:.2f}",
+             f"{rcp['skew']:.2f} / {rcp['kurtosis']:.2f}"),
+        mrow("VaR / CVaR 95 (daily)", f"{rp['var95'] * 100:.1f}% / {rp['cvar95'] * 100:.1f}%",
+             f"{rcp['var95'] * 100:.1f}% / {rcp['cvar95'] * 100:.1f}%"),
+        mrow("Avg exposure", "100%", f"{rcp.get('avg_exposure', 1.0) * 100:.0f}%"),
+    ])
+    bench_rows = "".join([
+        mrow("Beta vs S&amp;P", f"{rb.get('beta', float('nan')):.2f}", f"{rcb.get('beta', float('nan')):.2f}"),
+        mrow("Alpha (annual)", _pct(rb.get('alpha_ann', 0) * 100), _pct(rcb.get('alpha_ann', 0) * 100)),
+        mrow("Correlation", f"{rb.get('corr', float('nan')):.2f}", f"{rcb.get('corr', float('nan')):.2f}"),
+        mrow("Information ratio", f"{rb.get('info_ratio', float('nan')):.2f}", f"{rcb.get('info_ratio', float('nan')):.2f}"),
+        mrow("Tracking error", _pct(rb.get('tracking_error', 0) * 100), _pct(rcb.get('tracking_error', 0) * 100)),
+        mrow("Up / down capture", f"{rb.get('up_capture', float('nan')):.2f} / {rb.get('down_capture', float('nan')):.2f}",
+             f"{rcb.get('up_capture', float('nan')):.2f} / {rcb.get('down_capture', float('nan')):.2f}"),
+    ]) if rb else ""
+    roll_rows = "".join([
+        mrow("12m Sharpe — median", f"{rr.get('roll_sharpe_med', float('nan')):.2f}",
+             f"{rcr.get('roll_sharpe_med', float('nan')):.2f}"),
+        mrow("12m Sharpe — worst", f"{rr.get('roll_sharpe_min', float('nan')):.2f}",
+             f"{rcr.get('roll_sharpe_min', float('nan')):.2f}"),
+        mrow("12m windows positive", _pct(rr.get('roll_sharpe_pos_frac', 0) * 100),
+             _pct(rcr.get('roll_sharpe_pos_frac', 0) * 100)),
+    ]) if rr else ""
+    trade_rows = "".join([
+        f"<tr><td>Hit rate</td><td class='num mono'>{_pct(tm['hit_rate'] * 100)}</td></tr>",
+        f"<tr><td>Profit factor</td><td class='num mono'>{tm['profit_factor']:.2f}</td></tr>",
+        f"<tr><td>Payoff (avgW/avgL)</td><td class='num mono'>{tm['payoff']:.2f}</td></tr>",
+        f"<tr><td>Trades / year</td><td class='num mono'>{tm['trades_per_year']:.0f}</td></tr>",
+    ]) if tm else ""
+
+    g = raw["grade"]
+    score_cards = "".join([
+        _grade_card(raw), _grade_card(rc),
+        _card("Score — orig", f"{raw['grade']['score']:.0f}"),
+        _card("Score — risk-con", f"{rc['grade']['score']:.0f}"),
+    ])
+    flags = "".join(f"<li>{f}</li>" for f in g["flags"])
+    return (
+        "<h2>Quant scorecard &amp; honest grade</h2>"
+        f"<div class='cards'>{score_cards}</div>"
+        "<p class='dim'>Graded like a risk committee: standard ratios, benchmark attribution, "
+        "trade quality and stability — then the headline is <b>docked for what it doesn't "
+        "correct</b>. The risk-conscious version earns the same (or better) grade by trading some "
+        "raw return for a much smaller drawdown and a higher risk-adjusted Sharpe; the bias "
+        "deductions below apply to the shared selection, so they hit both equally.</p>"
+        "<div style='display:flex;flex-wrap:wrap;gap:1.5rem'>"
+        f"<table>{hdr}{perf_rows}</table>"
+        f"<table>{hdr}{bench_rows}</table>"
+        f"<table>{hdr}{roll_rows}</table>"
+        "<table><tr><th>Trade quality</th><th class='num'>Selection (both)</th></tr>"
+        f"{trade_rows}</table>"
+        "</div>"
+        "<div class='note warn'><b>Bias audit — why this is <i>not</i> clean alpha.</b> "
+        f"Is it real? Partly. Momentum-<i>selection</i> beats a random book on the same universe "
+        f"(p={d['significance']['mc']['p_sharpe']:.3f}, deflated-Sharpe "
+        f"{d['significance']['dsr']['dsr']:.0%}) — a genuine, modest tilt. But the <i>level</i> is "
+        f"inflated, and the honest verdict is a <b>{raw['grade']['letter']}</b> (original) / "
+        f"<b>{rc['grade']['letter']}</b> (risk-conscious):<ul>{flags}</ul>"
+        "Bottom line: a real but small momentum tilt riding survivorship + a small-cap regime — "
+        "a known, decaying premium, not novel alpha. Vol-targeting improves how you <i>hold</i> it, "
+        "not what it <i>is</i>. If it looks too easy, it is.</div>")
+
+
+# ── Yearly P&L (merged compare table) ───────────────────────────────────────────
 
 def _yearly_returns(series: pd.Series) -> pd.Series:
     """Calendar-year returns keyed by year int: each year from the prior year's last
@@ -227,78 +510,113 @@ def _yearly_returns(series: pd.Series) -> pd.Series:
     return (last / prev - 1.0).dropna()
 
 
-def sec_yearly(d: dict, public: bool) -> str:
-    eq = d["res"]["runs"][1.0]["equity"].dropna()
-    if len(eq) < 2:
-        return ""
-    sret = _yearly_returns(eq)
-    bench = d["benchmarks"]
-    spx = bench["S&P 500"] if "S&P 500" in bench.columns else None
-    bret = _yearly_returns(spx.reindex(eq.index).ffill()) if spx is not None else pd.Series(dtype=float)
-    # € P&L per year — the actual paper-account change (private builds only)
+def _yearly_pnl(series: pd.Series) -> pd.Series:
+    eq = series.dropna()
     last = eq.groupby(eq.index.year).last()
     prev = last.shift(1)
-    prev.iloc[0] = eq.iloc[0]
-    pnl = (last - prev).dropna()
-
-    rows = []
-    for y, r in sret.items():
-        eur = f"<td class='num mono'>€{pnl.get(y, 0.0):+,.0f}</td>" if not public else ""
-        b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>"
-             if y in bret.index else "<td class='num dim'>—</td>")
-        rows.append(f"<tr><td class='mono'>{y}</td>"
-                    f"<td class='num'>{_pct(r * 100)}</td>{eur}{b}</tr>")
-    eur_hdr = "<th class='num'>P&amp;L (€10k)</th>" if not public else ""
-    pnl_note = ("the €10k paper account's actual P&amp;L, and " if not public else "and ")
-    return ("<h2>Yearly P&amp;L</h2>"
-            "<p class='dim'>Calendar-year net return of the strategy (first year from "
-            f"inception), {pnl_note}the S&amp;P 500 over the same year. 2018 and 2026 are "
-            "part-years.</p>"
-            "<table><tr><th>Year</th><th class='num'>Strategy</th>" + eur_hdr +
-            "<th class='num'>S&amp;P 500</th></tr>" + "".join(rows) + "</table>")
+    if len(prev):
+        prev.iloc[0] = eq.iloc[0]
+    return (last - prev).dropna()
 
 
-def sec_risk_conscious(d: dict, public: bool) -> str:
-    """The risk-conscious variant: the same picks, volatility-targeted so the book de-risks
-    into turbulence. Cuts drawdown and lifts the Sharpe vs the raw strategy."""
-    vt = d.get("quant", {}).get("vol_target")
-    base = d.get("quant", {}).get("perf")
-    if not vt or not base or "equity" not in vt:
+def sec_yearly_compare(d: dict, public: bool) -> str:
+    raw, rc = d["variants"]
+    req, ceq = raw["equity"].dropna(), rc["equity"].dropna()
+    if len(req) < 2:
         return ""
-    be, ve = d["res"]["runs"][1.0]["equity"], vt["equity"]
-    broi = (be / be.iloc[0] - 1.0) * 100.0
-    vroi = (ve / ve.iloc[0] - 1.0) * 100.0
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=broi.index, y=broi.values, name="Raw strategy (A·"+"··EF)",
-                             line=dict(color="#808080", width=1.6)))
-    fig.add_trace(go.Scatter(x=vroi.index, y=vroi.values, name="Risk-conscious (vol-targeted)",
-                             line=dict(color="#4ec9b0", width=2.4)))
-    fig.add_hline(y=0, line_dash="dash", line_color=theme.FG_DIM)
-    fig.update_layout(height=420, yaxis=dict(title="Cumulative ROI (%)", ticksuffix="%"),
-                      hovermode="x unified", margin=dict(t=20))
+    rret, cret = _yearly_returns(req), _yearly_returns(ceq)
+    spx = d["benchmarks"]["S&P 500"] if "S&P 500" in d["benchmarks"].columns else None
+    bret = _yearly_returns(spx.reindex(req.index).ffill()) if spx is not None else pd.Series(dtype=float)
+    rpnl, cpnl = _yearly_pnl(req), _yearly_pnl(ceq)
 
-    def r(label, m, exp=None):
-        e = f"<td class='num mono'>{exp*100:.0f}%</td>" if exp is not None else "<td class='num dim'>100%</td>"
-        return (f"<tr><td>{label}</td><td class='num'>{_pct(m['ann_return']*100)}</td>"
-                f"<td class='num mono'>{m['ann_vol']*100:.0f}%</td><td class='num mono'>{m['sharpe']:.2f}</td>"
-                f"<td class='num'>{_pct(m['max_dd']*100)}</td>{e}</tr>")
-    return (
-        "<h2>Risk-conscious version</h2>"
-        f"<p class='dim'>Same momentum picks, but the book is <b>volatility-targeted to "
-        f"{RISK_TARGET_VOL:.0%}</b>: each day it scales exposure toward that vol using the prior "
-        "day's realised vol (no look-ahead, no leverage — it only ever de-risks) and parks the rest "
-        "in cash. When momentum gets turbulent the book automatically shrinks. The raw strategy's "
-        "−44% drawdown is the price of its raw return; this is how you'd actually run it.</p>"
-        f"<div class='chart'>{fig_html(fig)}</div>"
-        "<table><tr><th>Version</th><th class='num'>Ann. return</th><th class='num'>Vol</th>"
-        "<th class='num'>Sharpe</th><th class='num'>Max DD</th><th class='num'>Avg exposure</th></tr>"
-        f"{r('Raw (full-invested)', base)}{r('Risk-conscious', vt, vt['avg_exposure'])}</table>"
-        f"<p class='dim'>Vol-targeting cuts the drawdown from <b>{_pct(base['max_dd']*100)}</b> to "
-        f"<b>{_pct(vt['max_dd']*100)}</b> and lifts the Sharpe from <b>{base['sharpe']:.2f}</b> to "
-        f"<b>{vt['sharpe']:.2f}</b>, at ~<b>{vt['avg_exposure']*100:.0f}%</b> average exposure "
-        "(the rest in cash) — lower absolute return, far better risk-adjusted. Same survivorship "
-        "caveats apply to the underlying signal.</p>")
+    years = sorted(set(rret.index) | set(cret.index))
+    rows = []
+    for y in years:
+        def cell(sr):
+            return (f"<td class='num'>{_pct(sr[y] * 100)}</td>" if y in sr.index
+                    else "<td class='num dim'>—</td>")
+        eur = ""
+        if not public:
+            eur = (f"<td class='num mono'>€{rpnl.get(y, 0.0):+,.0f}</td>"
+                   f"<td class='num mono'>€{cpnl.get(y, 0.0):+,.0f}</td>")
+        b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>" if y in bret.index
+             else "<td class='num dim'>—</td>")
+        rows.append(f"<tr><td class='mono'>{y}</td>{cell(rret)}{cell(cret)}{eur}{b}</tr>")
+    eur_hdr = ("<th class='num'>P&amp;L orig (€10k)</th><th class='num'>P&amp;L risk-con</th>"
+               if not public else "")
+    pnl_note = ("each version's actual P&amp;L on the €10k paper account, and " if not public else "and ")
+    return ("<h2>Yearly P&amp;L</h2>"
+            "<p class='dim'>Calendar-year net return of each version (first year from inception), "
+            f"{pnl_note}the S&amp;P 500 over the same year. 2018 and 2026 are part-years.</p>"
+            "<table><tr><th>Year</th>"
+            f"<th class='num' style='color:{C_RAW}'>Original</th>"
+            f"<th class='num' style='color:{C_RC}'>Risk-conscious</th>"
+            f"{eur_hdr}<th class='num'>S&amp;P 500</th></tr>" + "".join(rows) + "</table>")
 
+
+# ── Every rebalance, colored (two columns) ──────────────────────────────────────
+
+def _window_ret(eq: pd.Series, d0, d1) -> float:
+    eq = eq.dropna()
+    if eq.empty:
+        return 0.0
+    try:
+        a = eq.asof(pd.Timestamp(d0))
+        b = eq.asof(pd.Timestamp(d1)) if d1 is not None else eq.iloc[-1]
+        if pd.notna(a) and pd.notna(b) and a != 0:
+            return float(b / a - 1.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _window_exposure(exp, d0, d1) -> float:
+    if exp is None or getattr(exp, "empty", True):
+        return 1.0
+    lo = pd.Timestamp(d0)
+    s = exp.loc[exp.index >= lo] if d1 is None else exp.loc[(exp.index >= lo) & (exp.index <= pd.Timestamp(d1))]
+    return float(s.mean()) if len(s) else 1.0
+
+
+def _timeline_col(d: dict, v: dict) -> str:
+    rc = v["key"] == "rc"
+    eq, exp = v["equity"], v["exposure"]
+    lines = [f"<h3 style='color:{v['color']}'>{v['short']}</h3>"]
+    for h in v["holdings_log"]:
+        dead = h.get("dead", set())
+        spans = " ".join(
+            f"<span style='color:{_pnl_color(h['ret'].get(t, 0.0), t in dead)}' "
+            f"title='{t} {h['ret'].get(t, 0.0):+.0%}'>{_disp(d['meta'], t)}</span>"
+            for t in h["picks"]) or "<span class='dim'>cash</span>"
+        if rc:
+            wret = _window_ret(eq, h["date"], h.get("next"))
+            badge = _window_exposure(exp, h["date"], h.get("next"))
+            head = (f"<span class='mono dim'>{h['date'].date()}</span> "
+                    f"<b style='color:{_pnl_color(wret, False)}'>{wret:+.1%}</b> "
+                    f"<span class='dim mono' title='avg exposure this period'>@{badge * 100:.0f}%</span> ")
+        else:
+            rv = [x for x in h["ret"].values() if pd.notna(x)]
+            mret = sum(rv) / len(rv) if rv else 0.0
+            head = (f"<span class='mono dim'>{h['date'].date()}</span> "
+                    f"<b style='color:{_pnl_color(mret, False)}'>{mret:+.1%}</b> ")
+        lines.append(f"<div>{head}{spans}</div>")
+    return f"<div style='font-size:0.78rem;line-height:1.7'>{''.join(lines)}</div>"
+
+
+def sec_timeline_compare(d: dict) -> str:
+    raw, rc = d["variants"]
+    return ("<h2>Every rebalance, colored by outcome</h2>"
+            "<p class='dim'>Each line is one rebalance’s picks (identical for both versions), colored "
+            "by that holding period’s return — <span style='color:#0a6b00'>■</span> ≥+20% · "
+            "<span style='color:#46c84e'>■</span> up · <span style='color:#ef4444'>■</span> down · "
+            "<span style='color:#7a0000'>■</span> ≤−20% · <span style='color:#000'>■</span> "
+            "defaulted (delisted/died). Hover for the %. The risk-conscious column shows each period’s "
+            "book return after vol-scaling and its average exposure (<span class='mono'>@x%</span> "
+            "invested).</p>"
+            + _cmp(_timeline_col(d, raw), _timeline_col(d, rc)))
+
+
+# ── Shared sections (both versions) ─────────────────────────────────────────────
 
 def sec_vs_portfolio(d: dict, public: bool) -> str:
     """Head-to-head: your real Trade Republic portfolio vs the momentum strategy over the
@@ -326,10 +644,10 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
     fig.add_trace(go.Scatter(x=prw.index, y=prw.values, name="Your portfolio (real)",
                              line=dict(color="#ffffff", width=2.6)))
     fig.add_trace(go.Scatter(x=strat.index, y=strat.values, name="Momentum — raw",
-                             line=dict(color="#dcdcaa", width=1.8)))
+                             line=dict(color=C_RAW, width=1.8)))
     if rc is not None:
         fig.add_trace(go.Scatter(x=rc.index, y=rc.values, name="Momentum — risk-conscious",
-                                 line=dict(color="#4ec9b0", width=2.4)))
+                                 line=dict(color=C_RC, width=2.4)))
     fig.add_hline(y=0, line_dash="dash", line_color=theme.FG_DIM)
     fig.update_layout(height=440, yaxis=dict(title="Cumulative ROI (%)", ticksuffix="%"),
                       hovermode="x unified", margin=dict(t=20))
@@ -353,8 +671,8 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
         "<h2>You vs the strategy</h2>"
         f"<p class='dim'>Same window — since your first trade ({start.date()}, ~{yrs:.1f}y). "
         "<span style='color:#fff'>White</span> = your real book; "
-        "<span style='color:#dcdcaa'>gold</span> = the raw momentum strategy; "
-        "<span style='color:#4ec9b0'>teal</span> = the risk-conscious (vol-targeted) version — all "
+        f"<span style='color:{C_RAW}'>gold</span> = the raw momentum strategy; "
+        f"<span style='color:{C_RC}'>teal</span> = the risk-conscious (vol-targeted) version — all "
         "hypothetical, lump-sum. Apples-to-pears (your book is cash-flow-timed), and the strategies "
         "carry every caveat below — survivorship especially — so read the gap as indicative.</p>"
         f"<div class='chart'>{fig_html(fig)}</div>"
@@ -364,63 +682,6 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
         f"{'ahead of' if lead >= 0 else 'behind'} your portfolio on total return — but watch the "
         "drawdown and Sharpe columns: the risk-conscious version is the fairer comparison to how "
         "you actually run money.</p>")
-
-
-def sec_grade(d: dict, public: bool) -> str:
-    q = d["quant"]
-    p, bm, tm, rl, g = q["perf"], q["bench"], q["trades"], q["roll"], q["grade"]
-    gcolor = {"A": "#46c84e", "B": "#9acd32", "C": "#d7ba7d", "D": "#e8a04e", "F": "#ef4444"}[g["letter"]]
-
-    def row(k, v):
-        return f"<tr><td>{k}</td><td class='num mono'>{v}</td></tr>"
-    perf_rows = "".join([
-        row("Sharpe (full, daily)", f"{p['sharpe']:.2f}"), row("Sortino", f"{p['sortino']:.2f}"),
-        row("Calmar (CAGR/maxDD)", f"{p['calmar']:.2f}"), row("Omega", f"{p['omega']:.2f}"),
-        row("Ann. return", _pct(p['ann_return']*100)), row("Ann. vol", _pct(p['ann_vol']*100)),
-        row("Max drawdown", _pct(p['max_dd']*100)), row("Underwater (days)", f"{p['dd_days']}"),
-        row("Skew / kurtosis", f"{p['skew']:.2f} / {p['kurtosis']:.2f}"),
-        row("VaR 95 / CVaR 95 (daily)", f"{p['var95']*100:.1f}% / {p['cvar95']*100:.1f}%")])
-    bench_rows = "".join([
-        row("Beta vs S&amp;P", f"{bm['beta']:.2f}"), row("Alpha (annual)", _pct(bm['alpha_ann']*100)),
-        row("Correlation", f"{bm['corr']:.2f}"), row("Information ratio", f"{bm['info_ratio']:.2f}"),
-        row("Tracking error", _pct(bm['tracking_error']*100)),
-        row("Up / down capture", f"{bm['up_capture']:.2f} / {bm['down_capture']:.2f}")]) if bm else ""
-    trade_rows = "".join([
-        row("Hit rate", _pct(tm['hit_rate']*100)), row("Profit factor", f"{tm['profit_factor']:.2f}"),
-        row("Payoff (avgW/avgL)", f"{tm['payoff']:.2f}"), row("Trades / year", f"{tm['trades_per_year']:.0f}")]) if tm else ""
-    roll_rows = "".join([
-        row("12m Sharpe — median", f"{rl['roll_sharpe_med']:.2f}"),
-        row("12m Sharpe — worst", f"{rl['roll_sharpe_min']:.2f}"),
-        row("12m windows positive", _pct(rl['roll_sharpe_pos_frac']*100))]) if rl else ""
-
-    flags = "".join(f"<li>{f}</li>" for f in g["flags"])
-    score_card = _card("Score / 100", f"{g['score']:.0f}")
-    sharpe_card = _card("Full Sharpe", f"{p['sharpe']:.2f}")
-    dd_card = _card("Max DD", _pct(p["max_dd"] * 100))
-    return (
-        "<h2>Quant scorecard &amp; honest grade</h2>"
-        f"<div class='cards'>"
-        f"<div class='card'><div class='k'>Grade</div>"
-        f"<div class='v' style='color:{gcolor};font-size:2rem'>{g['letter']}</div></div>"
-        f"{score_card}{sharpe_card}{dd_card}</div>"
-        "<p class='dim'>Graded like a risk committee: standard ratios, benchmark attribution, "
-        "trade quality and stability — then the headline is <b>docked for what it doesn't "
-        "correct</b>. The full-window daily Sharpe (<b>"
-        f"{p['sharpe']:.2f}</b>) and the −{abs(p['max_dd'])*100:.0f}% max drawdown are the sober "
-        "view; the eye-popping test total is regime + survivorship.</p>"
-        "<div style='display:flex;flex-wrap:wrap;gap:1.5rem'>"
-        f"<table><tr><th>Risk / return</th><th class='num'>Value</th></tr>{perf_rows}</table>"
-        f"<table><tr><th>vs S&amp;P 500</th><th class='num'>Value</th></tr>{bench_rows}</table>"
-        f"<table><tr><th>Trade quality</th><th class='num'>Value</th></tr>{trade_rows}</table>"
-        f"<table><tr><th>Stability</th><th class='num'>Value</th></tr>{roll_rows}</table>"
-        "</div>"
-        "<div class='note warn'><b>Bias audit — why this is <i>not</i> clean alpha.</b> "
-        f"Is it real? Partly. Momentum-<i>selection</i> beats a random book on the same universe "
-        f"(p={d['significance']['mc']['p_sharpe']:.3f}, deflated-Sharpe "
-        f"{d['significance']['dsr']['dsr']:.0%}) — a genuine, modest tilt. But the <i>level</i> is "
-        f"inflated, and the honest verdict is a <b>{g['letter']}</b>:<ul>{flags}</ul>"
-        "Bottom line: a real but small momentum tilt riding survivorship + a small-cap regime — "
-        "a known, decaying premium, not novel alpha. If it looks too easy, it is.</div>")
 
 
 def sec_significance(d: dict, public: bool) -> str:
@@ -467,30 +728,10 @@ def sec_significance(d: dict, public: bool) -> str:
             f'<div class="cards">{"".join(cards)}</div>'
             f"<div class='chart'>{fig_html(fig)}</div>"
             "<p class='dim'>A low p-value says the <i>selection</i> adds value over drawing names "
-            "at random from the same liquid pool; it does not promise the level repeats. Read it "
-            "with the regime and capacity caveats below.</p>")
-
-
-def sec_timeline(d: dict) -> str:
-    lines = []
-    for h in d["res"]["holdings_log"]:
-        dead = h.get("dead", set())
-        spans = " ".join(
-            f"<span style='color:{_pnl_color(h['ret'].get(t, 0.0), t in dead)}' "
-            f"title='{t} {h['ret'].get(t, 0.0):+.0%}'>{_disp(d['meta'], t)}</span>"
-            for t in h["picks"])
-        spans = spans or "<span class='dim'>cash</span>"
-        rv = [v for v in h["ret"].values() if pd.notna(v)]
-        mret = sum(rv) / len(rv) if rv else 0.0
-        lines.append(f"<div><span class='mono dim'>{h['date'].date()}</span> "
-                     f"<b style='color:{_pnl_color(mret, False)}'>{mret:+.1%}</b> {spans}</div>")
-    return ("<h2>Every rebalance, colored by outcome</h2>"
-            "<p class='dim'>Each line is one rebalance’s picks, colored by that holding "
-            "period’s return — <span style='color:#0a6b00'>■</span> ≥+20% · "
-            "<span style='color:#46c84e'>■</span> up · <span style='color:#ef4444'>■</span> down · "
-            "<span style='color:#7a0000'>■</span> ≤−20% · <span style='color:#000'>■</span> "
-            "defaulted (delisted/died). Hover for the %.</p>"
-            f"<div style='font-size:0.78rem;line-height:1.7'>{''.join(lines)}</div>")
+            "at random from the same liquid pool; it does not promise the level repeats. "
+            "<b>Selection is identical for the original and the risk-conscious versions</b>, so this "
+            "verdict applies to both — vol-targeting changes the sizing, not the edge. Read it with "
+            "the regime and capacity caveats below.</p>")
 
 
 def sec_caveat(d: dict) -> str:
@@ -529,29 +770,37 @@ def sec_caveat(d: dict) -> str:
         f'the book can pile into one theme; a few names drive the curve. <b>(3) Capacity</b> — picks '
         f'are liquid enough for a small account, but modeled slippage (25bps) understates real fills '
         f'in size. <b>(4) Mechanics</b> — daily closes, €1/order, slippage modeled not measured, and '
-        f'<b>past performance is not future returns</b>.</div>')
+        f'<b>past performance is not future returns</b>.'
+        f'<br><br><b style="color:{C_RC}">Risk-conscious version.</b> Volatility-targeting directly '
+        f'addresses the drawdown and the raw vol — it cuts both materially — but it does <b>not</b> '
+        f'fix survivorship, regime dependence or capacity: those sit in the underlying selection, '
+        f'which is identical, so they apply equally to both versions.</div>')
 
 
 def build(d: dict, public: bool = False) -> str:
-    """One page: the chosen strategy up top (intro → picks → equity → perf → timeline →
-    caveats), then a <hr> and the research lab below (the 32-config grid, feasibility, every
-    variation's timeline, the survivorship note, and the method). Local-only output."""
+    """One page, two strategies side by side: a shared intro + on-top summary, then the
+    side-by-side compare (picks → equity → performance → scorecard → yearly → every
+    rebalance), then the shared head-to-head / significance / caveats, then (private only)
+    the research lab — the 32-config grid the config was chosen from + supporting data."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cfg = d["strategy"]
     body = "".join([
-        f"<h1>Momentum strategy — {cfg.code}</h1>",
-        f"<p class='dim'>generated {now} · <a href='report.html'>← portfolio</a></p>",
-        # ── the chosen strategy ──
+        "<h1>Momentum strategy — Original vs Risk-conscious</h1>",
+        f"<p class='dim'>generated {now} · config {cfg.code} · "
+        f"<a href='report.html'>← portfolio</a></p>",
+        # ── both strategies, framed + summarised on top ──
         sec_intro(d),
-        sec_holdings(d),
-        sec_curve(d),
-        sec_perf(d, public),
-        sec_risk_conscious(d, public),
+        sec_summary(d),
+        # ── side-by-side compare (full parity) ──
+        sec_picks_compare(d),
+        sec_curve_compare(d),
+        sec_perf_compare(d, public),
+        sec_grade_compare(d, public),
+        sec_yearly_compare(d, public),
+        sec_timeline_compare(d),
+        # ── shared (both versions) ──
         sec_vs_portfolio(d, public),
-        sec_grade(d, public),
         sec_significance(d, public),
-        sec_yearly(d, public),
-        sec_timeline(d),
         sec_caveat(d),
         # ── the lab (private/live only): how this config was chosen + all the rest ──
         ("".join([
@@ -574,7 +823,7 @@ def main():
     local = ROOT / "local/strategy.html"
     local.parent.mkdir(exist_ok=True)
     local.write_text(build(d))                          # live/local only — no docs/ export
-    print(f"wrote {local}  (strategy {STRATEGY.code} + lab)")
+    print(f"wrote {local}  (strategy {STRATEGY.code}: original + risk-conscious + lab)")
     if args.open:
         webbrowser.open(local.as_uri())
 
