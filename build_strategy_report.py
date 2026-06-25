@@ -204,8 +204,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     variants = build_variants(res, quant["vol_target"], spx, train, val, test, quant, CAPITAL,
                               dsr=dsr["dsr"], mc_p=mc["p_sharpe"], overlap=overlap)
 
-    # ── Your real portfolio's ROI (cumulative %), for the head-to-head ──
-    portfolio_roi = None
+    # ── Your real portfolio's ROI (cumulative %) + a same-scale strategy run, for the head-to-head ──
+    portfolio_roi, vs_scale = None, None
     pf_csv = ROOT / "input" / "portfolio.csv"
     if pf_csv.exists():
         try:
@@ -213,12 +213,23 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             pr, _ = build_roi_timeseries(txns)
             if pr is not None and not pr.empty:
                 portfolio_roi = pr
+            invested = sum(float(t["price"]) for t in txns if t["action"] == "buy")
+            if invested > 0:
+                # Re-run the SAME strategy at YOUR invested scale, so the flat €1/order fee is the
+                # same % drag it is on your real (small) book — on €10k it's a negligible ~0.15%.
+                vsr = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=invested,
+                                   cost_mults=(1.0,), start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
+                                   min_price=MIN_PRICE, sectors=None, benchmark=spx, pit=pit,
+                                   execute_lag=EXEC_LAG, **STRATEGY.kwargs())
+                vse = vsr["runs"][1.0]["equity"]
+                vs_scale = dict(capital=invested, raw_equity=vse,
+                                rc_equity=qg.vol_target(vse, target_vol=RISK_TARGET_VOL).get("equity"))
         except Exception:
             portfolio_roi = None
 
     n_countries = len({m.get("country") for m in meta.values()} - {"—", None})
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
-                portfolio_roi=portfolio_roi, variants=variants,
+                portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
                 strategy=STRATEGY, train=train, val=val, test=test, graveyard_hits=hits,
                 grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
                 n_countries=n_countries,
@@ -250,33 +261,44 @@ def sec_intro(d: dict) -> str:
 
 
 def sec_summary(d: dict) -> str:
-    """Both versions summarised on top, side by side, before the detailed compare."""
+    """Both versions summarised on top: equal-height intro panels + one shared headline
+    compare table, so the key numbers sit at the same level (symmetric, not nested cards)."""
     raw, rc = d["variants"]
 
     def panel(v, blurb):
-        cards = "".join([
-            _card("Test return", _pct(v["test"]["net_return"] * 100)),
-            _card("Test Sharpe", f"{v['test']['sharpe']:.2f}"),
-            _card("Max DD", _pct(v["perf"]["max_dd"] * 100)),
-            _card("Grade", v["grade"]["letter"]),
-        ])
         return (f"<div class='note' style='border-left-color:{v['color']}'>"
-                f"<b style='color:{v['color']}'>{v['label']}.</b> {blurb}"
-                f"<div class='cards' style='margin-top:8px'>{cards}</div></div>")
+                f"<b style='color:{v['color']}'>{v['label']}.</b> {blurb}</div>")
+
+    def grade_cell(v):
+        g = v["grade"]["letter"]
+        return f"<b style='color:{_GRADE_COLOR[g]};font-size:1.05rem'>{g}</b>"
+
+    metrics = [
+        ("Test return", lambda v: _pct(v["test"]["net_return"] * 100)),
+        ("Test Sharpe", lambda v: f"{v['test']['sharpe']:.2f}"),
+        ("Max drawdown", lambda v: _pct(v["perf"]["max_dd"] * 100)),
+        ("Ann. vol", lambda v: _pct(v["perf"]["ann_vol"] * 100, signed=False)),
+        ("Grade", grade_cell),
+    ]
+
+    def mtable(v):
+        body = "".join(f"<tr><td>{k}</td><td class='num mono'>{fn(v)}</td></tr>" for k, fn in metrics)
+        return (f"<table><tr><th>Headline (test / full)</th>"
+                f"<th class='num' style='color:{v['color']}'>{v['short']}</th></tr>{body}</table>")
 
     raw_blurb = ("The chosen config — buys the 12-1 winners and holds them full-invested. The "
                  f"highest raw return, but the −{abs(raw['perf']['max_dd']) * 100:.0f}% drawdown and "
                  f"~{raw['perf']['ann_vol'] * 100:.0f}% vol are the price.")
-    rc_blurb = (f"The same picks, but the book is volatility-targeted to {RISK_TARGET_VOL:.0%}: it "
-                "scales exposure toward that vol using the prior day’s realised vol (no look-ahead, "
-                "no leverage — it only ever de-risks) and parks the rest in cash. When momentum gets "
-                "turbulent the book shrinks automatically. This is how you’d actually run momentum.")
+    rc_blurb = (f"The same picks, volatility-targeted to {RISK_TARGET_VOL:.0%}: it scales exposure "
+                "toward that vol using the prior day’s realised vol (de-risk only, no leverage) and "
+                "parks the rest in cash, so the book shrinks in turbulence — how you’d actually run it.")
     return ("<h2>Two ways to run it — side by side</h2>"
             "<p class='dim'>This page compares the <b>original</b> strategy (raw, full-invested) "
             "against a <b>risk-conscious</b> variation (same selection, volatility-targeted) as a "
             "valid alternative — picks, equity, performance, scorecard, yearly P&amp;L and every "
-            "rebalance, head to head.</p>"
-            + _cmp(panel(raw, raw_blurb), panel(rc, rc_blurb)))
+            "rebalance, head to head. The headline:</p>"
+            f"<div class='cmp stretch'>{panel(raw, raw_blurb)}{panel(rc, rc_blurb)}</div>"
+            + _cmp(mtable(raw), mtable(rc)))
 
 
 # ── Picks (side by side) ────────────────────────────────────────────────────────
@@ -311,10 +333,10 @@ def _picks_table(d: dict, v: dict) -> str:
             f"<td></td><td></td><td class='num dim'>—</td>"
             f"<td class='num mono'>{cash:.1f}%</td></tr>")
     if v["key"] == "rc":
-        sub = (f"<p class='dim'>top-{n} equal-weight, scaled to <b>{invested:.0f}% invested</b> "
-               f"({cash:.0f}% cash) at the current realised vol · {cur['date'].date()}</p>")
+        sub = (f"<p class='dim pick-sub'>top-{n} → <b>{invested:.0f}% invested</b> "
+               f"({cash:.0f}% cash) at current vol · {cur['date'].date()}</p>")
     else:
-        sub = f"<p class='dim'>top-{n} equal-weight, full-invested · {cur['date'].date()}</p>"
+        sub = f"<p class='dim pick-sub'>top-{n} equal-weight, full-invested · {cur['date'].date()}</p>"
     return (head + sub +
             "<table><tr><th>Ticker</th><th>Name</th><th>ISIN</th><th>Country</th>"
             "<th class='num'>12-1 mom</th><th class='num'>Weight</th></tr>" + "".join(rows) + "</table>")
@@ -373,6 +395,16 @@ def _perf_cells(s: dict) -> str:
             f"<td class='num'>{_pct(s['max_drawdown'] * 100)}</td>")
 
 
+def _perf_table(v: dict) -> str:
+    rows = "".join(
+        f"<tr><td>{label}</td>{_perf_cells(v[k])}</tr>"
+        for label, k in (("Train 2018–21", "train"), ("Validation 2022–23", "val"),
+                         ("Test 2024→", "test"), ("Full 2018→", "full")))
+    return (f"<h3 style='color:{v['color']}'>{v['short']}</h3>"
+            "<table><tr><th>Window</th><th class='num'>Ret</th><th class='num'>Sharpe</th>"
+            f"<th class='num'>Max DD</th></tr>{rows}</table>")
+
+
 def sec_perf_compare(d: dict, public: bool) -> str:
     raw, rc = d["variants"]
     cards = [
@@ -384,15 +416,6 @@ def sec_perf_compare(d: dict, public: bool) -> str:
     if not public:
         cards.append(_card("Net P&L — orig", f"€{raw['full']['net_return'] * d['capital']:+,.0f}"))
         cards.append(_card("Net P&L — risk-con", f"€{rc['full']['net_return'] * d['capital']:+,.0f}"))
-    grp = ("<tr><th rowspan='2'>Window</th>"
-           f"<th class='num' colspan='3' style='text-align:center;color:{C_RAW}'>Original</th>"
-           f"<th class='num' colspan='3' style='text-align:center;color:{C_RC}'>Risk-conscious</th></tr>"
-           "<tr><th class='num'>Ret</th><th class='num'>Sharpe</th><th class='num'>Max DD</th>"
-           "<th class='num'>Ret</th><th class='num'>Sharpe</th><th class='num'>Max DD</th></tr>")
-    rows = "".join(
-        f"<tr><td>{label}</td>{_perf_cells(raw[k])}{_perf_cells(rc[k])}</tr>"
-        for label, k in (("Train 2018–21", "train"), ("Validation 2022–23", "val"),
-                         ("Test 2024→ (held out)", "test"), ("Full 2018→", "full")))
     return ("<h2>Performance</h2>"
             "<p class='dim'>Train = 2018–21 (used to pick the config), validation = 2022–23 "
             "(used to compare configs), <b>test = 2024→ (held out — never touched the choice)</b>. "
@@ -400,7 +423,7 @@ def sec_perf_compare(d: dict, public: bool) -> str:
             "full-window total. Both versions share the same selection — the risk-conscious curve is "
             f"that selection scaled to a {RISK_TARGET_VOL:.0%} vol target.</p>"
             f"<div class='cards'>{''.join(cards)}</div>"
-            f"<table>{grp}{rows}</table>")
+            + _cmp(_perf_table(raw), _perf_table(rc)))
 
 
 # ── Quant scorecard & grade (merged compare) ────────────────────────────────────
@@ -412,58 +435,59 @@ def _grade_card(v: dict) -> str:
             f"<div class='v' style='color:{color};font-size:2rem'>{g['letter']}</div></div>")
 
 
-def sec_grade_compare(d: dict, public: bool) -> str:
-    raw, rc = d["variants"]
-    rp, rcp = raw["perf"], rc["perf"]
-    rb, rcb = raw["bench"] or {}, rc["bench"] or {}
-    rr, rcr = raw["roll"] or {}, rc["roll"] or {}
-    tm = d["quant"]["trades"]                       # trade quality = selection (identical for both)
+def _scorecard_table(v: dict, tm: dict) -> str:
+    """One variant's full scorecard — [Metric | value] with group sub-headers. Two of these
+    sit side by side (Original | Risk-conscious), same left/right zones as every other section."""
+    p, b, r = v["perf"], v["bench"] or {}, v["roll"] or {}
 
-    def mrow(k, a, b):
-        return (f"<tr><td>{k}</td><td class='num mono'>{a}</td><td class='num mono'>{b}</td></tr>")
+    def mr(k, val):
+        return f"<tr><td>{k}</td><td class='num mono'>{val}</td></tr>"
 
-    hdr = ("<tr><th>Metric</th>"
-           f"<th class='num' style='color:{C_RAW}'>Original</th>"
-           f"<th class='num' style='color:{C_RC}'>Risk-conscious</th></tr>")
+    def grp(label):
+        return (f"<tr><td colspan='2' style='padding-top:16px;color:{theme.FG_DIM};"
+                f"font-weight:600;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;"
+                f"border-bottom:1px solid {theme.GRID}'>{label}</td></tr>")
     perf_rows = "".join([
-        mrow("Sharpe (full, daily)", f"{rp['sharpe']:.2f}", f"{rcp['sharpe']:.2f}"),
-        mrow("Sortino", f"{rp['sortino']:.2f}", f"{rcp['sortino']:.2f}"),
-        mrow("Calmar (CAGR/maxDD)", f"{rp['calmar']:.2f}", f"{rcp['calmar']:.2f}"),
-        mrow("Omega", f"{rp['omega']:.2f}", f"{rcp['omega']:.2f}"),
-        mrow("Ann. return", _pct(rp['ann_return'] * 100), _pct(rcp['ann_return'] * 100)),
-        mrow("Ann. vol", _pct(rp['ann_vol'] * 100), _pct(rcp['ann_vol'] * 100)),
-        mrow("Max drawdown", _pct(rp['max_dd'] * 100), _pct(rcp['max_dd'] * 100)),
-        mrow("Underwater (days)", f"{rp['dd_days']}", f"{rcp['dd_days']}"),
-        mrow("Skew / kurtosis", f"{rp['skew']:.2f} / {rp['kurtosis']:.2f}",
-             f"{rcp['skew']:.2f} / {rcp['kurtosis']:.2f}"),
-        mrow("VaR / CVaR 95 (daily)", f"{rp['var95'] * 100:.1f}% / {rp['cvar95'] * 100:.1f}%",
-             f"{rcp['var95'] * 100:.1f}% / {rcp['cvar95'] * 100:.1f}%"),
-        mrow("Avg exposure", "100%", f"{rcp.get('avg_exposure', 1.0) * 100:.0f}%"),
+        mr("Sharpe (full, daily)", f"{p['sharpe']:.2f}"), mr("Sortino", f"{p['sortino']:.2f}"),
+        mr("Calmar (CAGR/maxDD)", f"{p['calmar']:.2f}"), mr("Omega", f"{p['omega']:.2f}"),
+        mr("Ann. return", _pct(p['ann_return'] * 100)), mr("Ann. vol", _pct(p['ann_vol'] * 100)),
+        mr("Max drawdown", _pct(p['max_dd'] * 100)), mr("Underwater (days)", f"{p['dd_days']}"),
+        mr("Skew / kurtosis", f"{p['skew']:.2f} / {p['kurtosis']:.2f}"),
+        mr("VaR / CVaR 95 (daily)", f"{p['var95'] * 100:.1f}% / {p['cvar95'] * 100:.1f}%"),
+        mr("Avg exposure", f"{p.get('avg_exposure', 1.0) * 100:.0f}%"),
     ])
     bench_rows = "".join([
-        mrow("Beta vs S&amp;P", f"{rb.get('beta', float('nan')):.2f}", f"{rcb.get('beta', float('nan')):.2f}"),
-        mrow("Alpha (annual)", _pct(rb.get('alpha_ann', 0) * 100), _pct(rcb.get('alpha_ann', 0) * 100)),
-        mrow("Correlation", f"{rb.get('corr', float('nan')):.2f}", f"{rcb.get('corr', float('nan')):.2f}"),
-        mrow("Information ratio", f"{rb.get('info_ratio', float('nan')):.2f}", f"{rcb.get('info_ratio', float('nan')):.2f}"),
-        mrow("Tracking error", _pct(rb.get('tracking_error', 0) * 100), _pct(rcb.get('tracking_error', 0) * 100)),
-        mrow("Up / down capture", f"{rb.get('up_capture', float('nan')):.2f} / {rb.get('down_capture', float('nan')):.2f}",
-             f"{rcb.get('up_capture', float('nan')):.2f} / {rcb.get('down_capture', float('nan')):.2f}"),
-    ]) if rb else ""
+        mr("Beta vs S&amp;P", f"{b.get('beta', float('nan')):.2f}"),
+        mr("Alpha (annual)", _pct(b.get('alpha_ann', 0) * 100)),
+        mr("Correlation", f"{b.get('corr', float('nan')):.2f}"),
+        mr("Information ratio", f"{b.get('info_ratio', float('nan')):.2f}"),
+        mr("Tracking error", _pct(b.get('tracking_error', 0) * 100)),
+        mr("Up / down capture",
+           f"{b.get('up_capture', float('nan')):.2f} / {b.get('down_capture', float('nan')):.2f}"),
+    ]) if b else ""
     roll_rows = "".join([
-        mrow("12m Sharpe — median", f"{rr.get('roll_sharpe_med', float('nan')):.2f}",
-             f"{rcr.get('roll_sharpe_med', float('nan')):.2f}"),
-        mrow("12m Sharpe — worst", f"{rr.get('roll_sharpe_min', float('nan')):.2f}",
-             f"{rcr.get('roll_sharpe_min', float('nan')):.2f}"),
-        mrow("12m windows positive", _pct(rr.get('roll_sharpe_pos_frac', 0) * 100),
-             _pct(rcr.get('roll_sharpe_pos_frac', 0) * 100)),
-    ]) if rr else ""
+        mr("12m Sharpe — median", f"{r.get('roll_sharpe_med', float('nan')):.2f}"),
+        mr("12m Sharpe — worst", f"{r.get('roll_sharpe_min', float('nan')):.2f}"),
+        mr("12m windows positive", _pct(r.get('roll_sharpe_pos_frac', 0) * 100)),
+    ]) if r else ""
     trade_rows = "".join([
-        f"<tr><td>Hit rate</td><td class='num mono'>{_pct(tm['hit_rate'] * 100)}</td></tr>",
-        f"<tr><td>Profit factor</td><td class='num mono'>{tm['profit_factor']:.2f}</td></tr>",
-        f"<tr><td>Payoff (avgW/avgL)</td><td class='num mono'>{tm['payoff']:.2f}</td></tr>",
-        f"<tr><td>Trades / year</td><td class='num mono'>{tm['trades_per_year']:.0f}</td></tr>",
+        mr("Hit rate", _pct(tm['hit_rate'] * 100)), mr("Profit factor", f"{tm['profit_factor']:.2f}"),
+        mr("Payoff (avgW/avgL)", f"{tm['payoff']:.2f}"), mr("Trades / year", f"{tm['trades_per_year']:.0f}"),
     ]) if tm else ""
+    head = f"<tr><th>Metric</th><th class='num' style='color:{v['color']}'>{v['short']}</th></tr>"
+    body = head + grp("Risk / return") + perf_rows
+    if bench_rows:
+        body += grp("vs S&amp;P 500") + bench_rows
+    if roll_rows:
+        body += grp("Stability — 12-month rolling") + roll_rows
+    if trade_rows:
+        body += grp("Trade quality — selection (identical)") + trade_rows
+    return f"<h3 style='color:{v['color']}'>{v['short']}</h3><table>{body}</table>"
 
+
+def sec_grade_compare(d: dict, public: bool) -> str:
+    raw, rc = d["variants"]
+    tm = d["quant"]["trades"]                       # trade quality = selection (identical for both)
     g = raw["grade"]
     score_cards = "".join([
         _grade_card(raw), _grade_card(rc),
@@ -478,15 +502,10 @@ def sec_grade_compare(d: dict, public: bool) -> str:
         "trade quality and stability — then the headline is <b>docked for what it doesn't "
         "correct</b>. The risk-conscious version earns the same (or better) grade by trading some "
         "raw return for a much smaller drawdown and a higher risk-adjusted Sharpe; the bias "
-        "deductions below apply to the shared selection, so they hit both equally.</p>"
-        "<div style='display:flex;flex-wrap:wrap;gap:1.5rem'>"
-        f"<table>{hdr}{perf_rows}</table>"
-        f"<table>{hdr}{bench_rows}</table>"
-        f"<table>{hdr}{roll_rows}</table>"
-        "<table><tr><th>Trade quality</th><th class='num'>Selection (both)</th></tr>"
-        f"{trade_rows}</table>"
-        "</div>"
-        "<div class='note warn'><b>Bias audit — why this is <i>not</i> clean alpha.</b> "
+        "deductions below apply to the shared selection, so they hit both equally. (Trade quality is "
+        "selection-driven, so it is identical in both columns.)</p>"
+        + _cmp(_scorecard_table(raw, tm), _scorecard_table(rc, tm))
+        + "<div class='note warn'><b>Bias audit — why this is <i>not</i> clean alpha.</b> "
         f"Is it real? Partly. Momentum-<i>selection</i> beats a random book on the same universe "
         f"(p={d['significance']['mc']['p_sharpe']:.3f}, deflated-Sharpe "
         f"{d['significance']['dsr']['dsr']:.0%}) — a genuine, modest tilt. But the <i>level</i> is "
@@ -524,34 +543,28 @@ def sec_yearly_compare(d: dict, public: bool) -> str:
     req, ceq = raw["equity"].dropna(), rc["equity"].dropna()
     if len(req) < 2:
         return ""
-    rret, cret = _yearly_returns(req), _yearly_returns(ceq)
     spx = d["benchmarks"]["S&P 500"] if "S&P 500" in d["benchmarks"].columns else None
     bret = _yearly_returns(spx.reindex(req.index).ffill()) if spx is not None else pd.Series(dtype=float)
-    rpnl, cpnl = _yearly_pnl(req), _yearly_pnl(ceq)
 
-    years = sorted(set(rret.index) | set(cret.index))
-    rows = []
-    for y in years:
-        def cell(sr):
-            return (f"<td class='num'>{_pct(sr[y] * 100)}</td>" if y in sr.index
-                    else "<td class='num dim'>—</td>")
-        eur = ""
-        if not public:
-            eur = (f"<td class='num mono'>€{rpnl.get(y, 0.0):+,.0f}</td>"
-                   f"<td class='num mono'>€{cpnl.get(y, 0.0):+,.0f}</td>")
-        b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>" if y in bret.index
-             else "<td class='num dim'>—</td>")
-        rows.append(f"<tr><td class='mono'>{y}</td>{cell(rret)}{cell(cret)}{eur}{b}</tr>")
-    eur_hdr = ("<th class='num'>P&amp;L orig (€10k)</th><th class='num'>P&amp;L risk-con</th>"
-               if not public else "")
-    pnl_note = ("each version's actual P&amp;L on the €10k paper account, and " if not public else "and ")
+    def ytable(v, eq):
+        sret, pnl = _yearly_returns(eq), _yearly_pnl(eq)
+        rows = []
+        for y in sorted(sret.index):
+            b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>" if y in bret.index
+                 else "<td class='num dim'>—</td>")
+            eur = f"<td class='num mono'>€{pnl.get(y, 0.0):+,.0f}</td>" if not public else ""
+            rows.append(f"<tr><td class='mono'>{y}</td>"
+                        f"<td class='num'>{_pct(sret[y] * 100)}</td>{b}{eur}</tr>")
+        eur_h = "<th class='num'>P&amp;L</th>" if not public else ""
+        return (f"<h3 style='color:{v['color']}'>{v['short']}</h3>"
+                "<table><tr><th>Year</th><th class='num'>Return</th>"
+                f"<th class='num'>S&amp;P</th>{eur_h}</tr>" + "".join(rows) + "</table>")
+
+    pnl_note = ("each version's actual €P&amp;L, and " if not public else "and ")
     return ("<h2>Yearly P&amp;L</h2>"
             "<p class='dim'>Calendar-year net return of each version (first year from inception), "
             f"{pnl_note}the S&amp;P 500 over the same year. 2018 and 2026 are part-years.</p>"
-            "<table><tr><th>Year</th>"
-            f"<th class='num' style='color:{C_RAW}'>Original</th>"
-            f"<th class='num' style='color:{C_RC}'>Risk-conscious</th>"
-            f"{eur_hdr}<th class='num'>S&amp;P 500</th></tr>" + "".join(rows) + "</table>")
+            + _cmp(ytable(raw, req), ytable(rc, ceq)))
 
 
 # ── Every rebalance, colored (two columns) ──────────────────────────────────────
@@ -624,16 +637,22 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
     pr = d.get("portfolio_roi")
     if public or pr is None or getattr(pr, "empty", True):
         return ""
-    eq = d["res"]["runs"][1.0]["equity"]
+    # Use the strategy run sized to YOUR invested capital (flat €1/order then hits the same %
+    # it does on your book); fall back to the €10k run if the portfolio scale is unavailable.
+    vs = d.get("vs_scale") or {}
+    eq = vs.get("raw_equity")
+    if eq is None:
+        eq = d["res"]["runs"][1.0]["equity"]
     start = pr.index[0]
     eqw = eq[eq.index >= start].dropna()
     prw = pr[pr.index >= start].dropna()
     if len(eqw) < 5 or len(prw) < 5:
         return ""
     strat = (eqw / eqw.iloc[0] - 1.0) * 100.0          # strategy cumulative ROI % from your start
-    # risk-conscious (vol-targeted) curve over the same window
-    vt = d.get("quant", {}).get("vol_target") or {}
-    rcw = vt.get("equity")
+    # risk-conscious (vol-targeted) curve over the same window, same scale
+    rcw = vs.get("rc_equity")
+    if rcw is None:
+        rcw = (d.get("quant", {}).get("vol_target") or {}).get("equity")
     rc = None
     if rcw is not None:
         rcw = rcw[rcw.index >= start].dropna()
@@ -673,8 +692,12 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
         "<span style='color:#fff'>White</span> = your real book; "
         f"<span style='color:{C_RAW}'>gold</span> = the raw momentum strategy; "
         f"<span style='color:{C_RC}'>teal</span> = the risk-conscious (vol-targeted) version — all "
-        "hypothetical, lump-sum. Apples-to-pears (your book is cash-flow-timed), and the strategies "
-        "carry every caveat below — survivorship especially — so read the gap as indicative.</p>"
+        "hypothetical, lump-sum. "
+        + (f"The strategies are run at <b>your invested scale (€{vs['capital']:,.0f})</b>, so the flat "
+           "€1/transaction fee is the same % drag it is on your book (on €10k it's a negligible "
+           "~0.15%). " if vs.get("capital") else "")
+        + "Apples-to-pears (your book is cash-flow-timed), and the strategies carry every caveat "
+        "below — survivorship especially — so read the gap as indicative.</p>"
         f"<div class='chart'>{fig_html(fig)}</div>"
         "<table><tr><th>Book</th><th class='num'>Total ROI</th><th class='num'>Sharpe</th>"
         f"<th class='num'>Max DD</th></tr>{rows}</table>"
