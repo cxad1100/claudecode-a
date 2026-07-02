@@ -80,6 +80,15 @@ SURV_SIMS = int(os.environ.get("SURV_SIMS", "8"))
 SURV_HAZARD = 0.05            # ~5%/yr delisting hazard (broad-equity plausible)
 SURV_LOSS = (0.40, 1.00)      # terminal crash drawn here (partial buyout → near-total wipeout)
 
+# Delisting-stress intensities (bull/base/bear). Two knobs each: annual hazard + terminal-loss
+# band, grounded in the delisting literature (Shumway 1997: -30% NYSE/AMEX; Shumway-Warther 1999:
+# -55% NASDAQ; bankruptcies -> -100%). Base == the single-intensity default above, so no regression.
+STRESS_PRESETS = {                       # name -> (hazard_annual, (loss_lo, loss_hi))
+    "bull": (0.02, (0.30, 0.60)),        # benign regime, orderly / partial-recovery delistings
+    "base": (SURV_HAZARD, SURV_LOSS),    # empirical central case (== current default)
+    "bear": (0.10, (0.60, 1.00)),        # crisis delisting wave, mostly wipeouts
+}
+
 # Regime attribution: strip the two sectors carrying the 2024-25 tailwind (Technology = the AI/
 # semiconductor boom; Industrials = aerospace & defense) and re-run the SAME config, to see how
 # much of the Sharpe survives without them. Coarse (defense is a slice of Industrials) but it's
@@ -165,35 +174,71 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
     return [raw, rc]
 
 
-def _survivorship_study(prices, slip, meta_df, sectors, spx, cfg, base_return):
-    """On-population answer to the *holding* leak: inject representative synthetic delistings
-    into the LIVE names and re-run the SAME strategy SURV_SIMS×. The real graveyard's ~2%
-    overlap can't test this; injecting into the live population (random sudden deaths — a
-    HARDER test than reality, where dyers bleed first and get down-ranked) can. Returns
-    survivorship.summarize(...) — drag vs the clean base + how often a name was held at death."""
+def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return):
+    """Multi-intensity on-population delisting stress (bull/base/bear). Inject synthetic deaths
+    into the LIVE names at each preset's hazard/loss, re-run the SAME strategy SURV_SIMS×, and per
+    run derive: raw net return, the risk-conscious (vol-targeted) curve, annualised CAPM alpha vs
+    the real un-injected benchmark, and the edge vs an equally-delisted buy-hold of the initial
+    picks. Observational — never feeds selection/sizing. Seeds 0..K-1 shared across presets.
+
+    Returns {"presets": {name: stress_summarize(...) + hazard/loss}, "clean": {...}, "sims": K}."""
     dead = set(meta_df.loc[meta_df["delisting_date"].notna(), "ticker"])
     live_cols = [c for c in prices.columns if c not in dead]
     base_map = delisting_map(meta_df)
-    rets, hits, deaths_n = [], [], []
-    for s in range(SURV_SIMS):
-        inj_live, deaths = survivorship.inject_delistings(
-            prices[live_cols], hazard_annual=SURV_HAZARD,
-            loss_lo=SURV_LOSS[0], loss_hi=SURV_LOSS[1], seed=s)
-        if not deaths:
-            rets.append(base_return); hits.append(0); deaths_n.append(0); continue
-        inj = prices.copy()
-        inj[live_cols] = inj_live
-        dmap = dict(base_map); dmap.update({t: dt for t, (dt, _loss) in deaths.items()})
-        r = run_momentum(inj, {t: slip[t] for t in inj.columns if t in slip},
-                         lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
-                         start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
-                         sectors=sectors, benchmark=spx, pit=PITUniverse(inj, dmap),
-                         execute_lag=EXEC_LAG, **cfg.kwargs())
-        rets.append(r["runs"][1.0]["stats"]["net_return"])
-        held = sum(1 for h in r["holdings_log"] for t in h["picks"]
-                   if t in deaths and h["date"] <= deaths[t][0] < h.get("next", deaths[t][0]))
-        hits.append(held); deaths_n.append(len(deaths))
-    return survivorship.summarize(base_return, rets, hits, deaths_n)
+    window = _equity_window(res)
+    first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
+
+    def _alpha(eq, bench):
+        if eq is None or bench is None:
+            return float("nan")
+        vb = qg.vs_benchmark(eq, bench)
+        return float(vb.get("alpha_ann", float("nan"))) if vb else float("nan")
+
+    def _rc(eq):
+        return qg.vol_target(eq, target_vol=RISK_TARGET_VOL, turn_cost_bps=RC_TURN_BPS)
+
+    raw_eq0 = res["runs"][1.0]["equity"]
+    rc0 = _rc(raw_eq0)
+    rc_eq0 = rc0.get("equity")
+    ew0 = equal_weight_curve(prices, first_picks, window, CAPITAL) if first_picks else None
+    clean = dict(
+        ret={"raw": float(base_return), "rc": float(rc0.get("net_return", float("nan")))},
+        alpha={"raw": _alpha(raw_eq0, spx), "rc": _alpha(rc_eq0, spx)},
+        edge={"raw": _alpha(raw_eq0, ew0), "rc": _alpha(rc_eq0, ew0)})
+
+    presets = {}
+    for name, (hz, (lo, hi)) in STRESS_PRESETS.items():
+        raw_rets, hits, deaths_n = [], [], []
+        a_raw, a_rc, e_raw, e_rc = [], [], [], []
+        for s in range(SURV_SIMS):
+            inj_live, deaths = survivorship.inject_delistings(
+                prices[live_cols], hazard_annual=hz, loss_lo=lo, loss_hi=hi, seed=s)
+            if not deaths:                                    # no deaths this draw -> clean values
+                raw_rets.append(base_return); hits.append(0); deaths_n.append(0)
+                a_raw.append(clean["alpha"]["raw"]); a_rc.append(clean["alpha"]["rc"])
+                e_raw.append(clean["edge"]["raw"]); e_rc.append(clean["edge"]["rc"])
+                continue
+            inj = prices.copy(); inj[live_cols] = inj_live
+            dmap = dict(base_map); dmap.update({t: dt for t, (dt, _l) in deaths.items()})
+            r = run_momentum(inj, {t: slip[t] for t in inj.columns if t in slip},
+                             lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
+                             start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                             sectors=sectors, benchmark=spx, pit=PITUniverse(inj, dmap),
+                             execute_lag=EXEC_LAG, **cfg.kwargs())
+            req = r["runs"][1.0]["equity"]
+            rrc = _rc(req).get("equity")
+            inj_ew = equal_weight_curve(inj, first_picks, window, CAPITAL) if first_picks else None
+            raw_rets.append(r["runs"][1.0]["stats"]["net_return"])
+            a_raw.append(_alpha(req, spx)); a_rc.append(_alpha(rrc, spx))
+            e_raw.append(_alpha(req, inj_ew)); e_rc.append(_alpha(rrc, inj_ew))
+            held = sum(1 for h in r["holdings_log"] for t in h["picks"]
+                       if t in deaths and h["date"] <= deaths[t][0] < h.get("next", deaths[t][0]))
+            hits.append(held); deaths_n.append(len(deaths))
+        st = survivorship.stress_summarize(base_return, raw_rets, hits, deaths_n,
+                                           a_raw, a_rc, e_raw, e_rc)
+        st["hazard"], st["loss"] = hz, (lo, hi)
+        presets[name] = st
+    return dict(presets=presets, clean=clean, sims=SURV_SIMS)
 
 
 def gather(force: bool = False, refresh: bool | None = None) -> dict:
@@ -266,11 +311,14 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     # ── On-population survivorship (holding leak): inject representative synthetic delistings
     #    into the live names and re-run K× — the honest test the ~2%-overlap graveyard can't give.
     surv_inject = None
+    delisting_stress = None
     if SURV_SIMS > 0:
         try:
-            surv_inject = _survivorship_study(prices, slip, meta_df, sectors, spx, cfg,
-                                              base_return=res["runs"][1.0]["stats"]["net_return"])
+            delisting_stress = _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res,
+                                                 base_return=res["runs"][1.0]["stats"]["net_return"])
+            surv_inject = delisting_stress["presets"]["base"]   # base == the single-intensity result
         except Exception:
+            delisting_stress = None
             surv_inject = None
 
     # ── Significance & robustness: random-selection null, deflated Sharpe, bootstrap CI ──
@@ -402,7 +450,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
                 portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
                 strategy=cfg, train=train, val=val, test=test, graveyard_hits=hits,
-                surv_inject=surv_inject,
+                surv_inject=surv_inject, delisting_stress=delisting_stress,
                 grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
                 n_countries=n_countries,
                 n_live=n_live, bounds=bounds, regime=reg, eff_bets=eff_bets,

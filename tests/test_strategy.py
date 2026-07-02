@@ -6,7 +6,7 @@ import pandas as pd
 import build_strategy_report as bs
 from tools import quant_grade as qg
 from tools.momentum import run_momentum
-from tools.momentum_grid import _stats_slice
+from tools.momentum_grid import _stats_slice, MomentumConfig
 
 
 def _fake_d():
@@ -292,3 +292,58 @@ def test_scenario_sits_after_regime_before_caveat():
     assert "Scenario fan" in html
     assert (html.index("Regime attribution") < html.index("Scenario fan")
             < html.index("survivorship is NOT corrected"))
+
+
+# ── Delisting-stress (Task 3) ───────────────────────────────────────────────────
+
+def _stress_fixture(k=24, n=520, seed=0):
+    idx = pd.bdate_range("2018-01-01", periods=n)
+    rng = np.random.default_rng(seed)
+    prices = pd.DataFrame(
+        {f"T{i}": 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, n))) for i in range(k)},
+        index=idx)
+    meta_df = pd.DataFrame({"ticker": list(prices.columns), "delisting_date": [pd.NaT] * k})
+    sectors = {t: ("Tech" if i % 2 else "Fin") for i, t in enumerate(prices.columns)}
+    spx = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0003, 0.008, n))), index=idx)
+    slip = {t: 5.0 for t in prices.columns}
+    return prices, meta_df, sectors, spx, slip
+
+
+def test_base_preset_matches_default():
+    assert bs.STRESS_PRESETS["base"] == (bs.SURV_HAZARD, bs.SURV_LOSS)
+
+
+def test_delisting_stress_grid_shape(monkeypatch):
+    monkeypatch.setattr(bs, "SURV_SIMS", 2)
+    prices, meta_df, sectors, spx, slip = _stress_fixture()
+    cfg = MomentumConfig()
+    res = bs.run_momentum(prices, slip, lookback=bs.LOOKBACK, skip=bs.SKIP, capital=bs.CAPITAL,
+                          cost_mults=(1.0,), start=bs.START, liq_max=bs.LIQ_MAX, fee_eur=bs.FEE_EUR,
+                          min_price=bs.MIN_PRICE, sectors=sectors, benchmark=spx,
+                          pit=bs.PITUniverse(prices, {}), execute_lag=bs.EXEC_LAG, **cfg.kwargs())
+    base = res["runs"][1.0]["stats"]["net_return"]
+    out = bs._delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return=base)
+    assert set(out["presets"]) == {"bull", "base", "bear"}
+    assert out["sims"] == 2
+    for name, st in out["presets"].items():
+        assert set(st["alpha"]) == {"raw", "rc"} and set(st["edge"]) == {"raw", "rc"}
+        assert "avoidance_rate" in st and st["sims"] == 2
+        assert st["hazard"] == bs.STRESS_PRESETS[name][0]
+    assert set(out["clean"]) == {"ret", "alpha", "edge"}
+
+
+def test_surv_inject_backcompat_keys(monkeypatch):
+    """The shared sec_survivorship reads d['surv_inject'] — base preset must carry its keys."""
+    monkeypatch.setattr(bs, "SURV_SIMS", 2)
+    prices, meta_df, sectors, spx, slip = _stress_fixture()
+    cfg = MomentumConfig()
+    res = bs.run_momentum(prices, slip, lookback=bs.LOOKBACK, skip=bs.SKIP, capital=bs.CAPITAL,
+                          cost_mults=(1.0,), start=bs.START, liq_max=bs.LIQ_MAX, fee_eur=bs.FEE_EUR,
+                          min_price=bs.MIN_PRICE, sectors=sectors, benchmark=spx,
+                          pit=bs.PITUniverse(prices, {}), execute_lag=bs.EXEC_LAG, **cfg.kwargs())
+    base = res["runs"][1.0]["stats"]["net_return"]
+    out = bs._delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return=base)
+    base_preset = out["presets"]["base"]
+    for key in ("base_return", "sims", "mean_return", "delta_mean", "delta_lo", "delta_hi",
+                "hits_mean", "deaths_mean", "avoidance_rate"):
+        assert key in base_preset
