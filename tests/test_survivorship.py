@@ -75,3 +75,19 @@ def test_summarize_bounds_drag_around_base():
 def test_summarize_avoidance_handles_zero_deaths():
     s = sv.summarize(1.0, [1.0], sim_hits=[0], sim_deaths=[0])
     assert s["avoidance_rate"] == 1.0                            # no deaths ⇒ nothing to hold
+
+
+def test_band_mean_and_percentiles():
+    b = sv.band([0.0, 1.0, 2.0, 3.0, 4.0])
+    assert abs(b["mean"] - 2.0) < 1e-9
+    assert abs(b["lo"] - np.percentile([0, 1, 2, 3, 4], 5)) < 1e-9
+    assert abs(b["hi"] - np.percentile([0, 1, 2, 3, 4], 95)) < 1e-9
+
+
+def test_band_empty_is_zeros():
+    assert sv.band([]) == dict(mean=0.0, lo=0.0, hi=0.0)
+
+
+def test_band_drops_nan():
+    b = sv.band([1.0, np.nan, 3.0])
+    assert abs(b["mean"] - 2.0) < 1e-9

@@ -73,3 +73,13 @@ def summarize(base_return: float, sim_returns: list, sim_hits: list, sim_deaths:
                 mean_return=float(r.mean()), delta_mean=float(d.mean()),
                 delta_lo=float(np.percentile(d, 5)), delta_hi=float(np.percentile(d, 95)),
                 hits_mean=hits_mean, deaths_mean=deaths_mean, avoidance_rate=float(avoidance))
+
+
+def band(arr, lo: float = 5, hi: float = 95) -> dict:
+    """mean + [lo, hi] percentile band of a 1-D sample; NaNs dropped, empty -> zeros."""
+    a = np.asarray(list(arr), float)
+    a = a[~np.isnan(a)]
+    if a.size == 0:
+        return dict(mean=0.0, lo=0.0, hi=0.0)
+    return dict(mean=float(a.mean()), lo=float(np.percentile(a, lo)),
+                hi=float(np.percentile(a, hi)))
