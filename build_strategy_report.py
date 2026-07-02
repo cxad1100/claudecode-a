@@ -1415,6 +1415,7 @@ def build(d: dict, public: bool = False) -> str:
         sec_vs_portfolio(d, public),
         # ── the limitations, in their own section (not the headline) ──
         sec_caveat(d),
+        sec_delisting_stress(d, public),
         # ── the lab (private/live only): how this config was chosen + the raw reference ──
         ("".join([
             "<hr style='margin:3rem 0;border:0;border-top:2px solid #333'>",
