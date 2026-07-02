@@ -83,3 +83,13 @@ def band(arr, lo: float = 5, hi: float = 95) -> dict:
         return dict(mean=0.0, lo=0.0, hi=0.0)
     return dict(mean=float(a.mean()), lo=float(np.percentile(a, lo)),
                 hi=float(np.percentile(a, hi)))
+
+
+def stress_summarize(base_return: float, raw_rets: list, sim_hits: list, sim_deaths: list,
+                     alpha_raw: list, alpha_rc: list, edge_raw: list, edge_rc: list) -> dict:
+    """summarize(...) for the raw return drag + avoidance, augmented with the annualised-alpha
+    and edge bands (raw & risk-conscious). One preset's worth of K injected sims -> one row."""
+    s = summarize(base_return, raw_rets, sim_hits, sim_deaths)
+    s["alpha"] = {"raw": band(alpha_raw), "rc": band(alpha_rc)}
+    s["edge"] = {"raw": band(edge_raw), "rc": band(edge_rc)}
+    return s

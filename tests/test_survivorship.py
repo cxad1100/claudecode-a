@@ -91,3 +91,16 @@ def test_band_empty_is_zeros():
 def test_band_drops_nan():
     b = sv.band([1.0, np.nan, 3.0])
     assert abs(b["mean"] - 2.0) < 1e-9
+
+
+def test_stress_summarize_merges_bands():
+    s = sv.stress_summarize(
+        1.0, [0.98, 1.0, 1.02], sim_hits=[1, 0, 2], sim_deaths=[10, 10, 10],
+        alpha_raw=[0.10, 0.12, 0.11], alpha_rc=[0.06, 0.07, 0.065],
+        edge_raw=[0.03, 0.04, 0.05], edge_rc=[0.02, 0.02, 0.03])
+    assert s["sims"] == 3                                      # inherits summarize
+    assert abs(s["avoidance_rate"] - (1 - 1.0 / 10.0)) < 1e-9  # inherits summarize
+    assert set(s["alpha"]) == {"raw", "rc"} and set(s["edge"]) == {"raw", "rc"}
+    assert abs(s["alpha"]["raw"]["mean"] - 0.11) < 1e-9
+    assert s["alpha"]["raw"]["lo"] <= s["alpha"]["raw"]["mean"] <= s["alpha"]["raw"]["hi"]
+    assert abs(s["edge"]["rc"]["mean"] - np.mean([0.02, 0.02, 0.03])) < 1e-9
