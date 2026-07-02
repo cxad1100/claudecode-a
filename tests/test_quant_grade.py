@@ -40,6 +40,63 @@ def test_grade_penalises_uncorrected_survivorship():
     assert any("Survivorship" in f for f in bad["flags"])
 
 
+def test_effective_bets_uncorrelated_many_bets():
+    # k independent streams → many real bets (≫1), spread across factors
+    rng = np.random.default_rng(0)
+    idx = pd.bdate_range("2019-01-01", periods=2000)
+    k = 5
+    rets = pd.DataFrame({f"A{i}": rng.normal(0, 0.01, 2000) for i in range(k)}, index=idx)
+    m = Q.effective_bets(rets, np.full(k, 1.0 / k))
+    assert m["k"] == k
+    assert abs(m["n_eff_weight"] - k) < 1e-9          # equal weights → naive count = k
+    assert m["n_eff_pca"] > 2.0                        # many independent bets, not one
+    assert m["pc1_share"] < 0.5                        # no single factor dominates
+
+
+def test_effective_bets_perfectly_correlated_is_one():
+    # every name the SAME series → one factor, ~1 effective bet (naive count still says 5)
+    idx = pd.bdate_range("2019-01-01", periods=500)
+    base = np.random.default_rng(1).normal(0, 0.01, 500)
+    rets = pd.DataFrame({f"A{i}": base for i in range(5)}, index=idx)
+    m = Q.effective_bets(rets, np.full(5, 0.2))
+    assert m["n_eff_pca"] < 1.05                        # collapses to a single bet
+    assert m["pc1_share"] > 0.95                        # PC1 explains ~all variance
+    assert abs(m["n_eff_weight"] - 5.0) < 1e-9          # weights spread → naive misses it
+
+
+def test_effective_bets_weight_concentration():
+    # n_eff_weight is the naive HHI of the weights, independent of the returns
+    idx = pd.bdate_range("2019-01-01", periods=300)
+    rng = np.random.default_rng(2)
+    rets = pd.DataFrame({"A": rng.normal(0, 0.01, 300),
+                         "B": rng.normal(0, 0.01, 300)}, index=idx)
+    m = Q.effective_bets(rets, np.array([0.9, 0.1]))
+    assert abs(m["n_eff_weight"] - 1.0 / (0.81 + 0.01)) < 1e-9
+
+
+def test_vol_target_turnover_cost_reduces_return():
+    # vol swings → exposure (w) moves → turnover; charging it must drag net return
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range("2019-01-01", periods=600)
+    r = np.concatenate([rng.normal(0.0005, 0.005, 150), rng.normal(0.0, 0.040, 150),
+                        rng.normal(0.0005, 0.005, 150), rng.normal(0.0, 0.040, 150)])
+    eq = pd.Series(1000 * np.cumprod(1 + r), index=idx)
+    free = Q.vol_target(eq, target_vol=0.15, turn_cost_bps=0.0)
+    costed = Q.vol_target(eq, target_vol=0.15, turn_cost_bps=25.0)
+    assert costed["equity"].iloc[-1] < free["equity"].iloc[-1]      # resizing isn't free
+    assert costed["ann_return"] < free["ann_return"]
+    assert costed["turn_cost"] > 0                                  # reports the drag
+
+
+def test_vol_target_constant_exposure_no_turnover_cost():
+    # near-zero vol → target/realised pins w at the cap, constant → no resizing → no cost
+    idx = pd.bdate_range("2019-01-01", periods=400)
+    eq = pd.Series(1000 * np.cumprod(1 + np.full(400, 0.0003)), index=idx)
+    a = Q.vol_target(eq, target_vol=0.15, turn_cost_bps=0.0)
+    b = Q.vol_target(eq, target_vol=0.15, turn_cost_bps=50.0)
+    assert abs(a["equity"].iloc[-1] - b["equity"].iloc[-1]) < 1e-6  # no turnover ⇒ cost is a no-op
+
+
 def test_vol_target_reduces_drawdown():
     # a volatile equity curve → vol-targeting should cut vol and (usually) drawdown
     rng = np.random.default_rng(3)

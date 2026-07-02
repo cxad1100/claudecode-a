@@ -38,6 +38,30 @@ def test_deflated_sharpe_haircuts_for_trials():
     assert out["n_trials"] == 32
 
 
+def test_deflated_sharpe_phantom_trials_lowers_confidence():
+    # "file-drawer" fix: raise the EFFECTIVE trial count above the 32 we can see (lifetime
+    # pipeline iterations) → higher deflation bar → lower P(real>0). Dispersion stays from the
+    # 32 observed configs; only N in the expected-max term grows.
+    rng = np.random.default_rng(0)
+    r = rng.normal(0.03, 0.08, 40)
+    trials = list(rng.normal(0.5, 0.6, 32))
+    base = deflated_sharpe_ratio(r, trials, ppy=4.0)                       # N = 32 observed
+    phantom = deflated_sharpe_ratio(r, trials, ppy=4.0, n_trials_effective=32 * 10)   # ×10
+    assert phantom["n_trials"] == 320 and phantom["n_trials_observed"] == 32
+    assert phantom["sr_benchmark_annual"] > base["sr_benchmark_annual"]    # higher bar
+    assert phantom["dsr"] < base["dsr"]                                    # honest, lower P
+    assert 0.0 <= phantom["dsr"] <= 1.0
+
+
+def test_deflated_sharpe_effective_none_is_baseline():
+    rng = np.random.default_rng(1)
+    r = rng.normal(0.03, 0.08, 40)
+    trials = list(rng.normal(0.5, 0.6, 32))
+    a = deflated_sharpe_ratio(r, trials, ppy=4.0)
+    b = deflated_sharpe_ratio(r, trials, ppy=4.0, n_trials_effective=None)
+    assert a["dsr"] == b["dsr"] and a["n_trials"] == b["n_trials"] == 32   # no override = unchanged
+
+
 def test_bootstrap_ci_brackets_point():
     rng = np.random.default_rng(2)
     r = rng.normal(0.04, 0.07, 40)

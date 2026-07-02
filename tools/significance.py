@@ -104,28 +104,39 @@ def monte_carlo_null(pools: list[np.ndarray], strat_rets: np.ndarray, k: int, *,
 
 
 def deflated_sharpe_ratio(period_rets: np.ndarray, trial_sharpes_annual: list[float],
-                          *, ppy: float = 4.0) -> dict:
+                          *, ppy: float = 4.0, n_trials_effective: int | None = None) -> dict:
     """Deflated Sharpe Ratio (Bailey & López de Prado, 2014).
 
-    `trial_sharpes_annual` = the annualised Sharpes of all configs we scanned (the 32-grid)
+    `trial_sharpes_annual` = the annualised Sharpes of all configs we scanned (the 64-grid)
     — their dispersion sets the benchmark a lucky winner must clear. Returns the observed
     annualised Sharpe, the deflation benchmark, and DSR = P(true Sharpe > 0) after the
-    multiple-testing + non-normality + length haircut."""
+    multiple-testing + non-normality + length haircut.
+
+    `n_trials_effective` addresses the *file-drawer* bias: the grid is only the trials we can
+    SEE, but the pipeline (architectures, indicators, calendars) was iterated many times before
+    it. Passing a larger effective N raises the expected-max deflation bar (Harvey's higher
+    hurdle) while keeping the trial-Sharpe *dispersion* from the observed grid — the honest,
+    strictly more-conservative estimate. None ⇒ N = the observed grid size (unchanged)."""
     r = np.asarray(period_rets, float)
     T = len(r)
+    n_obs = max(len(trial_sharpes_annual), 1)
     sd = r.std(ddof=1) if T > 1 else 0.0
     if T < 3 or sd == 0:
         return dict(sharpe_annual=_sharpe(r, ppy), dsr=float("nan"),
-                    sr_benchmark_annual=float("nan"), n_trials=len(trial_sharpes_annual), T=T)
+                    sr_benchmark_annual=float("nan"), n_trials=n_obs,
+                    n_trials_observed=n_obs, T=T)
     sr = r.mean() / sd                                   # per-period Sharpe
     g1 = float(stats.skew(r, bias=False))
     g2 = float(stats.kurtosis(r, fisher=False, bias=False))   # non-excess kurtosis
     sr_var = (1.0 - g1 * sr + (g2 - 1.0) / 4.0 * sr ** 2) / (T - 1)
     sr_se = np.sqrt(max(sr_var, 1e-12))
 
-    N = max(len(trial_sharpes_annual), 1)
+    # Effective trial count: the observed grid, unless a larger lifetime count is injected to
+    # cover the file-drawer (unseen pipeline iterations). Dispersion always comes from the
+    # OBSERVED grid — phantom trials borrow the same trial-to-trial Sharpe variance.
+    N = max(int(n_trials_effective), 1) if n_trials_effective else n_obs
     trials_pp = np.asarray(trial_sharpes_annual, float) / np.sqrt(ppy)   # → per-period
-    V = float(np.var(trials_pp, ddof=1)) if N > 1 else 0.0
+    V = float(np.var(trials_pp, ddof=1)) if n_obs > 1 else 0.0
     sigma = np.sqrt(V) if V > 0 else sr_se
     # Expected max of N standard-normal Sharpes (Gumbel approx) × their dispersion.
     if N > 1:
@@ -137,7 +148,7 @@ def deflated_sharpe_ratio(period_rets: np.ndarray, trial_sharpes_annual: list[fl
     dsr = float(stats.norm.cdf((sr - sr_star) / sr_se))
     return dict(sharpe_annual=float(sr * np.sqrt(ppy)), dsr=dsr,
                 sr_benchmark_annual=float(sr_star * np.sqrt(ppy)),
-                skew=g1, kurtosis=g2, n_trials=N, T=T)
+                skew=g1, kurtosis=g2, n_trials=N, n_trials_observed=n_obs, T=T)
 
 
 def bootstrap_sharpe_cagr_ci(period_rets: np.ndarray, *, ppy: float = 4.0, n_boot: int = 2000,

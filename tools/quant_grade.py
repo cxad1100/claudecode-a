@@ -93,21 +93,30 @@ def rolling_sharpe(equity: pd.Series, window: int = TD) -> dict:
 
 
 def vol_target(equity: pd.Series, target_vol: float = 0.15, lookback: int = 63,
-               cap: float = 1.0) -> dict:
+               cap: float = 1.0, turn_cost_bps: float = 0.0) -> dict:
     """Volatility-targeting overlay (risk-conscious): scale each day's exposure toward a
     fixed annualised `target_vol` using YESTERDAY's trailing realised vol (no look-ahead),
     capped at `cap` (1.0 = de-risk only, never lever). The un-deployed fraction sits in cash
     (earns 0). Returns the new equity curve, the average exposure, and the headline metrics.
 
     This is the standard institutional drawdown control: when turbulence spikes, the book
-    automatically shrinks; in calm momentum tapes it runs (near-)fully invested."""
+    automatically shrinks; in calm momentum tapes it runs (near-)fully invested.
+
+    Vol-targeting is NOT free: hitting the target means resizing the book (cash↔stocks) as
+    realised vol moves. `turn_cost_bps` charges that daily resizing — |Δexposure| × bps —
+    against the return, so the risk-conscious curve reflects its own turnover (the initial
+    deployment is excluded; the base strategy already pays the entry). It models the
+    proportional slippage only; the flat €/order on tiny daily resizes is extra, which is
+    why a real book would band the rebalancing rather than resize every day."""
     r = _ret(equity)
     if len(r) < lookback + 5:
         return {}
     realised = r.rolling(lookback).std(ddof=1) * np.sqrt(TD)
-    w = (target_vol / realised).clip(upper=cap)
-    w = w.shift(1).fillna(0.0)                          # use prior day's sizing (no look-ahead)
-    scaled = (r * w).dropna()
+    w_raw = (target_vol / realised).clip(upper=cap).shift(1)   # prior day's sizing (no look-ahead)
+    turnover = w_raw.diff().abs().fillna(0.0)                  # daily exposure change = resizing trades
+    w = w_raw.fillna(0.0)
+    cost = turnover * (turn_cost_bps / 1e4)                    # charge the resizing — it isn't free
+    scaled = (r * w - cost).dropna()
     eq = (1 + scaled).cumprod()
     eq = eq / eq.iloc[0] * float(equity.dropna().iloc[0])
     m = perf_metrics(eq)
@@ -116,7 +125,45 @@ def vol_target(equity: pd.Series, target_vol: float = 0.15, lookback: int = 63,
     m["equity"] = eq
     m["exposure"] = exposure                            # series — for the per-rebalance timeline
     m["exposure_latest"] = float(exposure.iloc[-1])     # today's invested fraction (rest = cash)
+    m["turn_cost"] = float(cost.sum())                  # total resizing drag (fraction of book)
     return m
+
+
+def effective_bets(returns: pd.DataFrame, weights) -> dict:
+    """How many *independent* bets a weighted book really holds.
+
+    Naive diversification counts names; this counts uncorrelated risk sources.
+    Diagonalise the holdings' covariance Σ = Σ_i λ_i e_i e_iᵀ; the share of portfolio
+    variance carried by principal component i is p_i = (wᵀe_i)² λ_i / (wᵀΣw). The
+    effective number of bets is the entropy of that distribution,
+    exp(−Σ p_i ln p_i) (Meucci 2009): rises with k for uncorrelated names, collapses to
+    ≈1 when they all load one factor. `n_eff_weight` = the naive 1/Σw_i² for contrast —
+    equal weights score k even when the book is really one bet.
+
+    Pure/observational: covariance comes from the caller's trailing returns window (no
+    look-ahead is introduced here). `weights` aligns positionally to `returns.columns`;
+    flat (zero-variance) and all-NaN names are dropped and the rest renormalised."""
+    w = np.asarray(weights, float)
+    cols = list(returns.columns)
+    keep = [i for i, c in enumerate(cols)
+            if returns[c].notna().any() and returns[c].std(ddof=1) > 0]
+    if len(keep) < 2:
+        return {}
+    r = returns.iloc[:, keep].dropna()
+    w = w[keep]
+    if w.sum() <= 0 or len(r) < 5:
+        return {}
+    w = w / w.sum()
+    cov = np.cov(r.values, rowvar=False, ddof=1)
+    lam, E = np.linalg.eigh(cov)                         # ascending λ, orthonormal columns
+    contrib = np.clip((E.T @ w) ** 2 * lam, 0.0, None)   # variance from each PC (clip rounding)
+    total = contrib.sum()
+    if total <= 0:
+        return {}
+    p = contrib / total
+    nz = p[p > 0]
+    return dict(k=len(keep), n_eff_pca=float(np.exp(-(nz * np.log(nz)).sum())),
+                pc1_share=float(p.max()), n_eff_weight=float(1.0 / (w ** 2).sum()))
 
 
 def grade(test_sharpe: float, dsr: float, mc_p: float, isin_overlap_frac: float) -> dict:
@@ -136,7 +183,7 @@ def grade(test_sharpe: float, dsr: float, mc_p: float, isin_overlap_frac: float)
                      "the bolt-on graveyard is a near-disjoint relic, so winners that died before "
                      "today are simply absent. This inflates everything and is the dominant caveat.")
     flags.append("Regime — the result leans on the 2024–25 small-cap momentum tape; it will not repeat.")
-    flags.append("Multiple testing beyond the 32-config grid — the whole pipeline (universe, "
+    flags.append("Multiple testing beyond the 64-config grid — the whole pipeline (universe, "
                  "calendar, filters) was iterated many times; the true trial count is higher than DSR assumes.")
     flags.append("Known, crowded, decaying anomaly — 12-1 cross-sectional momentum is a documented "
                  "premium, not novel alpha; net of real costs and capacity it shrinks.")
