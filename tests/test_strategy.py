@@ -347,3 +347,47 @@ def test_surv_inject_backcompat_keys(monkeypatch):
     for key in ("base_return", "sims", "mean_return", "delta_mean", "delta_lo", "delta_hi",
                 "hits_mean", "deaths_mean", "avoidance_rate"):
         assert key in base_preset
+
+
+# ── Delisting-stress rendering (Task 4) ───────────────────────────────────────────
+
+def _fake_stress():
+    def bd(m, l, h):
+        return dict(mean=m, lo=l, hi=h)
+
+    def preset(hz, a_raw, a_rc, e_raw, e_rc, av):
+        return dict(base_return=2.0, sims=8, mean_return=1.7, delta_mean=-0.3,
+                    delta_lo=-0.6, delta_hi=0.0, hits_mean=0.4, deaths_mean=5.0,
+                    avoidance_rate=av, hazard=hz, loss=(0.4, 1.0),
+                    alpha={"raw": bd(*a_raw), "rc": bd(*a_rc)},
+                    edge={"raw": bd(*e_raw), "rc": bd(*e_rc)})
+    return dict(sims=8,
+                clean=dict(ret={"raw": 2.0, "rc": 1.2}, alpha={"raw": 0.14, "rc": 0.10},
+                           edge={"raw": 0.05, "rc": 0.04}),
+                presets=dict(
+                    bull=preset(0.02, (0.12, 0.08, 0.15), (0.09, 0.06, 0.11),
+                                (0.05, 0.03, 0.06), (0.04, 0.02, 0.05), 0.95),
+                    base=preset(0.05, (0.10, 0.05, 0.14), (0.08, 0.04, 0.10),
+                                (0.045, 0.02, 0.06), (0.035, 0.01, 0.05), 0.92),
+                    bear=preset(0.10, (0.06, -0.02, 0.12), (0.05, 0.00, 0.09),
+                                (0.04, 0.00, 0.06), (0.03, 0.00, 0.05), 0.88)))
+
+
+def test_delisting_band_public_percentages_only():
+    html = bs.sec_delisting_stress({"delisting_stress": _fake_stress()}, public=True)
+    assert "%" in html
+    assert "€" not in html                          # public invariant
+    assert "delisting" in html.lower()
+
+
+def test_delisting_table_private_has_all_presets():
+    html = bs.sec_delisting_stress({"delisting_stress": _fake_stress()}, public=False)
+    for token in ("Bull", "Base", "Bear", "Original", "Risk-conscious"):
+        assert token in html
+    assert "€" not in html
+
+
+def test_delisting_stub_when_absent():
+    assert bs.sec_delisting_stress({"delisting_stress": None}, public=True) == ""
+    stub = bs.sec_delisting_stress({"delisting_stress": None}, public=False)
+    assert "SURV_SIMS" in stub

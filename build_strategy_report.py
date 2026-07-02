@@ -1228,6 +1228,73 @@ def sec_caveat(d: dict) -> str:
         f'<b>band</b> the rebalancing rather than resize every day.</div>')
 
 
+def sec_delisting_stress(d: dict, public: bool) -> str:
+    """Bull/base/bear synthetic-delisting stress. Public: a calm alpha band + the edge-robustness
+    line. Private: the full grid (alpha & edge, raw & risk-conscious, with 5-95% brackets)."""
+    st = d.get("delisting_stress")
+    if not st:
+        return "" if public else ("<h2>Delisting stress</h2>"
+                                  "<p class='dim'>Skipped (SURV_SIMS=0).</p>")
+    pr, clean = st["presets"], st["clean"]
+    order = [("bull", "Bull"), ("base", "Base"), ("bear", "Bear")]
+    a_rc = [pr[k]["alpha"]["rc"]["mean"] for k, _ in order]
+    lo_rc, hi_rc = min(a_rc), max(a_rc)
+    edge_bear = pr["bear"]["edge"]["rc"]["mean"]
+
+    if public:
+        cards = (_card("Risk-conscious alpha, bull→bear",
+                       f"{_pct(hi_rc * 100)} … {_pct(lo_rc * 100)}")
+                 + _card("Edge vs an equally-delisted basket (bear)", _pct(edge_bear * 100)))
+        return (
+            "<h2>Does the edge survive missing delistings?</h2>"
+            "<p class='dim'>Today's universe is survivors. We inject synthetic deaths into the live "
+            "names at three intensities — benign (bull), empirical (base) and crisis (bear) "
+            "delisting rates, terminal losses drawn from the delisting literature — then re-run the "
+            "identical strategy and re-measure annualised alpha against the untouched MSCI World.</p>"
+            f"<div class='cards'>{cards}</div>"
+            "<p class='dim'>The vol-targeted book keeps a positive alpha even at a crisis delisting "
+            "rate, and still beats a buy-hold basket that eats the very same deaths — the edge comes "
+            "from selection, not from quietly skipping the survivorship correction. This is a "
+            "one-sided, downside-only stress (absent <i>winners</i> are not added back): it bounds "
+            "the survivorship drag, it does not remove the caveat.</p>")
+
+    # ── private: full grid ──
+    heads = "".join(f"<th class='num'>{lab}</th>" for _, lab in order)
+
+    def band_row(label, metric, key):
+        cells = "".join(
+            f"<td class='num mono'>{_pct(pr[k][metric][key]['mean'] * 100)}"
+            f"<span class='dim'> [{_pct(pr[k][metric][key]['lo'] * 100)}, "
+            f"{_pct(pr[k][metric][key]['hi'] * 100)}]</span></td>" for k, _ in order)
+        return (f"<tr><td>{label}</td>"
+                f"<td class='num mono'>{_pct(clean[metric][key] * 100)}</td>{cells}</tr>")
+
+    ret_cells = "".join(f"<td class='num mono'>{_pct(pr[k]['mean_return'] * 100)}</td>"
+                        for k, _ in order)
+    av_cells = "".join(f"<td class='num mono'>{pr[k]['avoidance_rate'] * 100:.0f}%</td>"
+                       for k, _ in order)
+    dd_cells = "".join(f"<td class='num mono'>{pr[k]['deaths_mean']:.1f}</td>" for k, _ in order)
+    return (
+        "<h2>Delisting stress — full grid</h2>"
+        f"<p class='dim'>Synthetic deaths injected into the live names, {st['sims']} sims per "
+        "intensity, identical strategy re-run. Alpha = annualised CAPM alpha vs the un-injected "
+        "MSCI World; edge = vs an equally-delisted buy-hold of the initial picks; brackets = 5–95% "
+        "band. Base = the empirical central case (= the single-intensity survivorship test). Clean "
+        "= no injection.</p>"
+        "<table><thead>"
+        f"<tr><th>Metric</th><th class='num'>Clean</th>{heads}</tr>"
+        "</thead><tbody>"
+        f"<tr><td>Original — mean return</td>"
+        f"<td class='num mono'>{_pct(clean['ret']['raw'] * 100)}</td>{ret_cells}</tr>"
+        + band_row("Original — alpha vs bench", "alpha", "raw")
+        + band_row("Risk-conscious — alpha vs bench", "alpha", "rc")
+        + band_row("Original — edge vs EW", "edge", "raw")
+        + band_row("Risk-conscious — edge vs EW", "edge", "rc")
+        + f"<tr><td>Avoidance rate</td><td class='num mono'>—</td>{av_cells}</tr>"
+        + f"<tr><td>Deaths / run</td><td class='num mono'>0</td>{dd_cells}</tr>"
+        + "</tbody></table>")
+
+
 def sec_scenarios(d: dict, public: bool) -> str:
     """Observational scenario fan: regime-conditioned block bootstrap of the risk-conscious book's
     daily returns → bear/base/bull terminal-wealth distribution over a 1-year horizon. A sensitivity
