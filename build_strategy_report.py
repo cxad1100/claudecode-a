@@ -17,6 +17,7 @@ every-rebalance → diagnostics → regime → you-vs-strategy → limitations, 
 """
 import argparse
 import os
+import sys
 import webbrowser
 from datetime import datetime
 
@@ -317,7 +318,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             delisting_stress = _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res,
                                                  base_return=res["runs"][1.0]["stats"]["net_return"])
             surv_inject = delisting_stress["presets"]["base"]   # base == the single-intensity result
-        except Exception:
+        except Exception as e:
+            print(f"delisting-stress skipped: {e}", file=sys.stderr)
             delisting_stress = None
             surv_inject = None
 
@@ -1232,7 +1234,7 @@ def sec_delisting_stress(d: dict, public: bool) -> str:
     """Bull/base/bear synthetic-delisting stress. Public: a calm alpha band + the edge-robustness
     line. Private: the full grid (alpha & edge, raw & risk-conscious, with 5-95% brackets)."""
     st = d.get("delisting_stress")
-    if not st:
+    if st is None:
         return "" if public else ("<h2>Delisting stress</h2>"
                                   "<p class='dim'>Skipped (SURV_SIMS=0).</p>")
     pr, clean = st["presets"], st["clean"]
@@ -1242,9 +1244,15 @@ def sec_delisting_stress(d: dict, public: bool) -> str:
     edge_bear = pr["bear"]["edge"]["rc"]["mean"]
 
     if public:
-        cards = (_card("Risk-conscious alpha, bull→bear",
+        cards = (_card("Risk-conscious alpha (range across intensities)",
                        f"{_pct(hi_rc * 100)} … {_pct(lo_rc * 100)}")
                  + _card("Edge vs an equally-delisted basket (bear)", _pct(edge_bear * 100)))
+        alpha_clause = ("keeps a positive alpha even at a crisis delisting rate"
+                        if lo_rc > 0 else
+                        "keeps most of its alpha even at a crisis delisting rate")
+        edge_clause = ("still beats a buy-hold basket that eats the very same deaths"
+                       if edge_bear > 0 else
+                       "stays close to a buy-hold basket that eats the very same deaths")
         return (
             "<h2>Does the edge survive missing delistings?</h2>"
             "<p class='dim'>Today's universe is survivors. We inject synthetic deaths into the live "
@@ -1252,8 +1260,7 @@ def sec_delisting_stress(d: dict, public: bool) -> str:
             "delisting rates, terminal losses drawn from the delisting literature — then re-run the "
             "identical strategy and re-measure annualised alpha against the untouched MSCI World.</p>"
             f"<div class='cards'>{cards}</div>"
-            "<p class='dim'>The vol-targeted book keeps a positive alpha even at a crisis delisting "
-            "rate, and still beats a buy-hold basket that eats the very same deaths — the edge comes "
+            f"<p class='dim'>The vol-targeted book {alpha_clause}, and {edge_clause} — the edge comes "
             "from selection, not from quietly skipping the survivorship correction. This is a "
             "one-sided, downside-only stress (absent <i>winners</i> are not added back): it bounds "
             "the survivorship drag, it does not remove the caveat.</p>")

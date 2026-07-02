@@ -385,6 +385,8 @@ def test_delisting_table_private_has_all_presets():
     for token in ("Bull", "Base", "Bear", "Original", "Risk-conscious"):
         assert token in html
     assert "€" not in html
+    assert "%" in html                      # private table renders percentages
+    assert "Avoidance rate" in html         # row-level spot check
 
 
 def test_delisting_stub_when_absent():
