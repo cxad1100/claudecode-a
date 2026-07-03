@@ -26,7 +26,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from tools.report_html import pct as _pct, card as _card, page, fig_html
-from tools import theme, significance as sig, quant_grade as qg, regime, survivorship, regime_attr, scenario
+from tools import theme, significance as sig, quant_grade as qg, regime, survivorship, regime_attr, scenario, factors
 from tools.momentum import (run_momentum, winsorize_prices, to_xetra_calendar,
                             precompute_eligibility, benchmark_curves, equal_weight_curve,
                             rebalance_dates)
@@ -114,6 +114,11 @@ SCEN_HORIZON = 252           # 1-year forward path
 SCEN_BLOCK = 21              # ~1-month blocks (keep autocorrelation / crash clusters)
 SCEN_TILT = 3.0              # bear/bull over-weight on the stressed regime's blocks
 SCEN_SIMS = int(os.environ.get("SCEN_SIMS", "2000"))
+
+# Factor-spanning regression (observational): regress the strategy's daily USD excess
+# returns on the French Developed 5 factors + WML (US fallback). Answers "is the edge
+# just momentum beta?" sharper than the CAPM alpha above. Env FACTORS=0 skips (offline).
+FACTORS = int(os.environ.get("FACTORS", "1"))
 
 # Head-to-head colors — gold = original (raw), teal = risk-conscious (vol-targeted).
 C_RAW = "#dcdcaa"
@@ -434,6 +439,31 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     variants = build_variants(res, quant["vol_target"], spx, train, val, test, quant, CAPITAL,
                               dsr=dsr["dsr"], mc_p=mc["p_sharpe"], overlap=overlap, strategy=cfg)
 
+    # ── Factor-spanning regression (observational, never selection): daily USD excess
+    #    returns on French Developed 5F + WML. Skips cleanly on any network failure.
+    factor_reg = None
+    if FACTORS:
+        try:
+            fac, fac_src = factors.fetch_factors_daily(force=refresh)
+            fx = cached_price_history(["EURUSD=X"], period="9y",
+                                      force=refresh)["EURUSD=X"].dropna()
+
+            def _excess_usd(equity):
+                r = equity.pct_change().dropna()
+                r_usd = factors.to_usd(r, fx)
+                return (r_usd - fac["RF"].reindex(r_usd.index)).dropna()
+
+            raw_reg = factors.factor_regression(_excess_usd(eq), fac)
+            rc_reg = factors.factor_regression(_excess_usd(variants[1]["equity"]), fac)
+            if raw_reg:
+                key = "FF5+WML" if "FF5+WML" in raw_reg else next(iter(raw_reg))
+                factor_reg = dict(source=fac_src, raw=raw_reg, rc=rc_reg,
+                                  n=raw_reg[key]["n"],
+                                  start=str(eq.index[0].date()), end=str(eq.index[-1].date()))
+        except Exception as e:
+            print(f"factor regression skipped: {e}", file=sys.stderr)
+            factor_reg = None
+
     # ── Scenario fan (observational): regime-conditioned block bootstrap of the risk-conscious
     #    book's daily returns → bear/base/bull terminal-wealth bands. Sensitivity, not a forecast;
     #    never touches selection. Inherits the survivor universe (bear = bear among survivors).
@@ -478,6 +508,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
                 strategy=cfg, train=train, val=val, test=test, graveyard_hits=hits,
                 surv_inject=surv_inject, delisting_stress=delisting_stress,
+                factor_reg=factor_reg,
                 grid=grid, n_dead=int(death_mask(meta_df).sum()),
                 turnover_pit=turnover is not None,
                 n_countries=n_countries,
@@ -1032,6 +1063,78 @@ def sec_significance(d: dict, public: bool) -> str:
             "selection you hold either way. Read it with the regime and capacity caveats below.</p>")
 
 
+def sec_factor_regression(d: dict, public: bool) -> str:
+    """Factor-spanning table: daily USD excess returns on CAPM / FF5 / FF5+WML (Ken
+    French daily factors, Newey-West t-stats). The sharpest 'is there alpha?' test the
+    data allows: if alpha dies when WML enters, the edge is momentum factor beta —
+    cheap to hold at retail scale, but not proprietary. Observational: nothing here
+    feeds selection or sizing, so it costs no deflated-Sharpe budget."""
+    fr = d.get("factor_reg")
+    if not fr:
+        return ""
+    raw, rc = fr["raw"], fr.get("rc") or {}
+    key = "FF5+WML" if "FF5+WML" in raw else next(iter(raw))
+    m = raw[key]
+    wml = m["betas"].get("WML")
+    cards = "".join([
+        _card(f"Alpha ({key}, raw)", f"{_pct(m['alpha_ann'] * 100)}"),
+        _card("Alpha t-stat (Newey-West)", f"{m['alpha_t']:.1f}"),
+        _card("WML loading", f"{wml[0]:.2f} (t={wml[1]:.1f})" if wml else "—"),
+        _card("R²", f"{m['r2']:.2f}"),
+    ])
+
+    def rows(label, regs, color):
+        out = []
+        for name in ("CAPM", "FF5", "FF5+WML"):
+            r = regs.get(name)
+            if not r:
+                continue
+            b_mkt = r["betas"].get("MKT_RF", (float("nan"), float("nan")))
+            b_wml = r["betas"].get("WML")
+            wml_cell = (f"{b_wml[0]:.2f} <span class='dim'>(t={b_wml[1]:.1f})</span>"
+                        if b_wml else "—")
+            out.append(
+                f"<tr><td style='color:{color}'>{label}</td><td class='mono'>{name}</td>"
+                f"<td class='num mono'>{_pct(r['alpha_ann'] * 100)} "
+                f"<span class='dim'>(t={r['alpha_t']:.1f})</span></td>"
+                f"<td class='num mono'>{b_mkt[0]:.2f}</td>"
+                f"<td class='num mono'>{wml_cell}</td>"
+                f"<td class='num mono'>{r['r2']:.2f}</td>"
+                f"<td class='num mono'>{r['n']:,}</td></tr>")
+        return "".join(out)
+
+    body = rows("Original", raw, C_RAW) + rows("Risk-conscious", rc, C_RC)
+    at, aa = m["alpha_t"], m["alpha_ann"]
+    if at >= 2.0:
+        verdict = ("a <b>residual selection edge beyond the factors</b> — the alpha survives "
+                   "the momentum factor itself at a real t-stat")
+    elif aa > 0:
+        verdict = ("<b>positive but not statistically separable from factor exposure</b> — "
+                   "read the edge as momentum factor beta, self-managed at retail scale "
+                   "(which no UCITS momentum ETF gives you this cheaply), not as proprietary alpha")
+    else:
+        verdict = ("<b>no residual</b> — the performance is factor exposure; fine to hold, "
+                   "not proprietary")
+    wml_txt = (f"The WML loading of <b>{wml[0]:.2f}</b> confirms the book actually harvests "
+               f"the momentum premium it targets. " if wml else "")
+    return (
+        "<h2>Factor spanning — is the edge just momentum beta?</h2>"
+        f"<p class='dim'>Daily strategy returns, converted to <b>USD</b> and taken in excess "
+        f"of the T-bill rate, regressed on the <b>Ken French {fr['source']} factors</b> "
+        f"(daily, {fr['start']} → {fr['end']}, n = {fr['n']:,} overlapping days; "
+        "<b>Newey-West</b> t-stats). CAPM, then the 5-factor model, then 5F + <b>WML</b> "
+        "(momentum). The question each row answers: after paying the loadings, is anything "
+        "left?</p>"
+        f"<div class='cards'>{cards}</div>"
+        "<table><tr><th>Book</th><th>Model</th><th class='num'>Alpha (ann.)</th>"
+        "<th class='num'>β market</th><th class='num'>β WML</th><th class='num'>R²</th>"
+        f"<th class='num'>Days</th></tr>{body}</table>"
+        f"<p class='dim'><b>Verdict:</b> {wml_txt}On this sample the {key} alpha is "
+        f"<b>{_pct(aa * 100)}</b>/yr (t = {at:.1f}) — {verdict}. Same caveats as everything "
+        "above: the level rides the survivor universe, and ~8 years of daily data bounds how "
+        "sharp any factor t-stat can be. Observational — nothing here feeds selection.</p>")
+
+
 # ── Observational diagnostics: HMM regime + PCA effective bets (read-only) ──────
 
 def sec_diagnostics(d: dict, public: bool) -> str:
@@ -1446,6 +1549,7 @@ def build(d: dict, public: bool = False) -> str:
         sec_picks_compare(d),
         sec_curve_compare(d),
         sec_significance(d, public),      # Monte-Carlo validation right behind the honest curve
+        sec_factor_regression(d, public), # spanning test: edge vs factor beta (observational)
         sec_perf_compare(d, public),
         sec_grade_compare(d, public),
         sec_yearly_compare(d, public),

@@ -393,3 +393,44 @@ def test_delisting_stub_when_absent():
     assert bs.sec_delisting_stress({"delisting_stress": None}, public=True) == ""
     stub = bs.sec_delisting_stress({"delisting_stress": None}, public=False)
     assert "SURV_SIMS" in stub
+
+
+def _fake_factor_reg():
+    def _m(alpha, t, cols, r2):
+        return dict(alpha_ann=alpha, alpha_t=t,
+                    betas={c: ((0.6, 8.0) if c == "WML" else (0.5, 5.0)) for c in cols},
+                    r2=r2, n=2000)
+    f5 = ("MKT_RF", "SMB", "HML", "RMW", "CMA")
+    return dict(
+        source="Developed", start="2018-04-02", end="2026-07-02", n=2000,
+        raw={"CAPM": _m(0.21, 2.4, ("MKT_RF",), 0.55),
+             "FF5": _m(0.18, 2.1, f5, 0.58),
+             "FF5+WML": _m(0.12, 1.4, f5 + ("WML",), 0.61)},
+        rc={"CAPM": _m(0.15, 2.2, ("MKT_RF",), 0.50),
+            "FF5": _m(0.12, 1.9, f5, 0.53),
+            "FF5+WML": _m(0.08, 1.2, f5 + ("WML",), 0.56)})
+
+
+def test_factor_section_hidden_without_data():
+    assert bs.sec_factor_regression(_fake_d(), public=False) == ""
+
+
+def test_factor_section_renders_models_and_verdict():
+    d = _fake_d()
+    d["factor_reg"] = _fake_factor_reg()
+    html = bs.sec_factor_regression(d, public=False)
+    assert "Factor spanning" in html and "Newey-West" in html and "Developed" in html
+    assert html.count("CAPM") >= 2 and html.count("FF5+WML") >= 2   # both books, all models
+    assert "0.60" in html or "0.6" in html                          # WML loading shown
+    assert "not statistically separable" in html                    # t=1.4 verdict branch
+    assert "€" not in html                                          # public-safe by content
+    full = bs.build(d, public=True)
+    assert "Factor spanning" in full                                # rendered on public build
+
+
+def test_factor_section_residual_alpha_verdict():
+    d = _fake_d()
+    fr = _fake_factor_reg()
+    fr["raw"]["FF5+WML"]["alpha_t"] = 2.6
+    d["factor_reg"] = fr
+    assert "residual selection edge" in bs.sec_factor_regression(d, public=False)
