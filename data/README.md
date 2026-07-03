@@ -9,8 +9,10 @@ Momentum + Strategy pages. Built by
 
 | file | tracked | what |
 |------|---------|------|
-| `universe_meta.csv`   | ✅ | one row per name: ticker, name, country, isin, currency, slippage_bps, `delisting_date` (blank = live), `med_turnover`. Live = TR's enumerated list; dead = the survivorship graveyard. |
+| `universe_meta.csv`   | ✅ | one row per name: ticker, name, country, isin, currency, slippage_bps, `delisting_date` (blank = live), `exit_reason` (`delisted`/`removed`/`demoted`, blank = live — the membership ledger, `tools.universe_reconcile`; only `delisted` counts as a graveyard death), `med_turnover`. |
+| `snapshots.csv`       | ✅ | append-only PIT snapshots of TR's enumerated list (`tools.universe_snapshot`). Gates backtest eligibility from the first snapshot (2026-06-29) forward via `PITUniverse(membership=…)`. |
 | `universe_prices.csv` | ❌ gitignored (large) | EUR-converted daily close per ticker, 2017→. Regenerate with `build_tr_universe fetch`. |
+| `universe_turnover.csv` | ❌ gitignored (regenerable) | month-end median daily EUR turnover per name, written by `fetch` — the point-in-time liquidity gate's source. Absent → the engine falls back to the static build-time gate. |
 | `tr_universe.csv`     | ❌ gitignored (TR-account-derived) | raw TR enumeration: isin, name, country. |
 | `tr_ticker_map.json`  | ❌ gitignored | isin → yfinance ticker cache (resolution). |
 
