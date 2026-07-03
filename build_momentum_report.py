@@ -27,7 +27,8 @@ from tools.pairs_universe import UNIVERSE, fetch_prices
 from tools.portfolio_tools import BENCHMARKS
 from tools.data_buffer import cached_price_history
 from tools.universe_pit import PITUniverse
-from tools.universe_assemble import delisting_map
+from tools.universe_assemble import delisting_map, death_map, death_mask
+from tools import universe_snapshot
 from tools.momentum_grid import run_grid, feasibility, ALL_CONFIGS
 
 # ── Settings (one place) ──────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ REBAL_LABEL = {"M": "monthly", "W": "weekly", "Q": "quarterly"}
 ROOT = Path(__file__).parent
 PRICES_CSV = ROOT / "data" / "universe" / "universe_prices.csv"
 META_CSV = ROOT / "data" / "universe" / "universe_meta.csv"
+TURN_CSV = ROOT / "data" / "universe" / "universe_turnover.csv"   # written by fetch; absent = static gate
 # The universe is now TR-native (tools.tr_tradeable --enumerate → tools.build_tr_universe):
 # every live name is tradeable on TR by construction, so there is no separate tradeability filter.
 
@@ -99,7 +101,17 @@ def gather(force: bool = False, refresh: bool | None = None, with_grid: bool = T
     meta = {r["ticker"]: dict(r) for _, r in meta_df.iterrows()}
     slip = {t: _slip(m) for t, m in meta.items() if t in prices.columns}
     sectors = {t: m.get("sector") for t, m in meta.items()}     # real GICS now (tools.enrich_sectors)
-    pit = PITUniverse(prices, delisting_map(meta_df))
+    # PIT extras: monthly turnover (liquidity gate; absent until the next fetch), the TR
+    # snapshot store (membership gate, active from the first snapshot forward), and the
+    # exits/deaths split (ledger demotions gate eligibility but aren't graveyard deaths).
+    turnover = (pd.read_csv(TURN_CSV, index_col=0, parse_dates=True)
+                if TURN_CSV.exists() else None)
+    snap_store = universe_snapshot.load_store()
+    ticker_isin = {r["ticker"]: str(r["isin"]) for _, r in meta_df.iterrows()
+                   if pd.notna(r.get("isin"))}
+    membership = (snap_store, ticker_isin) if len(snap_store) else None
+    pit = PITUniverse(prices, delisting_map(meta_df), deaths=death_map(meta_df),
+                      membership=membership)
 
     benches = {n: v for n, v in BENCHMARKS.items() if n != "Bitcoin"}   # equities/bonds only
     bench_tickers = [tk for tk, _ in benches.values()]
@@ -110,15 +122,18 @@ def gather(force: bool = False, refresh: bool | None = None, with_grid: bool = T
     # Sectors are real now (tools.enrich_sectors) → sector-neutral (B) configs join the grid.
     res = run_momentum(prices, slip, k=K, lookback=LOOKBACK, skip=SKIP, capital=CAPITAL,
                        cost_mults=COST_MULTS, freq=REBAL, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
-                       min_price=MIN_PRICE, start=START, pit=pit, execute_lag=EXEC_LAG)
+                       min_price=MIN_PRICE, start=START, pit=pit, execute_lag=EXEC_LAG,
+                       turnover=turnover, turn_floor=MIN_TURNOVER)
     grid = (run_grid(prices, slip, sectors=sectors, benchmark=spx, pit=pit, start=START,
                      configs=ALL_CONFIGS,
                      train_end=TRAIN_END, val_end=VAL_END, capital=CAPITAL,
-                     lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG)
+                     lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG,
+                     turnover=turnover, turn_floor=MIN_TURNOVER)
             if with_grid else None)
 
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta,
-                grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
+                grid=grid, n_dead=int(death_mask(meta_df).sum()),
+                turnover_pit=turnover is not None,
                 n_countries=len({m.get("country") for m in meta.values()} - {"—", None}))
 
 
@@ -264,6 +279,11 @@ def sec_rebalance_log(d: dict) -> str:
 
 def sec_caveat(d: dict) -> str:
     nc = d.get("n_countries", 0)
+    liq = ("Liquidity is gated <b>point-in-time</b> — every rebalance re-checks the "
+           "trailing 6-month median turnover, so there is no full-window liquidity "
+           "look-ahead" if d.get("turnover_pit") else
+           "Membership uses peak turnover over the whole window, so there is a mild "
+           "liquidity look-ahead")
     return f"""
 <div class="note warn">
 <b>Read the result as relative, not absolute — but not because of survivorship.</b>
@@ -276,8 +296,7 @@ caps single-sector piling, but there is no per-name weight cap). The universe is
 <b>Trade-Republic-investable</b> set across
 {nc} countries, each priced off its <b>home exchange × EUR FX</b> (the Lang &amp; Schwarz
 model — NVIDIA on NASDAQ, Samsung on KRX, in their own currency converted to EUR), behind a
-≥100k/day turnover floor. Membership uses peak turnover over the whole window, so there is a
-mild liquidity look-ahead, and TR-routability is assumed from liquidity, not verified. Daily
+≥100k/day turnover floor. {liq}, and TR-routability is assumed from liquidity, not verified. Daily
 closes only — intraday execution and borrow costs (for any future short overlay) are ignored.
 </div>"""
 

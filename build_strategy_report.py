@@ -31,14 +31,15 @@ from tools.momentum import (run_momentum, winsorize_prices, to_xetra_calendar,
                             precompute_eligibility, benchmark_curves, equal_weight_curve,
                             rebalance_dates)
 from tools.universe_pit import PITUniverse
-from tools.universe_assemble import delisting_map
+from tools.universe_assemble import delisting_map, death_map, death_mask
+from tools import universe_snapshot
 from tools.momentum_grid import MomentumConfig, _stats_slice, run_grid, ALL_CONFIGS, pick_ultimate
 from tools.portfolio_tools import BENCHMARKS, parse_portfolio
 from tools.portfolio_analytics import build_roi_timeseries
 from tools.data_buffer import cached_price_history
 from build_momentum_report import (
-    PRICES_CSV, META_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
-    FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG, K,
+    PRICES_CSV, META_CSV, TURN_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
+    FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG, K, MIN_TURNOVER,
     _slip, _broker, _disp, _name, _pnl_color, _equity_window,
     sec_grid, sec_feasibility, sec_timelines, sec_survivorship, sec_method,
 )
@@ -175,7 +176,8 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
     return [raw, rc]
 
 
-def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return):
+def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return,
+                      membership=None, turnover=None):
     """Multi-intensity on-population delisting stress (bull/base/bear). Inject synthetic deaths
     into the LIVE names at each preset's hazard/loss, re-run the SAME strategy SURV_SIMS×, and per
     run derive: raw net return, the risk-conscious (vol-targeted) curve, annualised CAPM alpha vs
@@ -183,9 +185,10 @@ def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return
     picks. Observational — never feeds selection/sizing. Seeds 0..K-1 shared across presets.
 
     Returns {"presets": {name: stress_summarize(...) + hazard/loss}, "clean": {...}, "sims": K}."""
-    dead = set(meta_df.loc[meta_df["delisting_date"].notna(), "ticker"])
+    dead = set(meta_df.loc[meta_df["delisting_date"].notna(), "ticker"])   # every exit: not injectable
     live_cols = [c for c in prices.columns if c not in dead]
-    base_map = delisting_map(meta_df)
+    base_map = delisting_map(meta_df)                  # all exits (gates eligibility)
+    base_deaths = death_map(meta_df)                   # true deaths (graveyard stats)
     window = _equity_window(res)
     first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
 
@@ -221,11 +224,14 @@ def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return
                 continue
             inj = prices.copy(); inj[live_cols] = inj_live
             dmap = dict(base_map); dmap.update({t: dt for t, (dt, _l) in deaths.items()})
+            dd = dict(base_deaths); dd.update({t: dt for t, (dt, _l) in deaths.items()})
             r = run_momentum(inj, {t: slip[t] for t in inj.columns if t in slip},
                              lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
                              start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
-                             sectors=sectors, benchmark=spx, pit=PITUniverse(inj, dmap),
-                             execute_lag=EXEC_LAG, **cfg.kwargs())
+                             sectors=sectors, benchmark=spx,
+                             pit=PITUniverse(inj, dmap, deaths=dd, membership=membership),
+                             execute_lag=EXEC_LAG, turnover=turnover, turn_floor=MIN_TURNOVER,
+                             **cfg.kwargs())
             req = r["runs"][1.0]["equity"]
             rrc = _rc(req).get("equity")
             inj_ew = equal_weight_curve(inj, first_picks, window, CAPITAL) if first_picks else None
@@ -254,7 +260,17 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     meta = {r["ticker"]: dict(r) for _, r in meta_df.iterrows()}
     slip = {t: _slip(m) for t, m in meta.items() if t in prices.columns}
     sectors = {t: m.get("sector") for t, m in meta.items()}     # real GICS now (tools.enrich_sectors)
-    pit = PITUniverse(prices, delisting_map(meta_df))
+    # PIT extras: monthly turnover (liquidity gate; absent until the next fetch), the TR
+    # snapshot store (membership gate, active from the first snapshot forward), and the
+    # exits/deaths split (ledger demotions gate eligibility but aren't graveyard deaths).
+    turnover = (pd.read_csv(TURN_CSV, index_col=0, parse_dates=True)
+                if TURN_CSV.exists() else None)
+    snap_store = universe_snapshot.load_store()
+    ticker_isin = {r["ticker"]: str(r["isin"]) for _, r in meta_df.iterrows()
+                   if pd.notna(r.get("isin"))}
+    membership = (snap_store, ticker_isin) if len(snap_store) else None
+    pit = PITUniverse(prices, delisting_map(meta_df), deaths=death_map(meta_df),
+                      membership=membership)
 
     benches = {n: v for n, v in BENCHMARKS.items() if n != "Bitcoin"}   # equities/bonds only
     bench_tickers = [tk for tk, _ in benches.values()]
@@ -269,7 +285,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     #    every run below; STRATEGY is only the fallback if nothing qualifies.
     grid = run_grid(prices, slip, sectors=sectors, benchmark=spx, pit=pit, start=START,
                     configs=ALL_CONFIGS, train_end=TRAIN_END, val_end=VAL_END, capital=CAPITAL,
-                    lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG)
+                    lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG,
+                    turnover=turnover, turn_floor=MIN_TURNOVER)
     picked = pick_ultimate(grid, capital=CAPITAL, fee_eur=FEE_EUR)
     cfg = picked["config"] if picked else STRATEGY
 
@@ -277,7 +294,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     res = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=CAPITAL,
                        cost_mults=COST_MULTS, start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
                        min_price=MIN_PRICE, sectors=sectors, benchmark=spx, pit=pit,
-                       execute_lag=EXEC_LAG, **cfg.kwargs())
+                       execute_lag=EXEC_LAG, turnover=turnover, turn_floor=MIN_TURNOVER,
+                       **cfg.kwargs())
     eq, tr = res["runs"][1.0]["equity"], res["runs"][1.0]["trades"]
     te, ve = pd.Timestamp(TRAIN_END), pd.Timestamp(VAL_END)
     train = _stats_slice(eq, tr, eq.index[0], te, CAPITAL)
@@ -297,12 +315,13 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     n_dead_dropped = int(meta_df["delisting_date"].notna().sum() - ub_meta["delisting_date"].notna().sum())
     ub_tickers = set(ub_meta["ticker"])
     ub_prices = prices[[c for c in prices.columns if c in ub_tickers]]
-    ub_pit = PITUniverse(ub_prices, delisting_map(ub_meta))
+    ub_pit = PITUniverse(ub_prices, delisting_map(ub_meta), deaths=death_map(ub_meta),
+                         membership=membership)
     ub_res = run_momentum(ub_prices, {t: slip[t] for t in ub_prices.columns if t in slip},
                           lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
                           start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
                           sectors=sectors, benchmark=spx, pit=ub_pit, execute_lag=EXEC_LAG,
-                          **cfg.kwargs())
+                          turnover=turnover, turn_floor=MIN_TURNOVER, **cfg.kwargs())
     ub_eq, ub_tr = ub_res["runs"][1.0]["equity"], ub_res["runs"][1.0]["trades"]
     bounds = dict(lower_full=test["net_return"], n_dead_dropped=n_dead_dropped,
                   upper_full=ub_res["runs"][1.0]["stats"]["net_return"],
@@ -316,7 +335,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     if SURV_SIMS > 0:
         try:
             delisting_stress = _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res,
-                                                 base_return=res["runs"][1.0]["stats"]["net_return"])
+                                                 base_return=res["runs"][1.0]["stats"]["net_return"],
+                                                 membership=membership, turnover=turnover)
             surv_inject = delisting_stress["presets"]["base"]   # base == the single-intensity result
         except Exception as e:
             print(f"delisting-stress skipped: {e}", file=sys.stderr)
@@ -327,7 +347,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     hl = res["holdings_log"]
     rb_dates = [h["date"] for h in hl] + [hl[-1]["next"]]
     elig = precompute_eligibility(prices, slip, rb_dates, liq_max=LIQ_MAX,
-                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE, pit=pit)
+                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE, pit=pit,
+                                  turnover=turnover, turn_floor=MIN_TURNOVER)
     pools = sig.period_pools(prices, rb_dates, elig, execute_lag=EXEC_LAG)
     strat_rets = sig.strategy_period_returns(hl)
     ppy = {"Q": 4.0, "M": 12.0, "W": 52.0}.get(cfg.freq, 12.0)
@@ -389,8 +410,11 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
         strip_res = run_momentum(kept, {t: slip[t] for t in kept.columns if t in slip},
                                  lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
                                  start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
-                                 sectors=sectors, benchmark=spx, pit=PITUniverse(kept, delisting_map(meta_df)),
-                                 execute_lag=EXEC_LAG, **cfg.kwargs())
+                                 sectors=sectors, benchmark=spx,
+                                 pit=PITUniverse(kept, delisting_map(meta_df),
+                                                 deaths=death_map(meta_df), membership=membership),
+                                 execute_lag=EXEC_LAG, turnover=turnover, turn_floor=MIN_TURNOVER,
+                                 **cfg.kwargs())
         s_eq, s_tr = strip_res["runs"][1.0]["equity"], strip_res["runs"][1.0]["trades"]
         s_test = _stats_slice(s_eq, s_tr, ve + pd.Timedelta(days=1), s_eq.index[-1], CAPITAL)
         cond = regime_attr.conditional_performance(eq.pct_change().dropna(),
@@ -440,7 +464,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 vsr = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=invested,
                                    cost_mults=(1.0,), start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
                                    min_price=MIN_PRICE, sectors=sectors, benchmark=spx, pit=pit,
-                                   execute_lag=EXEC_LAG, **cfg.kwargs())
+                                   execute_lag=EXEC_LAG, turnover=turnover,
+                                   turn_floor=MIN_TURNOVER, **cfg.kwargs())
                 vse = vsr["runs"][1.0]["equity"]
                 vs_scale = dict(capital=invested, raw_equity=vse,
                                 rc_equity=qg.vol_target(vse, target_vol=RISK_TARGET_VOL,
@@ -453,7 +478,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
                 strategy=cfg, train=train, val=val, test=test, graveyard_hits=hits,
                 surv_inject=surv_inject, delisting_stress=delisting_stress,
-                grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
+                grid=grid, n_dead=int(death_mask(meta_df).sum()),
+                turnover_pit=turnover is not None,
                 n_countries=n_countries,
                 n_live=n_live, bounds=bounds, regime=reg, eff_bets=eff_bets,
                 regime_attr=ratt, scenarios=scenarios,
@@ -529,8 +555,9 @@ def sec_intro(d: dict) -> str:
             f"<b>Trade-Republic-investable</b> names across <b>{nc} countries</b>, each priced off "
             "its <b>home exchange × EUR FX</b> — the way Lang &amp; Schwarz actually fills you "
             "(NVIDIA on NASDAQ, Samsung on KRX, Rheinmetall on XETRA, in their own currency, "
-            "converted to EUR). Behind a <b>≥100k/day turnover</b> floor. Long-only, walk-forward, "
-            "executable. Not advice.</div>")
+            "converted to EUR). Behind a <b>≥100k/day turnover</b> floor"
+            + (", re-checked point-in-time each rebalance" if d.get("turnover_pit") else "")
+            + ". Long-only, walk-forward, executable. Not advice.</div>")
 
 
 # ── Picks (the risk-conscious book) ─────────────────────────────────────────────
@@ -1203,6 +1230,13 @@ def sec_caveat(d: dict) -> str:
             f'worst-case cumulative drag averages <b>{rel:+.0f}%</b> of the level, but it is a wide, '
             f'high-variance tail. Either way this does <b>not</b> touch the <i>membership</i> leak '
             f'(absent winners) — that stays the real problem.')
+    ledger = (
+        ' <b>Forward fix live:</b> the universe refresh keeps an append-only membership '
+        'ledger (a live name that dies, loses liquidity or leaves TR is carried with an '
+        'exit date — never silently dropped), and point-in-time snapshots of TR\'s own '
+        'list gate eligibility from <b>2026-06-29</b> forward (a name is only pickable at '
+        't if TR offered it at t). Neither rewrites the past — the historical window stays '
+        'survivor-biased and stress-bounded — but the bleed stops compounding from here.')
     return (
         f'<div class="note warn"><b>The dominant caveat — survivorship is NOT corrected.</b> '
         f'The live universe is Trade Republic’s <i>current</i> list — names that <b>survived to '
@@ -1211,7 +1245,7 @@ def sec_caveat(d: dict) -> str:
         f'near-disjoint EODHD relic (<b>{ov*100:.0f}%</b> ISIN overlap with the live set), so they '
         f'do <b>not</b> fix it.{bound_txt} This is the single biggest reason to distrust the raw '
         f'level, and is why the raw full-invested curve is kept in the lab, not on the main '
-        f'page.{trade}{onpop}'
+        f'page.{trade}{onpop}{ledger}'
         f'<br><br>The other caveats: <b>(1) Regime</b> — 2024→ was an exceptional small-cap momentum '
         f'tape; even the held-out {test_ret:+.0f}% test figure is regime-specific and will <b>not</b> '
         f'repeat. <b>(2) Concentration</b> — top-{d["strategy"].slots}; sector-neutral (B) now caps '
