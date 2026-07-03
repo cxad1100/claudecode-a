@@ -53,7 +53,8 @@ def _stats_slice(equity: pd.Series, trades: list, lo, hi, capital: float) -> dic
 
 def run_grid(prices, slippage_bps, *, sectors=None, benchmark=None, pit=None,
              configs=None, start="2018-01-01", train_end="2022-12-31", val_end=None,
-             capital=10_000.0, lookback=252, skip=21, execute_lag=0) -> dict:
+             capital=10_000.0, lookback=252, skip=21, execute_lag=0,
+             turnover=None, turn_floor=100_000.0, turn_window=6) -> dict:
     """Run each config walk-forward over [start, end]; partition each equity curve +
     trades into train (≤ train_end), validation (train_end < t ≤ val_end) and — when
     `val_end` is given — a held-out test (> val_end). `test` is the honest check: the
@@ -72,7 +73,9 @@ def run_grid(prices, slippage_bps, *, sectors=None, benchmark=None, pit=None,
     cand_dates = [d for d in rebalance_dates(prices.index, "M")
                   if len(prices.loc[:d]) >= lookback + 1 and d >= cutoff]
     elig_by_date = precompute_eligibility(prices, slippage_bps, cand_dates,
-                                          min_obs=lookback + skip, pit=pit)
+                                          min_obs=lookback + skip, pit=pit,
+                                          turnover=turnover, turn_floor=turn_floor,
+                                          turn_window=turn_window)
     score_by_date = precompute_scores(prices, cand_dates, lookback, skip)
     cells = []
     for cfg in configs:
