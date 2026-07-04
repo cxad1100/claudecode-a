@@ -37,3 +37,49 @@ def test_env_flag_disables_module(monkeypatch):
     assert er._enabled("leadlag") is False
     monkeypatch.setenv("ECONO_LEADLAG", "1")
     assert er._enabled("leadlag") is True
+
+
+def _fake_stats(sh=1.0, net=0.5):
+    return dict(net_return=net, sharpe=sh, max_drawdown=-0.2, n_trades=40,
+                win_rate=0.6, avg_days=90, total_costs=100.0)
+
+
+def test_sec_leadlag_renders_cells_and_verdict():
+    cell = dict(code="Q-r21-raw", kind="signal", train=_fake_stats(),
+                val=_fake_stats(0.8), test=_fake_stats(0.6), full=_fake_stats())
+    base = dict(cell, code="Q-r21-base", kind="baseline")
+    plac = dict(cell, code="Q-r21-plac", kind="placebo", full=_fake_stats(-0.2))
+    d = {"leadlag": dict(
+        cells=[cell, base, plac],
+        headline=dict(code="Q-r21-raw", mc=dict(p_total=0.03, p_sharpe=0.04),
+                      dsr_phantom=[dict(mult=1, n=74, dsr=0.7),
+                                   dict(mult=5, n=370, dsr=0.55),
+                                   dict(mult=10, n=740, dsr=0.4)],
+                      t_stat=2.4,
+                      factor={"model": "FF5+WML", "alpha_ann": 0.06,
+                              "alpha_t": 2.2, "n": 1500, "source": "dev"}),
+        ic=dict(r5=dict(mean=0.02, t=1.1, n=90), r21=dict(mean=0.01, t=0.6, n=90)),
+        diag=dict(median_kept=140, expected_false=90, mean_self_lag=0.04,
+                  median_uni=300),
+        n_trials=10)}
+    html = er.sec_leadlag(d, False)
+    assert "Q-r21-raw" in html and "placebo" in html.lower()
+    assert "baseline" in html.lower()
+    assert "DSR" in html
+    assert "verdict" in html.lower()
+
+
+def test_sec_leadlag_placebo_beats_headline_forces_leak_warning():
+    cell = dict(code="Q-r21-raw", kind="signal", train=_fake_stats(),
+                val=_fake_stats(), test=_fake_stats(), full=_fake_stats(sh=0.5))
+    plac = dict(cell, code="Q-r21-plac", kind="placebo", full=_fake_stats(sh=1.5))
+    d = {"leadlag": dict(cells=[cell, plac],
+                         headline=dict(code="Q-r21-raw", mc=dict(p_sharpe=0.01),
+                                       dsr_phantom=[dict(mult=5, n=370, dsr=0.9)],
+                                       t_stat=3.0,
+                                       factor={"model": "FF5+WML", "alpha_ann": 0.1,
+                                               "alpha_t": 3.0, "n": 1500,
+                                               "source": "dev"}),
+                         ic={}, diag={}, n_trials=10)}
+    html = er.sec_leadlag(d, False)
+    assert "leak" in html.lower()
