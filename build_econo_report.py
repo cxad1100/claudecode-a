@@ -54,6 +54,9 @@ LL_SEED = 0
 #: the strategy page's 64-config grid is inherited history in the DSR trial
 #: count; every econo cell (controls included) adds to it and never leaves.
 N_INHERITED_TRIALS = 64
+CORR_N_CLUSTERS = 20          # M2: statistical clusters per rebalance
+PH_TARGET_VOL = 0.15          # M3: vol-target baseline (strategy-page RC twin)
+PH_TURN_BPS = 25.0            # M3: resize cost charged to BOTH overlays
 PHANTOM_MULTS = (1, 5, 10)    # file-drawer ladder (strategy-page convention)
 FACTORS = os.environ.get("FACTORS", "1") != "0"
 
@@ -233,6 +236,147 @@ def _gather_leadlag(u: dict) -> dict:
                 ic=ic, diag=diag, n_trials=len(cells))
 
 
+def _gather_corr(u: dict) -> dict:
+    """M2: does statistical clustering beat GICS for book construction?
+    Same plain-momentum scores three ways — GICS-neutral, cluster-neutral,
+    no grouping — judged on val+test Sharpe and PCA effective bets. Plus the
+    canonical RMT read of the latest correlation matrix."""
+    from tools import quant_grade as qg
+    from tools.corr_struct import (cluster_maps_by_date, mp_clip, rand_index)
+    from tools.momentum import precompute_scores
+    prices, slip, turnover, pit, sectors = (u["prices"], u["slip"],
+                                            u["turnover"], u["pit"],
+                                            u["sectors"])
+    cutoff = pd.Timestamp(START)
+    cand = [d for d in rebalance_dates(prices.index, "M")
+            if len(prices.loc[:d]) >= LOOKBACK + 1 and d >= cutoff]
+    elig = precompute_eligibility(prices, slip, cand, liq_max=LIQ_MAX,
+                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE,
+                                  pit=pit, turnover=turnover,
+                                  turn_floor=MIN_TURNOVER)
+    scores = precompute_scores(prices, cand, LOOKBACK, SKIP)
+    # trailing-window PIT clusters, capped to the liquid graph universe so the
+    # matrix is estimable (T=252 vs N≤300)
+    members = {d: set(network_universe(prices, turnover, d,
+                                       elig.get(d, set()), top_n=LL_TOP_N))
+               for d in cand}
+    cl_maps = cluster_maps_by_date(prices, cand, members, window=LOOKBACK,
+                                   n_clusters=CORR_N_CLUSTERS)
+    te, ve = pd.Timestamp(TRAIN_END), pd.Timestamp(VAL_END)
+
+    def _run(sector_neutral, by_date, code):
+        r = run_momentum(prices, slip, k=LL_K, lookback=LOOKBACK, skip=SKIP,
+                         capital=CAPITAL, cost_mults=(1.0,), freq="Q",
+                         liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                         start=START, sectors=sectors,
+                         sector_neutral=sector_neutral, lazy=True, pit=pit,
+                         execute_lag=EXEC_LAG, turnover=turnover,
+                         turn_floor=MIN_TURNOVER, elig_by_date=elig,
+                         score_by_date=scores, sectors_by_date=by_date)
+        eq, tr = r["runs"][1.0]["equity"], r["runs"][1.0]["trades"]
+        ebs = []
+        for h in r["holdings_log"]:
+            picks = [t for t in h["picks"] if t in prices.columns]
+            if len(picks) < 2:
+                continue
+            win = prices[picks].loc[:h["date"]].tail(LOOKBACK) \
+                .pct_change().dropna(how="all")
+            m = qg.effective_bets(win, np.full(len(picks), 1.0 / len(picks)))
+            if m:
+                ebs.append(m["n_eff_pca"])
+        return dict(code=code,
+                    train=_stats_slice(eq, tr, eq.index[0], te, CAPITAL),
+                    val=_stats_slice(eq, tr, te + pd.Timedelta(days=1), ve,
+                                     CAPITAL),
+                    test=_stats_slice(eq, tr, ve + pd.Timedelta(days=1),
+                                      eq.index[-1], CAPITAL),
+                    full=r["runs"][1.0]["stats"],
+                    eff_bets=float(np.mean(ebs)) if ebs else float("nan"))
+
+    variants = [_run(True, None, "GICS-neutral"),
+                _run(True, cl_maps, "cluster-neutral"),
+                _run(False, None, "no-grouping")]
+
+    # RMT read + GICS agreement on the latest window
+    d_last = cand[-1]
+    cols = sorted(members[d_last])
+    w = prices.loc[:d_last, cols].tail(LOOKBACK + 1)
+    r_ = w.pct_change()
+    keep = list(r_.columns[r_.notna().sum() >= 126])
+    corr = r_[keep].corr()
+    _, info = mp_clip(corr.to_numpy(), T=len(r_))
+    gics_last = {t: sectors.get(t) for t in keep if sectors.get(t)}
+    rand = rand_index(cl_maps.get(d_last, {}), gics_last)
+    return dict(rmt=dict(lambda_plus=info["lambda_plus"],
+                         n_signal_eigs=info["n_signal_eigs"],
+                         market_share=info["var_explained_market"],
+                         n_names=len(keep), T=int(len(r_))),
+                rand_gics=float(rand), n_clusters=CORR_N_CLUSTERS,
+                variants=variants, n_trials=2)
+
+
+def _gather_phase(u: dict) -> dict:
+    """M3: phase-transition stress gauges (observational) + the AR-throttle
+    vs vol-target head-to-head on the same plain-momentum book. Promotion
+    (and its 4 trials) only if the throttle beats vol targeting on val AND
+    test Sharpe with no worse drawdown."""
+    from tools import quant_grade as qg
+    from tools.phase_transition import (absorption_ratio, ar_throttle,
+                                        breadth, susceptibility)
+    prices, slip, turnover, pit, sectors = (u["prices"], u["slip"],
+                                            u["turnover"], u["pit"],
+                                            u["sectors"])
+    cutoff = pd.Timestamp(START)
+    cand = [d for d in rebalance_dates(prices.index, "M")
+            if len(prices.loc[:d]) >= LOOKBACK + 1 and d >= cutoff]
+    elig = precompute_eligibility(prices, slip, cand, liq_max=LIQ_MAX,
+                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE,
+                                  pit=pit, turnover=turnover,
+                                  turn_floor=MIN_TURNOVER)
+    r = run_momentum(prices, slip, k=LL_K, lookback=LOOKBACK, skip=SKIP,
+                     capital=CAPITAL, cost_mults=(1.0,), freq="Q",
+                     liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                     start=START, sectors=sectors, sector_neutral=True,
+                     lazy=True, pit=pit, execute_lag=EXEC_LAG,
+                     turnover=turnover, turn_floor=MIN_TURNOVER,
+                     elig_by_date=elig)
+    eq = r["runs"][1.0]["equity"]
+
+    m = breadth(prices)
+    chi = susceptibility(m)
+    ar_df = absorption_ratio(prices, turnover=turnover, top_n=LL_TOP_N)
+    vt = qg.vol_target(eq, target_vol=PH_TARGET_VOL, turn_cost_bps=PH_TURN_BPS)
+    art = ar_throttle(eq, ar_df["ar"], turn_cost_bps=PH_TURN_BPS)
+
+    te, ve = pd.Timestamp(TRAIN_END), pd.Timestamp(VAL_END)
+
+    def _row(code, curve, expo):
+        val = _stats_slice(curve, [], te + pd.Timedelta(days=1), ve, CAPITAL)
+        test = _stats_slice(curve, [], ve + pd.Timedelta(days=1),
+                            curve.index[-1], CAPITAL)
+        dd = qg.perf_metrics(curve).get("max_dd", float("nan"))
+        return dict(code=code, val=val["sharpe"], test=test["sharpe"],
+                    dd=dd, expo=expo)
+
+    rows = [_row("raw book", eq, 1.0)]
+    if vt:
+        rows.append(_row(f"vol-target {PH_TARGET_VOL:.0%}", vt["equity"],
+                         vt["avg_exposure"]))
+    if art.get("equity") is not None and len(art["equity"]):
+        rows.append(_row("AR-throttle", art["equity"], art["avg_exposure"]))
+    promoted = (len(rows) == 3
+                and rows[2]["val"] > rows[1]["val"]
+                and rows[2]["test"] > rows[1]["test"]
+                and rows[2]["dd"] >= rows[1]["dd"])
+    a = ar_df["ar"].dropna()
+    c = chi.dropna()
+    return dict(rows=rows, promoted=bool(promoted),
+                n_trials=4 if promoted else 0,
+                ar_now=float(a.iloc[-1]) if len(a) else float("nan"),
+                ar_pct=float((a <= a.iloc[-1]).mean()) if len(a) else float("nan"),
+                chi_pct=float((c <= c.iloc[-1]).mean()) if len(c) else float("nan"))
+
+
 def gather() -> dict:
     """Run every enabled module; a disabled or failed module leaves None.
 
@@ -253,6 +397,16 @@ def gather() -> dict:
             d["leadlag"] = _gather_leadlag(u)
         except Exception as e:
             print(f"[econo] leadlag skipped: {e}", file=sys.stderr)
+    if _enabled("corr"):
+        try:
+            d["corr"] = _gather_corr(u)
+        except Exception as e:
+            print(f"[econo] corr skipped: {e}", file=sys.stderr)
+    if _enabled("phase"):
+        try:
+            d["phase"] = _gather_phase(u)
+        except Exception as e:
+            print(f"[econo] phase skipped: {e}", file=sys.stderr)
     return d
 
 
@@ -382,15 +536,102 @@ Frazzini (2008, JF); Hou (2007, RFS).</p></details>"""
 
 
 def sec_corr(d: dict, public: bool) -> str:
-    if d.get("corr") is None:
+    c = d.get("corr")
+    if c is None:
         return ""
-    return "<h2>Correlation structure</h2>"
+    rmt = c.get("rmt") or {}
+    rows = []
+    for v in c.get("variants", []):
+        rows.append(
+            f"<tr><td class='mono'>{v['code']}</td>"
+            f"<td class='mono'>{v['train']['sharpe']:.2f}</td>"
+            f"<td class='mono'>{v['val']['sharpe']:.2f}</td>"
+            f"<td class='mono'>{v['test']['sharpe']:.2f}</td>"
+            f"<td>{_pct(v['full']['net_return'] * 100)}</td>"
+            f"<td class='mono'>{v['eff_bets']:.2f}</td></tr>")
+    by = {v["code"]: v for v in c.get("variants", [])}
+    g, cl = by.get("GICS-neutral"), by.get("cluster-neutral")
+    if g and cl:
+        better = (cl["val"]["sharpe"] >= g["val"]["sharpe"]
+                  and cl["test"]["sharpe"] >= g["test"]["sharpe"]
+                  and cl["eff_bets"] > g["eff_bets"])
+        vcls, vtext = (("pos", "Cluster-neutral construction beats GICS on "
+                        "val AND test with more effective bets — promoted as "
+                        "the book-construction default candidate (2 trials "
+                        "charged to the ledger).") if better else
+                       ("", "Cluster-neutral does not beat GICS-neutral out "
+                        "of sample — statistical clustering stays a "
+                        "diagnostic/teaching tool, GICS grouping keeps the "
+                        "book. (Construction experiment, not alpha; 2 trials "
+                        "charged.)"))
+    else:
+        vcls, vtext = "", "Comparison incomplete."
+    return f"""<h2>Correlation structure — RMT + cluster-neutral books</h2>
+<p class="sub">Same plain 12-1 momentum scores, three constructions: GICS
+round-robin, trailing-correlation cluster round-robin ({c.get('n_clusters')}
+clusters, average linkage, PIT windows), no grouping. Construction experiment
+— the signal never changes.</p>
+<p class="mono sub">RMT (latest window, {rmt.get('n_names', 0)} names ×
+T={rmt.get('T', 0)}): λ+ = {rmt.get('lambda_plus', float('nan')):.2f} ·
+signal eigenvalues {rmt.get('n_signal_eigs', 0)} ·
+market mode {rmt.get('market_share', float('nan')) * 100:.0f}% of variance ·
+Rand agreement clusters↔GICS {c.get('rand_gics', float('nan')):.2f}</p>
+<table><thead><tr><th>construction</th><th>train S</th><th>val S</th>
+<th>test S</th><th>full net</th><th>mean effective bets</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+<div class="callout"><b>Verdict:</b> <span class="{vcls}">{vtext}</span></div>
+<details><summary>Method &amp; references</summary>
+<p>Correlation matrices on T≈252, N≈300 are mostly noise: Marchenko–Pastur
+bulk edge λ+ = (1+√(N/T))² separates signal eigenvalues from the random bulk
+(Laloux, Cizeau, Bouchaud, Potters 1999; Plerou et al. 2002). Distance
+d = √(2(1−ρ)) (Mantegna 1999); average-linkage hierarchical clustering — MST
+is single linkage's skeleton and chains, so it stays a viz. Cluster-neutral
+selection = the engine's sector round-robin fed per-rebalance statistical
+clusters (López de Prado 2016 HRP is the weighted cousin; equal-weight top-k
+is this harness's contract). Ledoit–Wolf (2004) shrinkage available in
+tools/corr_struct.py for anything downstream needing an invertible Σ.</p>
+</details>"""
 
 
 def sec_phase(d: dict, public: bool) -> str:
-    if d.get("phase") is None:
+    p = d.get("phase")
+    if p is None:
         return ""
-    return "<h2>Phase-transition indicators</h2>"
+    rows = "".join(
+        f"<tr><td>{r['code']}</td><td class='mono'>{r['val']:.2f}</td>"
+        f"<td class='mono'>{r['test']:.2f}</td>"
+        f"<td class='mono'>{r['dd'] * 100:.1f}%</td>"
+        f"<td class='mono'>{r['expo']:.2f}</td></tr>"
+        for r in p.get("rows", []))
+    if p.get("promoted"):
+        vcls, vtext = "pos", ("AR-throttle beats vol targeting on val AND "
+                              "test with no worse drawdown — promoted; its 4 "
+                              "threshold trials are charged to the ledger.")
+    else:
+        vcls, vtext = "", ("AR-throttle does not beat plain vol targeting "
+                           "out of sample — stays observational (0 trials "
+                           "charged), exactly the expected outcome for a "
+                           "coincident stress gauge.")
+    return f"""<h2>Phase-transition gauges — breadth, χ, absorption ratio</h2>
+<p class="sub">Ising framing: breadth M(t) = magnetization, χ = Var(M) =
+susceptibility, absorption ratio = eigenvalue concentration (Kritzman 2011).
+Causal trailing windows; observational by construction — same culture pin as
+the HMM (never imported by selection).</p>
+<p class="mono sub">now: AR {p.get('ar_now', float('nan')):.2f}
+(expanding percentile {p.get('ar_pct', float('nan')) * 100:.0f}%) ·
+χ percentile {p.get('chi_pct', float('nan')) * 100:.0f}%</p>
+<table><thead><tr><th>curve</th><th>val S</th><th>test S</th><th>maxDD</th>
+<th>avg exposure</th></tr></thead><tbody>{rows}</tbody></table>
+<div class="callout"><b>Verdict:</b> <span class="{vcls}">{vtext}</span></div>
+<details><summary>Method &amp; references</summary>
+<p>Exposure slides 1→0.3 between the EXPANDING-TRAILING 50th and 90th AR
+percentiles (full-sample quantiles are the classic look-ahead in this
+literature), applied at t+1 and charged {PH_TURN_BPS:.0f} bps on |Δexposure|
+— the identical contract as the vol-target twin, so the comparison is fair.
+References: Kritzman, Li, Page, Rigobon (2011, JPM); Preis, Kenett, Stanley,
+Helbing, Ben-Jacob (2012, Sci Rep); Sornette (2003) — cited with the honest
+caveat that critical-point CRASH PREDICTION has a weak out-of-sample record,
+which is why this module is a risk gauge, not a signal.</p></details>"""
 
 
 def sec_events(d: dict, public: bool) -> str:

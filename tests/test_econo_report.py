@@ -83,3 +83,40 @@ def test_sec_leadlag_placebo_beats_headline_forces_leak_warning():
                          ic={}, diag={}, n_trials=10)}
     html = er.sec_leadlag(d, False)
     assert "leak" in html.lower()
+
+
+def test_sec_corr_renders_variants_and_rmt():
+    d = {"corr": dict(
+        rmt=dict(lambda_plus=1.42, n_signal_eigs=12, market_share=0.31,
+                 n_names=300, T=252),
+        rand_gics=0.71, n_clusters=20,
+        variants=[dict(code="GICS-neutral", train=_fake_stats(),
+                       val=_fake_stats(0.7), test=_fake_stats(0.9),
+                       full=_fake_stats(), eff_bets=2.6),
+                  dict(code="cluster-neutral", train=_fake_stats(),
+                       val=_fake_stats(0.8), test=_fake_stats(1.0),
+                       full=_fake_stats(), eff_bets=3.4),
+                  dict(code="no-grouping", train=_fake_stats(),
+                       val=_fake_stats(0.5), test=_fake_stats(0.8),
+                       full=_fake_stats(), eff_bets=2.1)],
+        n_trials=2)}
+    html = er.sec_corr(d, False)
+    assert "cluster-neutral" in html and "GICS" in html
+    assert "λ" in html or "lambda" in html.lower()
+    assert "effective bets" in html.lower()
+    assert "verdict" in html.lower()
+    assert er.sec_corr({}, False) == ""
+
+
+def test_sec_phase_renders_overlays_and_verdict():
+    d = {"phase": dict(
+        ar_now=0.71, ar_pct=0.93, chi_pct=0.55,
+        rows=[dict(code="raw book", val=1.0, test=0.9, dd=-0.25, expo=1.0),
+              dict(code="vol-target 15%", val=1.1, test=0.95, dd=-0.18, expo=0.8),
+              dict(code="AR-throttle", val=1.05, test=0.97, dd=-0.17, expo=0.85)],
+        promoted=False, n_trials=0)}
+    html = er.sec_phase(d, False)
+    assert "absorption" in html.lower()
+    assert "vol-target" in html and "AR-throttle" in html
+    assert "verdict" in html.lower()
+    assert "observational" in html.lower()
