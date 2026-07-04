@@ -30,7 +30,7 @@ from tools import factors
 from tools import significance as sig
 from tools import universe_snapshot
 from tools.data_buffer import cached_price_history
-from tools.leadlag import (leadlag_scores, rank_ic,
+from tools.leadlag import (leadlag_scores, network_universe, rank_ic,
                            size_leadlag_baseline_scores)
 from tools.momentum import (precompute_eligibility, rebalance_dates,
                             run_momentum, to_xetra_calendar, winsorize_prices)
@@ -158,6 +158,26 @@ def _gather_leadlag(u: dict) -> dict:
     ppy = 4.0 if head_cell["freq"] == "Q" else 12.0
     mc = sig.monte_carlo_null(pools, strat_rets, k=LL_K, ppy=ppy,
                               n_trials=1000, seed=0)
+    # Matched null: random books drawn from the GRAPH MEMBERS, not the full
+    # pool. The signal can only ever hold graph members, so the full-pool null
+    # conflates the membership tilt (top-N liquidity screen) with selection
+    # skill — the matched null isolates selection. Both are reported.
+    members = {d: set(network_universe(prices, turnover, d,
+                                       elig.get(d, set()), top_n=LL_TOP_N))
+               for d in rb}
+    pools_m = sig.period_pools(prices, rb, members, execute_lag=EXEC_LAG)
+    mc_matched = sig.monte_carlo_null(pools_m, strat_rets, k=LL_K, ppy=ppy,
+                                      n_trials=1000, seed=0)
+
+    def _ew(ps):
+        x = np.array([float(np.mean(p)) for p in ps if len(p) > 10])
+        if len(x) < 2 or x.std(ddof=1) == 0:
+            return dict(total=float("nan"), sharpe=float("nan"), n=len(x))
+        return dict(total=float(np.prod(1 + x) - 1),
+                    sharpe=float(x.mean() / x.std(ddof=1) * np.sqrt(ppy)),
+                    n=len(x))
+
+    ew = dict(graph=_ew(pools_m), pool=_ew(pools))
     trial_sharpes = [c["full"]["sharpe"] for c in cells]
     n_total = N_INHERITED_TRIALS + len(cells)
     dsr0 = sig.deflated_sharpe_ratio(strat_rets, trial_sharpes, ppy=ppy,
@@ -207,6 +227,7 @@ def _gather_leadlag(u: dict) -> dict:
 
     return dict(cells=cells,
                 headline=dict(code=head_cell["code"], mc=mc,
+                              mc_matched=mc_matched, ew=ew,
                               dsr_phantom=dsr_phantom, t_stat=t_stat,
                               factor=factor),
                 ic=ic, diag=diag, n_trials=len(cells))
@@ -256,12 +277,23 @@ def _verdict_leadlag(ll: dict) -> tuple[str, str]:
     plac = [c for c in cells if c["kind"] == "placebo"]
     if plac and head_full and \
             max(p["full"]["sharpe"] for p in plac) >= head_full["full"]["sharpe"]:
+        mcm_p = (head.get("mc_matched") or {}).get("p_sharpe")
+        if mcm_p is not None and mcm_p >= 0.2:
+            return "neg", ("Killed — no selection information. The shuffled-"
+                           "leader placebo matches the signal and the matched "
+                           f"null (random books from the graph members) gives "
+                           f"p≈{mcm_p:.2f}: the apparent profit is the "
+                           "liquidity-membership screen plus universe beta, "
+                           "not lead-lag. The full-pool null credited that "
+                           "tilt as significance — lesson recorded.")
         return "neg", ("Pipeline leak suspected: the shuffled-leader placebo "
                        "matches or beats the signal. Halt — nothing here is "
                        "interpretable until the leak is explained.")
     dsr5 = next((x.get("dsr") for x in head.get("dsr_phantom", [])
                  if x.get("mult") == 5), None)
-    mcp = (head.get("mc") or {}).get("p_sharpe")
+    # judge on the matched null when present — the full-pool null credits the
+    # liquidity-membership tilt to the signal
+    mcp = ((head.get("mc_matched") or head.get("mc")) or {}).get("p_sharpe")
     alpha_t = fac.get("alpha_t") if fac else None
     if (alpha_t is not None and alpha_t >= 2.0 and mcp is not None
             and mcp < 0.05 and dsr5 is not None and dsr5 > 0.5):
@@ -305,6 +337,17 @@ def sec_leadlag(d: dict, public: bool) -> str:
                 f"(Newey–West t {fac['alpha_t']:.2f}, n {fac['n']})"
                 if fac else "factor regression unavailable")
     cls, text = _verdict_leadlag(ll)
+    mcm = head.get("mc_matched") or {}
+    ewd = head.get("ew") or {}
+    ew_line = ""
+    if ewd:
+        g, p_ = ewd.get("graph", {}), ewd.get("pool", {})
+        ew_line = (f"<p>Membership-tilt check: EW of graph members "
+                   f"{g.get('total', float('nan')) * 100:+.1f}% "
+                   f"(Sharpe {g.get('sharpe', float('nan')):.2f}, gross) vs EW full pool "
+                   f"{p_.get('total', float('nan')) * 100:+.1f}% "
+                   f"(Sharpe {p_.get('sharpe', float('nan')):.2f}). If the cells don't beat "
+                   f"the members' EW, the 'signal' is the membership screen.</p>")
     return f"""<h2>Lead-lag network — neighbor momentum</h2>
 <p class="sub">Directed lagged-correlation graph on the eligible, actively-
 printing universe (top {LL_TOP_N} by PIT turnover); edges must clear a
@@ -314,9 +357,12 @@ Baseline = the known big→small channel; placebo = shuffled leader identities.<
 <table><thead><tr><th>cell</th><th>kind</th><th>train S</th><th>val S</th>
 <th>test S</th><th>full net</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 <p>Headline <span class="mono">{head.get('code', '—')}</span>:
-MC null p(Sharpe) {mc.get('p_sharpe', float('nan')):.3f} ·
+full-pool null p(Sharpe) {mc.get('p_sharpe', float('nan')):.3f} ·
+<b>matched null (graph members) p(Sharpe)
+{mcm.get('p_sharpe', float('nan')):.3f}</b> ·
 Harvey t {head.get('t_stat', float('nan')):.2f} ·
 DSR ladder {ladder or '—'} · {fac_line}</p>
+{ew_line}
 <p>Rank IC ({ic_bits or 'n/a'}) — a daily-horizon signal must show decay
 here; flat ≈0 IC at both horizons means the graph carries no forecast at
 tradeable rebalance frequencies.</p>
