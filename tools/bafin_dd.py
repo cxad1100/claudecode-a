@@ -20,7 +20,17 @@ portal.mvp.bafin.de/database/DealingsInfo/):
 
 Crawl economics: person pages return full histories, so the register is
 covered by crawling UNIQUE persons (~requests ≈ unique meldepflichtigerIds,
-not dealings). Fetch is windowed (--since/--until months), paced (1s +
+not dealings).
+
+RETENTION (measured 2026-07-04): the search only returns the trailing ~12
+months — earlier windows come back empty (and out-of-range dates on the
+export path silently fall back to the unfiltered view, so a "114 pages"
+result is the cap artifact, not data). Person pages DO reach further back,
+so the store holds multi-year histories for persons active in the trailing
+year. Coverage bias to document wherever this feeds analysis: going back in
+time, only still-active insiders are covered; fresh-window signals (90d
+tilt) are unbiased, deep backtests are not. Re-running fetch monthly keeps
+discovery complete going forward. Fetch is windowed (--since/--until months), paced (1s +
 backoff), and resumable: raw pages cached under local/econo_cache/bafin_dd/,
 person pages skipped when cached same-day, and the archive is idempotent by
 row key. Store data/universe/insider_dealings.csv is append-only — the
@@ -156,8 +166,14 @@ def _get(op, url: str, tries: int = 3) -> str:
     return ""
 
 
+#: displaytag caps any query at 114 pages (2,272 rows) — a window hitting the
+#: cap must be split (weekly) or rows silently vanish. zeitraum=3 activates
+#: the custom date range; 0 would be Gesamtzeitraum and IGNORE von/bis.
+_PAGE_CAP = 114
+
+
 def _search_url(von: str, bis: str, page: int = 1) -> str:
-    q = dict(zeitraum="0", zeitraumVon=von, zeitraumBis=bis, emittentName="",
+    q = dict(zeitraum="3", zeitraumVon=von, zeitraumBis=bis, emittentName="",
              emittentIsin="", meldepflichtigerName="", sucheButton="Suche")
     if page > 1:
         q["d-5010980-p"] = str(page)
@@ -174,21 +190,31 @@ def fetch(since: str, until: str, limit: int | None = None,
     CACHE.mkdir(parents=True, exist_ok=True)
     op = _opener()
     _get(op, BASE + "?locale=de_DE")                        # open session
-    months = pd.period_range(since, until, freq="M")
-    person_ids: dict[str, str] = {}
-    for p in months:
-        von = p.start_time.strftime("%d.%m.%Y")
-        bis = (p.end_time + pd.Timedelta(days=1)).strftime("%d.%m.%Y")
+    def _discover(von_ts: pd.Timestamp, bis_ts: pd.Timestamp) -> None:
+        """Page one window into person_ids; split when the row cap bites."""
+        von = von_ts.strftime("%d.%m.%Y")
+        bis = bis_ts.strftime("%d.%m.%Y")
         page = 1
         while True:
             html = _get(op, _search_url(von, bis, page))
             time.sleep(pace)
             res = parse_results(html)
+            if page == 1 and res["max_page"] >= _PAGE_CAP \
+                    and (bis_ts - von_ts).days > 7:
+                mid = von_ts + (bis_ts - von_ts) / 2
+                _discover(von_ts, mid)
+                _discover(mid, bis_ts)
+                return
             for r in res["rows"]:
                 person_ids.setdefault(r["meldepflichtiger_id"], r["nachname"])
             if page >= res["max_page"] or not res["rows"]:
-                break
+                return
             page += 1
+
+    months = pd.period_range(since, until, freq="M")
+    person_ids: dict[str, str] = {}
+    for p in months:
+        _discover(p.start_time, p.end_time + pd.Timedelta(days=1))
         print(f"bafin_dd: {p} → {len(person_ids)} unique persons so far",
               flush=True)
     ids = list(person_ids)
