@@ -178,12 +178,21 @@ def parkinson_vol(high: pd.Series, low: pd.Series, lookback: int = 21) -> pd.Ser
 
 
 _METHODS = {"rolling": rolling_vol, "ewma": ewma_vol, "garch": garch11_vol, "har": har_rv_vol}
+_ML_METHODS = ("adaptive_ewma", "ridge", "ensemble")     # live in tools.vol_ml (lazy import)
 
 
 def forecast_vol(r: pd.Series, method: str = "ewma", **kw) -> pd.Series:
-    """Dispatcher over {rolling, ewma, garch, har} (all obey the t → t+1 convention)."""
+    """Dispatcher over the base forecasters {rolling, ewma, garch, har} plus the learned
+    ones in tools.vol_ml {adaptive_ewma, ridge, ensemble} — all obey the t → t+1
+    convention."""
+    if method in _ML_METHODS:
+        from tools import vol_ml                          # lazy: vol_ml imports this module
+        fn = dict(adaptive_ewma=vol_ml.adaptive_ewma_vol, ridge=vol_ml.ridge_vol,
+                  ensemble=vol_ml.ensemble_vol)[method]
+        return fn(r, **kw)
     if method not in _METHODS:
-        raise ValueError(f"unknown vol forecast method {method!r}; pick one of {sorted(_METHODS)}")
+        raise ValueError(f"unknown vol forecast method {method!r}; pick one of "
+                         f"{sorted(_METHODS) + sorted(_ML_METHODS)}")
     return _METHODS[method](r, **kw)
 
 

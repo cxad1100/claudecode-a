@@ -23,6 +23,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from tools import theme, significance as sig, quant_grade as qg, vol_forecast as vf
+from tools import vol_ml as vml
 from tools.report_html import pct as _pct, card as _card, page, fig_html
 
 ROOT = Path(__file__).parent
@@ -33,14 +34,18 @@ ETF_NAME = "MSCI World (IWDA.AS)"
 PROXY = "^GSPC"                       # research-only long history (USD price index)
 PROXY_NAME = "S&P 500 (^GSPC)"
 PROXY_START = "1995-01-01"
-METHODS = ("rolling", "ewma", "garch", "har")
+METHODS = ("rolling", "ewma", "garch", "har",            # fixed-parameter forecasters
+           "adaptive_ewma", "ridge", "ensemble")         # learned (tools.vol_ml)
 METHOD_LABEL = dict(rolling="Trailing 63d (incumbent)", ewma="EWMA (RiskMetrics)",
-                    garch="GARCH(1,1)", har="HAR-RV (daily proxy)")
+                    garch="GARCH(1,1)", har="HAR-RV (daily proxy)",
+                    adaptive_ewma="EWMA, learned λ", ridge="Ridge (learned, auto-α)",
+                    ensemble="Online ensemble (Hedge)")
 COST_BPS = 5.0                        # liquid-ETF half-spread
 FEE_EUR = 1.0                         # Trade Republic per-order fee
 BAND = 0.10                           # only rebalance when |Δw| > band
 CAPITAL = 10_000.0
 _COLORS = dict(rolling="#808080", ewma="#4ec9b0", garch="#569cd6", har="#c586c0",
+               adaptive_ewma="#d7ba7d", ridge="#e8a04e", ensemble="#46c84e",
                trend="#dcdcaa", bh="#d4d4d4")
 
 
@@ -109,7 +114,13 @@ def compute_underlying(r: pd.Series, name: str, price: pd.Series | None = None,
     """Everything the report shows for one underlying, from its daily returns alone
     (price/OHLC optional extras). Pure — testable with synthetic data."""
     r = r.dropna()
-    forecasts = {m: vf.forecast_vol(r, method=m) for m in METHODS}
+    forecasts: dict[str, pd.Series] = {}
+    for m in METHODS:
+        if m == "ensemble":                       # reuse the base fits — no double compute
+            comp = {k: forecasts[k] for k in vml.BASE_COMPONENTS if k in forecasts}
+            forecasts[m] = vml.ensemble_vol(r, components=comp)
+        else:
+            forecasts[m] = vf.forecast_vol(r, method=m)
     valid = pd.concat(forecasts.values(), axis=1).dropna().index
     if len(valid) < 300:
         return {}
@@ -477,7 +488,15 @@ def sec_method(d: dict) -> str:
         'understates crash protection); its Amsterdam close vs the US session adds stale-close '
         'echo to daily vol; ^GSPC is a USD price index used only to score forecasts. HAR here '
         'runs on daily squared-return proxies (next-week target), noisier than the intraday-RV '
-        'original. <b>(7) Future work.</b> Downside semi-vol targeting; a ^VIX vol-risk-premium '
+        'original. <b>(7) Learned vs fixed parameters.</b> Three forecasters learn their '
+        'parameters walk-forward (tools/vol_ml.py): the EWMA λ is QMLE-refit quarterly, the '
+        'ridge model re-chooses its own regularisation at every refit by a chronological '
+        'validation split, and the online ensemble (Hedge) reallocates trust across models '
+        'daily by realised QLIKE. No LSTM by choice: ~4k noisy non-stationary daily '
+        'observations is far below where recurrent nets beat GARCH/HAR out of sample, and '
+        'the failure mode is silent overfitting — any challenger emitting the same forecast '
+        'Series can be added to the QLIKE table and judged identically. '
+        '<b>(8) Future work.</b> Downside semi-vol targeting; a ^VIX vol-risk-premium '
         'signal; leverage via UCITS-leveraged ETFs. <b>Past performance is not future returns.</b>'
         '</div>')
 
