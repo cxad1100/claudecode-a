@@ -132,3 +132,62 @@ def test_follower_scored_by_leader_recent_return():
     # (no momentum fallback); a couple of false edges at edge_q=0.999 are fine
     n_scored = sum(f"N{k:02d}" in out.index for k in range(18))
     assert n_scored <= 2
+
+
+def test_rank_ic_detects_planted_predictiveness():
+    from tools.leadlag import rank_ic
+    rng = np.random.default_rng(5)
+    idx = pd.bdate_range("2021-01-01", periods=140)
+    prices = pd.DataFrame(
+        (1 + rng.normal(0, 0.02, (140, 12))).cumprod(axis=0) * 100,
+        index=idx, columns=[f"S{k}" for k in range(12)])
+    dates = list(idx[[60, 80, 100, 120]])
+    elig = {d: set(prices.columns) for d in dates}
+    good, noise = {}, {}
+    for i, d in enumerate(dates):
+        nxt = dates[i + 1] if i + 1 < len(dates) else idx[-1]
+        fwd = prices.loc[nxt] / prices.loc[d] - 1.0
+        good[d] = {"raw": fwd + rng.normal(0, 1e-4, 12), "voladj": fwd}
+        noise[d] = {"raw": pd.Series(rng.normal(0, 1, 12), index=prices.columns),
+                    "voladj": pd.Series(rng.normal(0, 1, 12), index=prices.columns)}
+        good[d]["raw"] = pd.Series(good[d]["raw"], index=prices.columns)
+    ic_good = rank_ic(good, prices, dates, elig, execute_lag=0)
+    ic_noise = rank_ic(noise, prices, dates, elig, execute_lag=0)
+    assert ic_good["ic"].mean() > 0.8
+    assert abs(ic_noise["ic"].mean()) < 0.5
+
+
+def test_size_baseline_covers_dates_and_follows_basket():
+    from tools.leadlag import size_leadlag_baseline_scores
+    prices = _panel()
+    dates = list(prices.index[[300, 340, 380]])
+    elig = {d: set(prices.columns) for d in dates}
+    # turnover frame: A is the giant (leader basket), everything else small
+    turn = pd.DataFrame(1000.0, index=pd.date_range("2020-01-31", periods=20, freq="ME"),
+                        columns=prices.columns)
+    turn["A"] = 1e9
+    out = size_leadlag_baseline_scores(prices, dates, elig, turn,
+                                       leader_frac=0.1, recent=21)
+    assert set(out.keys()) == set(dates)
+    for d in dates:
+        assert set(out[d].keys()) == {"raw", "voladj"}
+    # B tracks A with lag → positive trailing corr to the basket; its score
+    # must carry the sign of the basket's recent return
+    d = dates[-1]
+    s = out[d]["raw"]
+    a_recent = prices["A"].loc[:d].iloc[-1] / prices["A"].loc[:d].iloc[-22] - 1.0
+    assert "B" in s.index
+    assert np.sign(s["B"]) == np.sign(a_recent)
+
+
+def test_placebo_scores_differ_from_real():
+    prices = _panel()
+    dates = list(prices.index[[340, 380]])
+    elig = {d: set(prices.columns) for d in dates}
+    real = leadlag_scores(prices, dates, elig, None, seed=0)
+    plac = leadlag_scores(prices, dates, elig, None, seed=0, placebo_seed=1)
+    d = dates[-1]
+    assert not real[d]["raw"].sort_index().equals(plac[d]["raw"].sort_index())
+    # placebo is itself deterministic
+    plac2 = leadlag_scores(prices, dates, elig, None, seed=0, placebo_seed=1)
+    pd.testing.assert_series_equal(plac[d]["raw"], plac2[d]["raw"])

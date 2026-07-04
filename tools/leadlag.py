@@ -20,7 +20,8 @@ import numpy as np
 import pandas as pd
 
 __all__ = ["lagged_corr", "shuffle_threshold", "leadlag_edges",
-           "network_universe", "leadlag_scores"]
+           "network_universe", "leadlag_scores",
+           "size_leadlag_baseline_scores", "rank_ic"]
 
 
 def _zscore(returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -155,13 +156,17 @@ def leadlag_scores(prices: pd.DataFrame, dates, elig_by_date: dict,
                    lags: tuple = (1,), recent: int = 21, top_n: int = 300,
                    min_overlap: int = 126, min_active: float = 0.6,
                    n_shuffle: int = 3, edge_q: float = 0.999,
-                   seed: int = 0) -> dict:
+                   seed: int = 0, placebo_seed: int | None = None) -> dict:
     """run_momentum-ready score precompute: {date: {"raw": Series, "voladj":
     Series}} covering EVERY date in `dates` (a missing date would silently fall
     back to price momentum inside run_momentum — never allowed).
 
     s_i(d) = Σ_j w_{j→i}·R_j^recent / Σ_j |w_{j→i}| over significant in-edges;
     names with no in-edges are absent from the Series (no momentum fallback).
+
+    `placebo_seed` permutes leader identities per date AFTER the graph is
+    built (same edges, same degree distribution, scrambled attribution): a
+    pipeline that 'works' under the placebo is leaking, not predicting.
     """
     out = {}
     for d in dates:
@@ -177,6 +182,11 @@ def leadlag_scores(prices: pd.DataFrame, dates, elig_by_date: dict,
             edges = leadlag_edges(rets, lags=lags, min_overlap=min_overlap,
                                   n_shuffle=n_shuffle, edge_q=edge_q,
                                   seed=_date_rng_seed(seed, d))
+            if placebo_seed is not None and len(edges):
+                prng = np.random.default_rng([placebo_seed,
+                                              _date_rng_seed(seed, d)])
+                perm = dict(zip(uni, prng.permutation(uni)))
+                edges = edges.assign(leader=edges["leader"].map(perm))
             if len(edges):
                 recent_ret = w.iloc[-1] / w.iloc[-(recent + 1)] - 1.0
                 num = edges.assign(x=lambda e: e["weight"]
@@ -189,3 +199,82 @@ def leadlag_scores(prices: pd.DataFrame, dates, elig_by_date: dict,
                 voladj = (raw / vol).replace([np.inf, -np.inf], np.nan).dropna()
         out[d] = {"raw": raw, "voladj": voladj}
     return out
+
+
+def size_leadlag_baseline_scores(prices: pd.DataFrame, dates,
+                                 elig_by_date: dict,
+                                 turnover: pd.DataFrame | None, *,
+                                 leader_frac: float = 0.2, recent: int = 21,
+                                 lookback: int = 252,
+                                 min_overlap: int = 60) -> dict:
+    """The KNOWN lead-lag channel as a baseline: big (top-turnover) names lead
+    small ones (Lo & MacKinlay). Each name is scored by the turnover-weighted
+    leader basket's recent return × its own trailing lagged correlation to the
+    basket. If the network signal can't beat this, it found nothing new.
+
+    Requires the PIT turnover frame (that's what defines 'big'); without it
+    every date returns empty Series."""
+    out = {}
+    for d in dates:
+        raw = pd.Series(dtype=float)
+        voladj = pd.Series(dtype=float)
+        elig = sorted(elig_by_date.get(d, set()))
+        if turnover is not None and len(elig) >= 3:
+            hist = prices.loc[:d]
+            w = hist.reindex(columns=elig).tail(lookback + 1)
+            med = turnover.loc[:d].tail(6).reindex(columns=elig).median()
+            med = med.dropna()
+            n_lead = max(1, int(np.ceil(leader_frac * len(elig))))
+            leaders = med.sort_values(ascending=False).head(n_lead)
+            if len(leaders) and leaders.sum() > 0:
+                rets = np.log(w).diff()
+                bw = leaders / leaders.sum()
+                basket = (rets[leaders.index] * bw).sum(axis=1)
+                # corr(basket(t−1), r_i(t)) — the basket leads
+                zb = (basket - basket.mean()) / (basket.std(ddof=1) or np.inf)
+                c = {}
+                for t in elig:
+                    x, y = zb.iloc[:-1].to_numpy(), rets[t].iloc[1:].to_numpy()
+                    ok = np.isfinite(x) & np.isfinite(y)
+                    if ok.sum() < min_overlap or np.nanstd(y[ok]) == 0:
+                        continue
+                    yy = (y[ok] - y[ok].mean()) / y[ok].std(ddof=1)
+                    c[t] = float(np.dot(x[ok], yy) / max(ok.sum() - 1, 1))
+                bl = w[leaders.index].iloc[-1] / w[leaders.index].iloc[-(recent + 1)] - 1.0
+                basket_recent = float((bl * bw).sum())
+                raw = pd.Series({t: v * basket_recent for t, v in c.items()}).dropna()
+                vol = rets[raw.index].std() * np.sqrt(252.0)
+                voladj = (raw / vol).replace([np.inf, -np.inf], np.nan).dropna()
+        out[d] = {"raw": raw, "voladj": voladj}
+    return out
+
+
+def rank_ic(score_by_date: dict, prices: pd.DataFrame, dates,
+            elig_by_date: dict, execute_lag: int = 1) -> pd.DataFrame:
+    """Per-rebalance Spearman rank IC of the 'raw' scores against realized
+    next-period returns, executed with the same t+`execute_lag` convention as
+    the engine. Rows: date → (ic, n). Interpret with a Newey–West t on the
+    mean; the decay across holding horizons is the honest way to read a
+    daily-horizon signal forced through a monthly/quarterly harness."""
+    from scipy.stats import spearmanr
+
+    from tools.momentum import _exec_date
+
+    rows = []
+    for i in range(len(dates) - 1):
+        d, nxt = dates[i], dates[i + 1]
+        s = score_by_date.get(d, {}).get("raw", pd.Series(dtype=float)).dropna()
+        names = [t for t in s.index
+                 if t in elig_by_date.get(d, set()) and t in prices.columns]
+        if len(names) < 3:
+            continue
+        e0 = _exec_date(prices.index, d, execute_lag)
+        e1 = _exec_date(prices.index, nxt, execute_lag)
+        realized = prices.loc[e1, names] / prices.loc[e0, names] - 1.0
+        ok = realized.notna()
+        if ok.sum() < 3:
+            continue
+        ic = spearmanr(s[names][ok.values], realized[ok])[0]
+        rows.append(dict(date=d, ic=float(ic), n=int(ok.sum())))
+    return pd.DataFrame(rows).set_index("date") if rows else \
+        pd.DataFrame(columns=["ic", "n"])
