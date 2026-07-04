@@ -60,4 +60,7 @@ build_report.py                   ← orchestrates: data → optimizer → HTML
  ├─ tools/optimizer.py            ← Markowitz: frontier, max-Sharpe, same-risk, backtest
  ├─ tools/portfolio_meta.py       ← sector maps, ETF decomposition
  └─ tools/theme.py                ← VSCode Dark+ palette, plotly template, CSS
+
+build_vol_report.py               ← vol lab: forecast volatility (EWMA/GARCH/HAR), not the mean,
+ └─ tools/vol_forecast.py            and vol-target exposure (serve.py route /vol, local-only)
 ```
