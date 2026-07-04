@@ -24,6 +24,7 @@ import build_pairs_report as P
 import build_scenarios_report as S
 import build_strategy_report as ST   # the Strategy page folds the momentum lab in as its lower half
 import build_vol_report as V         # vol lab — forecast-based volatility targeting
+import build_edge_report as E        # edge stack — structural edges (capacity/flows/horizon/costs)
 
 PORT = 8000
 
@@ -34,6 +35,7 @@ PAGES = {
     "strategy": dict(loader="/strategy", build="/strategy-report", snap=ST.ROOT / "local/strategy.html"),
     "scenarios": dict(loader="/scenarios", build="/scenarios-report", snap=S.ROOT / "local/scenarios.html"),
     "vol":      dict(loader="/vol",      build="/vol-report",       snap=V.ROOT / "local/vol.html"),
+    "edge":     dict(loader="/edge",     build="/edge-report",      snap=E.ROOT / "local/edge.html"),
 }
 
 # cross-page nav links shown in the top bar, in display order.
@@ -155,6 +157,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 d = V.gather(force=force)
                 html = V.build(d, public=False)
                 stale, as_of = None, None
+            elif page == "edge":
+                d = E.gather(force=force)
+                html = E.build(d, public=False)
+                stale, as_of = None, None
             else:  # scenarios (local-only)
                 d = S.gather(force=force)
                 html = S.build(d, public=False)
@@ -188,6 +194,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(_loader("/scenarios-report" + ("?force=1" if force else "")))
         elif path == "/vol":
             self._send(_loader("/vol-report" + ("?force=1" if force else "")))
+        elif path == "/edge":
+            self._send(_loader("/edge-report" + ("?force=1" if force else "")))
         elif path == "/report":
             self._serve_report("main", force)
         elif path == "/pairs-report":
@@ -198,6 +206,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_report("scenarios", force)
         elif path == "/vol-report":
             self._serve_report("vol", force)
+        elif path == "/edge-report":
+            self._serve_report("edge", force)
         else:
             self.send_error(404)
 

@@ -63,4 +63,6 @@ build_report.py                   ← orchestrates: data → optimizer → HTML
 
 build_vol_report.py               ← vol lab: forecast volatility (EWMA/GARCH/HAR), not the mean,
  └─ tools/vol_forecast.py            and vol-target exposure (serve.py route /vol, local-only)
+build_edge_report.py              ← edge stack: structural retail edges — capacity, forced flows
+ └─ tools/edge_seasonal.py           (tax-loss rebound), horizon, costs (route /edge, local-only)
 ```
