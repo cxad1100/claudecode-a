@@ -206,7 +206,8 @@ def run_momentum(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 15,
                  turnover: pd.DataFrame | None = None, turn_floor: float = 100_000.0,
                  turn_window: int = 6,
                  elig_by_date: dict | None = None,
-                 score_by_date: dict | None = None) -> dict:
+                 score_by_date: dict | None = None,
+                 sectors_by_date: dict | None = None) -> dict:
     """Walk-forward momentum backtest.
 
     Returns {"runs": {mult: {equity, trades, stats}}, "holdings_log": [...],
@@ -222,6 +223,9 @@ def run_momentum(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 15,
     last traded price (liquidated to cash) so the backtest eats the real loss.
     `execute_lag=1` fills one bar after the signal (t+1) instead of at the signal-day
     close, removing the same-bar look-ahead; scores still use only data through `d`.
+    `sectors_by_date` ({date: {ticker: group}}) swaps the static sector map for a
+    per-rebalance grouping (e.g. trailing-correlation clusters) in the B round-robin;
+    None (default) leaves behavior byte-identical to the static `sectors` path.
     """
     dates = [d for d in rebalance_dates(prices.index, freq)
              if len(prices.loc[:d]) >= lookback + 1]
@@ -246,8 +250,10 @@ def run_momentum(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 15,
         if trend_filter and benchmark is not None and not trend_ok(benchmark, d):
             picks = []                                         # kill-switch → cash
         else:
+            group_map = (sectors_by_date.get(d, sectors)
+                         if sectors_by_date is not None else sectors)
             picks = select_topk(scores, elig, k,
-                                 sectors=sectors if sector_neutral else None)
+                                 sectors=group_map if sector_neutral else None)
         died = pit.died_between(d, dates[i + 1]) if pit is not None else set()
         dead = {t for t in picks if t in died}
         holdings_log.append(dict(date=d, next=dates[i + 1], picks=picks,

@@ -87,3 +87,56 @@ def test_cluster_maps_truncate_future_invariance():
                                  n_clusters=2)
     assert full[d] == trunc[d]
     assert set(full.keys()) == set(dates)
+
+
+def _mini_market(n_days=300, n=8, seed=1):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2022-01-01", periods=n_days)
+    return pd.DataFrame((1 + rng.normal(0.0005, 0.01, (n_days, n))).cumprod(axis=0) * 50,
+                        index=idx, columns=[f"S{k}" for k in range(n)])
+
+
+def _run_kwargs(prices, scores_by_date, elig):
+    return dict(k=4, lookback=50, skip=5, capital=10_000.0, cost_mults=(1.0,),
+                freq="M", fee_eur=0.0, start=None, execute_lag=0,
+                elig_by_date=elig, score_by_date=scores_by_date)
+
+
+def test_run_momentum_sectors_by_date_none_is_noop():
+    from tools.momentum import run_momentum, rebalance_dates
+    prices = _mini_market()
+    slip = {t: 10 for t in prices.columns}
+    dates = [d for d in rebalance_dates(prices.index, "M")
+             if len(prices.loc[:d]) >= 51]
+    scores = {d: {"raw": pd.Series(np.arange(8, dtype=float),
+                                   index=prices.columns),
+                  "voladj": pd.Series(np.arange(8, dtype=float),
+                                      index=prices.columns)}
+              for d in dates}
+    elig = {d: set(prices.columns) for d in dates}
+    a = run_momentum(prices, slip, **_run_kwargs(prices, scores, elig))
+    b = run_momentum(prices, slip, sectors_by_date=None,
+                     **_run_kwargs(prices, scores, elig))
+    assert [h["picks"] for h in a["holdings_log"]] == \
+           [h["picks"] for h in b["holdings_log"]]
+
+
+def test_sectors_by_date_caps_cluster_concentration():
+    from tools.momentum import run_momentum, rebalance_dates
+    prices = _mini_market()
+    slip = {t: 10 for t in prices.columns}
+    dates = [d for d in rebalance_dates(prices.index, "M")
+             if len(prices.loc[:d]) >= 51]
+    # scores strictly descending S7 > S6 > ... > S0
+    sc = pd.Series(np.arange(8, dtype=float), index=prices.columns)
+    scores = {d: {"raw": sc, "voladj": sc} for d in dates}
+    elig = {d: set(prices.columns) for d in dates}
+    # top-4 scorers all in cluster 1 → plain top-k book = pure cluster 1
+    cl = {f"S{k}": (1 if k >= 4 else 2) for k in range(8)}
+    by_date = {d: cl for d in dates}
+    res = run_momentum(prices, slip, sector_neutral=True,
+                       sectors_by_date=by_date,
+                       **_run_kwargs(prices, scores, elig))
+    picks = res["holdings_log"][0]["picks"]
+    assert sum(cl[t] == 1 for t in picks) == 2
+    assert sum(cl[t] == 2 for t in picks) == 2
