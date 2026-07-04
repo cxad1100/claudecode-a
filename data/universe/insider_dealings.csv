@@ -1,0 +1,6 @@
+key,meldung_id,isin,issuer,bafin_id,person,person_role,instrument,side,event_date,published_at,published_imputed,venue,price,volume_eur,fetched_at
+3f413e52da2d1d23,34415,GB00BM9XQ619,Vidac Pharma Holding PLC,50089006,"Herzberg, Dr Max",Vorstand,Aktie,sell,2026-07-02,2026-07-03,False,Xetra,,,2026-07-04T09:21:35
+496643ad0a2f9ab8,34400,DE000A460JS9,PCC SE,40002609,"Warnecke, Ulrike",Aufsichtsrat,Schuldtitel,buy,2026-07-01,2026-07-02,False,,,,2026-07-04T09:21:35
+93a27e60aa5f12df,34405,DE000A2GS633,Allgeier SE,40002005,"Goedsche, Dr. Marcus",Vorstand,Aktie,Sonstiges,2026-07-01,2026-07-02,False,,,,2026-07-04T09:21:35
+229f76efe8c75091,34406,DE000A2GS633,Allgeier SE,40002005,"Dürschmidt, Carl Georg",Aufsichtsrat,Aktie,Sonstiges,2026-07-01,2026-07-02,False,,,,2026-07-04T09:21:35
+ead128f974978af4,34410,DE000A11QW68,7C Solarparken AG,40000662,"De Proost, Steven",Vorstand,Aktie,buy,2026-07-01,2026-07-02,False,Xetra,,,2026-07-04T09:21:35
