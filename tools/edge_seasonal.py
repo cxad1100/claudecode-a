@@ -46,8 +46,9 @@ def seasonal_windows(index: pd.DatetimeIndex, entry_mmdd: str = "12-15",
             continue
         epos = index.searchsorted(exit_target, side="right") - 1
         exit_date = index[min(epos, len(index) - 1)]
-        if exit_date <= sig_date:
-            continue
+        if exit_date < pd.Timestamp(year + 1, 1, 1):
+            continue                    # data ends before January → a degenerate stub,
+            # not a rebound window; counting it would pollute the tiny yearly sample
         out.append(dict(year=year, signal=sig_date, exit=exit_date))
     return out
 
@@ -115,8 +116,10 @@ def run_seasonal(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 10,
             [np.inf, -np.inf], np.nan).dropna() if len(seg_all) >= 2 else pd.Series(dtype=float)
         pools.append(pool_ret.to_numpy(float))
 
+        died = pit.died_between(d, x) if pit is not None else set()
         rec = dict(year=w["year"], signal=d, exit=x, picks=picks,
-                   ytd={t: float(ytd[t]) for t in picks}, ret={}, net_ret=0.0)
+                   ytd={t: float(ytd[t]) for t in picks}, ret={}, net_ret=0.0,
+                   dead={t for t in picks if t in died})
         if not picks:
             years.append(rec)
             continue

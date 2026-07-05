@@ -102,6 +102,32 @@ def test_entry_executes_after_signal():
             assert first_move >= y["signal"]              # nothing booked before the signal
 
 
+def test_no_stub_window_when_data_ends_in_december():
+    idx = pd.bdate_range("2018-01-01", "2020-12-20")      # ends 5 sessions after signal
+    wins = ES.seasonal_windows(idx)
+    assert [w["year"] for w in wins] == [2018, 2019]      # 2020's stub is rejected
+    for w in wins:
+        assert w["exit"] >= pd.Timestamp(w["year"] + 1, 1, 1)
+
+
+def test_deaths_during_window_are_recorded():
+    prices = _universe(plant_rebound=True, seed=6)
+
+    class StubPIT:                                        # every name listed; L0 dies
+        def listed(self, t, d):
+            return True
+
+        def died_between(self, d, nxt):
+            return {"L0"}
+
+    res = ES.run_seasonal(prices, _slip(prices), k=10, pit=StubPIT())
+    with_picks = [y for y in res["years"] if y["picks"]]
+    assert with_picks and all("dead" in y for y in res["years"])
+    for y in with_picks:                                  # L0 is a planted loser → picked
+        if "L0" in y["picks"]:
+            assert "L0" in y["dead"]
+
+
 def test_combine_sleeves_blend():
     idx = pd.bdate_range("2020-01-01", periods=100)
     core = pd.Series(0.01, index=idx)

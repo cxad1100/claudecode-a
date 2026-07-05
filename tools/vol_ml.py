@@ -26,7 +26,7 @@ import pandas as pd
 from scipy.optimize import minimize_scalar
 from scipy.signal import lfilter
 
-from tools.vol_forecast import (TD, MIN_TRAIN, REFIT_EVERY, _EPS,
+from tools.vol_forecast import (TD, MIN_TRAIN, REFIT_EVERY, _EPS, _har_design,
                                 rolling_vol, ewma_vol, garch11_vol, har_rv_vol, qlike)
 
 BASE_COMPONENTS = ("rolling", "ewma", "garch", "har")
@@ -115,17 +115,14 @@ def ridge_vol(r: pd.Series, refit_every: int = REFIT_EVERY, min_train: int = MIN
     if n < min_train + 1:
         return pd.Series(out, index=r.index)
     x2 = x ** 2
-    rv_w = pd.Series(x2).rolling(5).mean().to_numpy()
-    rv_m = pd.Series(x2).rolling(22).mean().to_numpy()
     s2 = np.full(n, np.nan)                          # fixed-λ EWMA state as a feature
     seed = 63
     if n > seed:
         s2[seed - 1] = np.var(x[:seed], ddof=1)
         for t in range(seed, n):
             s2[t] = lam * s2[t - 1] + (1.0 - lam) * x2[t]
-    X_all = np.column_stack([np.log(x2 + _EPS), np.log(rv_w + _EPS),
-                             np.log(rv_m + _EPS), np.log(s2 + _EPS)])
-    y_all = np.log(pd.Series(x2).rolling(h).mean().shift(-h).to_numpy() + _EPS)
+    X_base, y_all, _, _ = _har_design(x2, h)         # same features/target as har_rv_vol
+    X_all = np.column_stack([X_base, np.log(s2 + _EPS)])
     valid_x = np.isfinite(X_all).all(axis=1)
     valid_row = valid_x & np.isfinite(y_all)
     beta, rvar = None, 0.0

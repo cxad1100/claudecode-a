@@ -27,6 +27,7 @@ import plotly.graph_objects as go
 from tools import theme, significance as sig, quant_grade as qg, vol_forecast as vf
 from tools import edge_seasonal as es
 from tools.report_html import pct as _pct, card as _card, page, fig_html
+from tools.universe_panel import load_universe_panel, momentum_net_returns
 
 ROOT = Path(__file__).parent
 
@@ -38,31 +39,11 @@ TARGET_VOL = 0.15           # matches the strategy page's overlay
 CAPITAL = 10_000.0
 
 
-def _universe_inputs():
-    """Universe panel + costs, prepared exactly like the strategy page (winsorized,
-    tradeable calendar, PIT). None when the price panel isn't on disk."""
-    from build_momentum_report import (PRICES_CSV, META_CSV, LIQ_MAX, MIN_PRICE,
-                                       FEE_EUR, WINSOR_CAP, _slip)
-    if not PRICES_CSV.exists():
-        return None
-    from tools.momentum import winsorize_prices, to_xetra_calendar
-    from tools.universe_pit import PITUniverse
-    from tools.universe_assemble import delisting_map
-    prices = pd.read_csv(PRICES_CSV, index_col=0, parse_dates=True)
-    prices = winsorize_prices(to_xetra_calendar(prices), cap=WINSOR_CAP)
-    meta_df = pd.read_csv(META_CSV)
-    meta = {r["ticker"]: dict(r) for _, r in meta_df.iterrows()}
-    slip = {t: _slip(m) for t, m in meta.items() if t in prices.columns}
-    pit = PITUniverse(prices, delisting_map(meta_df))
-    return dict(prices=prices, slip=slip, pit=pit, meta=meta,
-                fee_eur=FEE_EUR, liq_max=LIQ_MAX, min_price=MIN_PRICE)
-
-
 def gather(force: bool = False, refresh: bool | None = None) -> dict:
     refresh = force if refresh is None else refresh
     d: dict = dict(seasonal=None, mc=None, stack=None)
 
-    uni = _universe_inputs()
+    uni = load_universe_panel()                     # prepared ONCE, shared with the core
     if uni is not None:
         res = es.run_seasonal(uni["prices"], uni["slip"], k=K, capital=CAPITAL,
                               fee_eur=uni["fee_eur"], entry_mmdd=ENTRY_MMDD,
@@ -71,15 +52,19 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
         d["seasonal"] = res
         strat = es.seasonal_period_returns(res["years"])
         if len(strat) >= 3:
-            d["mc"] = sig.monte_carlo_null(res["pools"], strat, k=K, ppy=1.0,
+            # the null's random books match the sleeve's TYPICAL breadth, not the k
+            # cap — in thin-loser years the sleeve holds fewer than K names and a
+            # fixed-K null would be better-diversified than the strategy it judges
+            picked = [len(y["picks"]) for y in res["years"] if y["picks"]]
+            k_eff = max(1, int(round(np.mean(picked)))) if picked else K
+            d["mc"] = sig.monte_carlo_null(res["pools"], strat, k=k_eff, ppy=1.0,
                                            n_trials=2000, seed=0)
+            d["mc"]["k_eff"] = k_eff
 
-    # the stack: momentum core ⊕ seasonal sleeve, then the vol-managed overlay
-    try:
-        from build_vol_report import _momentum_returns
-        core = _momentum_returns(refresh)
-    except Exception:
-        core = None
+    # the stack: momentum core ⊕ seasonal sleeve, then the vol-managed overlay.
+    # No blanket except here — a corrupt panel should fail the build loudly (serve.py
+    # falls back to the last snapshot); only the missing-panel case degrades to None.
+    core = momentum_net_returns(panel=uni) if uni is not None else None
     if core is not None and d["seasonal"] is not None and len(core) > 900:
         sleeve = d["seasonal"]["equity"].pct_change().fillna(0.0)
         blend = es.combine_sleeves(core, sleeve, w_sleeve=W_SLEEVE)
@@ -121,13 +106,17 @@ def sec_seasonal(d: dict) -> str:
     for y in res["years"]:
         if not y["picks"]:
             rows.append(f"<tr><td class='mono'>{y['year']}</td><td class='num dim'>—</td>"
-                        "<td class='num dim'>no losers</td><td class='num dim'>—</td></tr>")
+                        "<td class='num dim'>no losers</td><td class='num dim'>—</td>"
+                        "<td class='num dim'>—</td></tr>")
             continue
         avg_ytd = float(np.mean(list(y["ytd"].values())))
+        n_dead = len(y.get("dead", set()))
+        dead_cell = (f"<td class='num mono' style='color:#ef4444'>{n_dead}</td>"
+                     if n_dead else "<td class='num mono'>0</td>")
         rows.append(f"<tr><td class='mono'>{y['year']}→{y['year'] + 1}</td>"
                     f"<td class='num mono'>{len(y['picks'])}</td>"
                     f"<td class='num'>{_pct(avg_ytd * 100)}</td>"
-                    f"<td class='num'>{_pct(y['net_ret'] * 100)}</td></tr>")
+                    f"<td class='num'>{_pct(y['net_ret'] * 100)}</td>{dead_cell}</tr>")
     eq = res["equity"]
     roi = (eq / eq.iloc[0] - 1.0) * 100.0
     fig = go.Figure()
@@ -152,11 +141,14 @@ def sec_seasonal(d: dict) -> str:
         f"last session on/before Dec&nbsp;{ENTRY_MMDD[3:]}, buy the bottom-{K} <b>with "
         "negative YTD only</b> (no loss → no forced seller), enter t+1, exit end of "
         "January, cash the rest of the year. The inference is the <b>per-year table</b> "
-        "and the <b>Monte-Carlo null</b> — random names from the same pool over the same "
-        "windows — never a Sharpe off a handful of yearly points.</p>"
+        "and the <b>Monte-Carlo null</b> — random books from the same pool over the same "
+        "windows, drawn at the sleeve's <i>average</i> breadth so thin-loser years don't "
+        "face an artificially diversified null — never a Sharpe off a handful of yearly "
+        "points.</p>"
         + cards +
         "<table><tr><th>Window</th><th class='num'>Picks</th><th class='num'>Avg YTD of "
-        "picks</th><th class='num'>Window net return</th></tr>" + "".join(rows) + "</table>"
+        "picks</th><th class='num'>Window net return</th><th class='num'>Died in "
+        "window</th></tr>" + "".join(rows) + "</table>"
         f"<div class='chart'>{fig_html(fig)}</div>")
 
 
@@ -206,6 +198,13 @@ def sec_method(d: dict) -> str:
         '<b>(1) Sample size.</b> The seasonal sleeve has one observation per year — a '
         'single-digit number of windows. The Monte-Carlo selection null is the real test; '
         'the equity curve is illustration, not evidence. '
+        '<b>(1b) Survivorship is AMPLIFIED here, not just inherited.</b> The sleeve '
+        'deliberately buys the year&rsquo;s most-crushed names — the cohort with the highest '
+        'delisting hazard — on a universe of today&rsquo;s survivors. Deep losers that '
+        'subsequently died are missing at a higher rate than random names, so the missing-'
+        'graveyard inflation is worse for this sleeve than for momentum (which buys '
+        'winners); the &ldquo;died in window&rdquo; column above shows only the deaths the '
+        'graveyard actually captures. '
         '<b>(2) Documented, not secret.</b> The January/tax-loss effect is in the '
         'literature since Wachtel (1942) and Roll (1983); it has weakened in large caps '
         'and survives mainly in small/illiquid names — which is exactly the capacity '

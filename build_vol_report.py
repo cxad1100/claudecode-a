@@ -50,61 +50,10 @@ _COLORS = dict(rolling="#808080", ewma="#4ec9b0", garch="#569cd6", har="#c586c0"
 
 
 # ───────────────────────────── data ─────────────────────────────
-
-def _fetch_ohlc(ticker: str, period: str = "max") -> pd.DataFrame:
-    import yfinance as yf
-    raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    if raw.index.tz is not None:
-        raw.index = raw.index.tz_localize(None)
-    return raw[["Close", "High", "Low"]].dropna(how="all")
-
-
-def _cached_ohlc(ticker: str, force: bool = False, ttl_hours: float = 12,
-                 _fetch=_fetch_ohlc) -> pd.DataFrame:
-    """OHLC needs its own cache — data_buffer.cached_price_history stores Close only."""
-    import time
-    d = ROOT / "local" / "buffer"
-    d.mkdir(parents=True, exist_ok=True)
-    path = d / f"ohlc_{ticker.replace('^', 'i').replace('.', '_')}.pkl"
-    if not force and path.exists() and (time.time() - path.stat().st_mtime) < ttl_hours * 3600:
-        try:
-            return pd.read_pickle(path)
-        except Exception:
-            pass
-    df = _fetch(ticker)
-    try:
-        df.to_pickle(path)
-    except Exception:
-        pass
-    return df
-
-
-def _momentum_returns(refresh: bool = False) -> pd.Series | None:
-    """Net daily returns of the production momentum strategy (one run_momentum call,
-    no grid/MC). None when the universe price panel isn't on disk."""
-    from build_momentum_report import (PRICES_CSV, META_CSV, LOOKBACK, SKIP, START,
-                                       LIQ_MAX, MIN_PRICE, CAPITAL as MCAP, FEE_EUR as MFEE,
-                                       WINSOR_CAP, EXEC_LAG, _slip)
-    if not PRICES_CSV.exists():
-        return None
-    from build_strategy_report import STRATEGY
-    from tools.momentum import run_momentum, winsorize_prices, to_xetra_calendar
-    from tools.universe_pit import PITUniverse
-    from tools.universe_assemble import delisting_map
-    prices = pd.read_csv(PRICES_CSV, index_col=0, parse_dates=True)
-    prices = winsorize_prices(to_xetra_calendar(prices), cap=WINSOR_CAP)
-    meta_df = pd.read_csv(META_CSV)
-    meta = {r["ticker"]: dict(r) for _, r in meta_df.iterrows()}
-    slip = {t: _slip(m) for t, m in meta.items() if t in prices.columns}
-    pit = PITUniverse(prices, delisting_map(meta_df))
-    res = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=MCAP,
-                       cost_mults=(1.0,), start=START, liq_max=LIQ_MAX, fee_eur=MFEE,
-                       min_price=MIN_PRICE, sectors=None, benchmark=None, pit=pit,
-                       execute_lag=EXEC_LAG, **STRATEGY.kwargs())
-    eq = res["runs"][1.0]["equity"]
-    return eq.dropna().pct_change().dropna()
+# OHLC cache lives in tools.data_buffer; the momentum helper in tools.universe_panel —
+# module-level names so tests can monkeypatch them here.
+from tools.data_buffer import cached_ohlc
+from tools.universe_panel import momentum_net_returns as _momentum_returns
 
 
 # ───────────────────────────── compute (pure) ─────────────────────────────
@@ -138,7 +87,6 @@ def compute_underlying(r: pd.Series, name: str, price: pd.Series | None = None,
         fo = f.loc[oos_start:]
         s = dict(qlike_h1=vf.qlike(fo ** 2, (fwd1.loc[oos_start:]) ** 2),
                  qlike_h21=vf.qlike(fo ** 2, (fwd21.loc[oos_start:]) ** 2),
-                 mse_h21=vf.mse(fo, fwd21.loc[oos_start:]),
                  oos_r2=vf.oos_r2(fo, fwd21.loc[oos_start:], horizon=21),
                  mz=vf.mincer_zarnowitz(fo, fwd21.loc[oos_start:]))
         if pk_fwd is not None:
@@ -174,8 +122,8 @@ def cost_grid(r_oos: pd.Series, forecast: pd.Series) -> list[dict]:
 
 def gather(force: bool = False, refresh: bool | None = None) -> dict:
     refresh = force if refresh is None else refresh
-    etf_ohlc = _cached_ohlc(ETF, force=refresh)
-    spx_ohlc = _cached_ohlc(PROXY, force=refresh)
+    etf_ohlc = cached_ohlc(ETF, force=refresh)
+    spx_ohlc = cached_ohlc(PROXY, force=refresh)
     spx_ohlc = spx_ohlc[spx_ohlc.index >= PROXY_START]
 
     etf_close = etf_ohlc["Close"].dropna()
@@ -201,13 +149,18 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
 
     mean_null = vf.mean_null(spx["returns"])
 
-    # significance over EVERY variant scanned (methods × underlyings + trend combo)
-    all_variants = []
+    # significance: EVERY variant scanned counts as a trial (methods × underlyings +
+    # trend combo), but the headline "best" is chosen among TRADEABLE books only —
+    # the ^GSPC proxy exists to score forecasts, not to be certified as a strategy.
+    all_variants, tradeable = [], []
     for u in (etf, spx, mom):
         if u:
-            all_variants += [(u["name"], m, v) for m, v in u["variants"].items()]
+            vs = [(u["name"], m, v) for m, v in u["variants"].items()]
+            all_variants += vs
+            if u is not spx:
+                tradeable += vs
     trial_sharpes = [v.get("sharpe", 0.0) for _, _, v in all_variants]
-    best_name, best_m, best = max(all_variants, key=lambda t: t[2].get("sharpe", -9))
+    best_name, best_m, best = max(tradeable, key=lambda t: t[2].get("sharpe", -9))
     best_rets = best["equity"].pct_change().dropna().to_numpy()
     dsr = sig.deflated_sharpe_ratio(best_rets, trial_sharpes, ppy=252.0)
     ci = sig.bootstrap_sharpe_cagr_ci(best_rets, ppy=252.0, block=21, seed=0)
@@ -438,7 +391,9 @@ def sec_significance(d: dict) -> str:
         _card(f"CAGR {ci['conf']}% CI", f"{ci['cagr_lo']*100:+.1f}% – {ci['cagr_hi']*100:+.1f}%"),
     ]
     return ("<h2>Significance</h2>"
-            f"<p class='dim'>The best variant's Sharpe, haircut for the <b>{dsr['n_trials']} "
+            f"<p class='dim'>The best <b>tradeable</b> variant's Sharpe (the ^GSPC proxy "
+            "variants count as trials in the haircut but are not candidates — you can't buy "
+            f"a price index), deflated for the <b>{dsr['n_trials']} "
             "variants scanned</b> on this page (methods &times; underlyings + the trend combo), "
             "return skew/kurtosis and sample length (Bailey&ndash;L&oacute;pez de Prado deflated "
             "Sharpe), plus a circular block-bootstrap (21-day blocks) error bar. Remember what "

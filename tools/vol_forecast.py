@@ -127,6 +127,19 @@ def garch11_vol(r: pd.Series, refit_every: int = REFIT_EVERY,
     return pd.Series(out, index=r.index)
 
 
+def _har_design(x2: np.ndarray, h: int = 5):
+    """Shared HAR design (single source of truth for har_rv_vol AND vol_ml.ridge_vol —
+    they must stay on the same features/target or their QLIKE comparison measures
+    drift, not modelling): features at t = [log r²_t, log RV_w(5d), log RV_m(22d)],
+    target y[t] = log mean(r²[t+1..t+h]). Returns (X, y, valid_x, valid_row)."""
+    rv_w = pd.Series(x2).rolling(5).mean().to_numpy()
+    rv_m = pd.Series(x2).rolling(22).mean().to_numpy()
+    X = np.column_stack([np.log(x2 + _EPS), np.log(rv_w + _EPS), np.log(rv_m + _EPS)])
+    y = np.log(pd.Series(x2).rolling(h).mean().shift(-h).to_numpy() + _EPS)
+    valid_x = np.isfinite(X).all(axis=1)
+    return X, y, valid_x, valid_x & np.isfinite(y)
+
+
 def har_rv_vol(r: pd.Series, refit_every: int = REFIT_EVERY,
                min_train: int = MIN_TRAIN, h: int = 5) -> pd.Series:
     """Corsi HAR-RV from daily squared-return proxies (no intraday RV — noisier than the
@@ -142,14 +155,8 @@ def har_rv_vol(r: pd.Series, refit_every: int = REFIT_EVERY,
     out = np.full(n, np.nan)
     if n < min_train + 1:
         return pd.Series(out, index=r.index)
-    rv_w = pd.Series(x2).rolling(5).mean().to_numpy()
-    rv_m = pd.Series(x2).rolling(22).mean().to_numpy()
-    X_all = np.column_stack([np.ones(n), np.log(x2 + _EPS),
-                             np.log(rv_w + _EPS), np.log(rv_m + _EPS)])
-    rv_fwd = pd.Series(x2).rolling(h).mean().shift(-h).to_numpy()  # mean r²[s+1..s+h]
-    y_all = np.log(rv_fwd + _EPS)
-    valid_x = np.isfinite(X_all).all(axis=1)
-    valid_row = valid_x & np.isfinite(y_all)
+    X_base, y_all, valid_x, valid_row = _har_design(x2, h)
+    X_all = np.column_stack([np.ones(n), X_base])
     beta, rvar = None, 0.0
     for i in range(min_train, n, refit_every):
         rows = np.where(valid_row[:max(i - h, 0)])[0]              # targets known by i-1

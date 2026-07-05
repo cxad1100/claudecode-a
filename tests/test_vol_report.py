@@ -23,8 +23,9 @@ def _ohlc(start: str, n: int, seed: int) -> pd.DataFrame:
 def synthetic_data(monkeypatch):
     frames = {V.ETF: _ohlc("2009-09-01", 4200, seed=1),
               V.PROXY: _ohlc("1995-01-01", 7800, seed=2)}
-    monkeypatch.setattr(V, "_cached_ohlc", lambda t, force=False, **kw: frames[t])
-    monkeypatch.setattr(V, "_momentum_returns", lambda refresh=False: None)
+    monkeypatch.setattr(V, "cached_ohlc", lambda t, force=False, **kw: frames[t])
+    monkeypatch.setattr(V, "_momentum_returns",
+                        lambda refresh=False, panel=None: None)
 
 
 def test_gather_and_build(synthetic_data):
@@ -36,6 +37,7 @@ def test_gather_and_build(synthetic_data):
         assert d["etf"]["variants"][m]["exposure"].max() <= 1.0 + 1e-12
     assert len(d["grid"]) == 12
     assert np.isfinite(d["significance"]["ci"]["sharpe"])
+    assert "^GSPC" not in d["significance"]["best"]       # research proxy never certified
 
     html = V.build(d)
     for needle in ("Vol lab", "Is volatility actually predictable", "mean is not",
