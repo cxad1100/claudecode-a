@@ -25,6 +25,7 @@ import build_scenarios_report as S
 import build_strategy_report as ST   # the Strategy page folds the momentum lab in as its lower half
 import build_vol_report as V         # vol lab — forecast-based volatility targeting
 import build_edge_report as E        # edge stack — structural edges (capacity/flows/horizon/costs)
+import build_econo_report as EC      # econophysics lab — signals vs the production gate
 
 PORT = 8000
 
@@ -36,6 +37,7 @@ PAGES = {
     "scenarios": dict(loader="/scenarios", build="/scenarios-report", snap=S.ROOT / "local/scenarios.html"),
     "vol":      dict(loader="/vol",      build="/vol-report",       snap=V.ROOT / "local/vol.html"),
     "edge":     dict(loader="/edge",     build="/edge-report",      snap=E.ROOT / "local/edge.html"),
+    "econo":    dict(loader="/econo",    build="/econo-report",     snap=EC.OUT),
 }
 
 # cross-page nav links shown in the top bar, in display order.
@@ -44,6 +46,9 @@ PAGES = {
 _NAV = [
     ("main",     "/",         "Portfolio"),
     ("strategy", "/strategy", "Strategy"),
+    ("vol",      "/vol",      "Vol"),
+    ("edge",     "/edge",     "Edge"),
+    ("econo",    "/econo",    "Econo"),
 ]
 
 
@@ -161,6 +166,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 d = E.gather(force=force)
                 html = E.build(d, public=False)
                 stale, as_of = None, None
+            elif page == "econo":
+                d = EC.gather()          # several minutes: full experiment re-run
+                html = EC.build(d, public=False)
+                stale, as_of = None, None
             else:  # scenarios (local-only)
                 d = S.gather(force=force)
                 html = S.build(d, public=False)
@@ -196,6 +205,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(_loader("/vol-report" + ("?force=1" if force else "")))
         elif path == "/edge":
             self._send(_loader("/edge-report" + ("?force=1" if force else "")))
+        elif path == "/econo":
+            self._send(_loader("/econo-report" + ("?force=1" if force else "")))
         elif path == "/report":
             self._serve_report("main", force)
         elif path == "/pairs-report":
@@ -208,6 +219,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_report("vol", force)
         elif path == "/edge-report":
             self._serve_report("edge", force)
+        elif path == "/econo-report":
+            self._serve_report("econo", force)
         else:
             self.send_error(404)
 
