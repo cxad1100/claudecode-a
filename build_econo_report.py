@@ -567,6 +567,12 @@ def _gather_trials(d: dict) -> dict:
         n, status = _status(key)
         rows.append(dict(module=label, cells=n if n is not None else 0,
                          status=status))
+    # sibling pages merged from claude/model-ytg40m — their searches count
+    # here too (one program, one file drawer), verdicts live on their pages
+    rows.append(dict(module="vol lab (build_vol_report, 7 forecasters)",
+                     cells=7, status="pre-registered gates on own page"))
+    rows.append(dict(module="edge stack (tax-loss sleeve + combiner)",
+                     cells=2, status="pre-registered gates on own page"))
     total = sum(r["cells"] for r in rows)
     return dict(rows=rows, total=total, phantom=PHANTOM_MULTS)
 

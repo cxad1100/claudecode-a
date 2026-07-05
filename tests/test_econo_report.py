@@ -158,7 +158,7 @@ def test_sec_trials_ledger_counts_and_statuses():
     d["trials"] = er._gather_trials(d)
     html = er.sec_trials(d, False)
     assert "64" in html                       # inherited grid
-    assert "80" in html                       # 64+10+2+0+4 cumulative
+    assert "89" in html                       # 64+10+2+0+4 +7 vol +2 edge
     assert "lead-lag" in html.lower()
     assert "file drawer" in html.lower() or "killed" in html.lower()
     # phase not promoted → its 0 trials shown, marked observational
