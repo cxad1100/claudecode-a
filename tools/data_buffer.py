@@ -53,6 +53,42 @@ def cached_price_history(tickers, period="5y", ttl_hours=12, force=False,
     return df
 
 
+def _fetch_ohlc_yf(ticker: str, period: str = "max") -> pd.DataFrame:
+    import yfinance as yf
+    raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    if raw.index.tz is not None:
+        raw.index = raw.index.tz_localize(None)
+    return raw[["Close", "High", "Low"]].dropna(how="all")
+
+
+def cached_ohlc(ticker: str, period: str = "max", ttl_hours: float = 12, force=False,
+                buffer_dir: Path | None = None, _fetch=None) -> pd.DataFrame:
+    """OHLC (Close/High/Low) with a TTL pickle cache — cached_price_history stores Close
+    only. A failed fetch degrades to the last-good pickle (stale beats dead) and only
+    raises when nothing was ever cached."""
+    _fetch = _fetch or _fetch_ohlc_yf
+    d = _dir(buffer_dir)
+    path = d / f"ohlc_{ticker.replace('^', 'i').replace('.', '_')}.pkl"
+    if not force and _fresh(path, ttl_hours):
+        try:
+            return pd.read_pickle(path)
+        except Exception:
+            pass
+    try:
+        df = _fetch(ticker, period)
+    except Exception:
+        if path.exists():
+            return pd.read_pickle(path)                   # last-good fallback
+        raise
+    try:
+        df.to_pickle(path)
+    except Exception:
+        pass
+    return df
+
+
 def cached_market_caps(tickers, ttl_hours=24, force=False,
                        buffer_dir: Path | None = None, _fetch=None) -> dict[str, float]:
     """Market caps with a long TTL JSON cache. A failed/partial fetch keeps the
