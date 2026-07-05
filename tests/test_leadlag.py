@@ -191,3 +191,16 @@ def test_placebo_scores_differ_from_real():
     # placebo is itself deterministic
     plac2 = leadlag_scores(prices, dates, elig, None, seed=0, placebo_seed=1)
     pd.testing.assert_series_equal(plac[d]["raw"], plac2[d]["raw"])
+
+
+def test_scores_fill_diagnostics_dict():
+    prices = _panel()
+    dates = list(prices.index[[340, 380]])
+    elig = {d: set(prices.columns) for d in dates}
+    diag = {}
+    leadlag_scores(prices, dates, elig, None, seed=0, diag=diag)
+    assert set(diag.keys()) == set(dates)
+    for d in dates:
+        assert {"n_uni", "n_kept", "n_expected_false",
+                "rho_star", "mean_self_lag"} <= set(diag[d].keys())
+        assert diag[d]["n_uni"] == 20

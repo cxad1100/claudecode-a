@@ -128,16 +128,13 @@ def network_universe(prices: pd.DataFrame, turnover: pd.DataFrame | None,
     (≥ min_obs returns in the window AND ≥ min_active of them nonzero — a
     stale/ffilled line is mostly zero returns), capped at the top_n by trailing
     6-month median EUR turnover when the PIT turnover frame is available."""
-    w = prices.loc[:asof].tail(window + 1)
+    cols = [t for t in prices.columns if t in elig]
+    w = prices.loc[:asof, cols].tail(window + 1)
     r = w.pct_change()
-    keep = []
-    for t in w.columns:
-        if t not in elig:
-            continue
-        obs = r[t].dropna()
-        if len(obs) < min_obs or (obs != 0).mean() < min_active:
-            continue
-        keep.append(t)
+    obs = r.notna().sum()
+    nonzero = (r.ne(0) & r.notna()).sum()
+    frac = nonzero / obs.where(obs > 0)
+    keep = list(obs.index[(obs >= min_obs) & (frac >= min_active)])
     if turnover is not None and len(keep) > top_n:
         tw = turnover.loc[:asof].tail(6)
         med = tw.reindex(columns=keep).median()
@@ -156,7 +153,8 @@ def leadlag_scores(prices: pd.DataFrame, dates, elig_by_date: dict,
                    lags: tuple = (1,), recent: int = 21, top_n: int = 300,
                    min_overlap: int = 126, min_active: float = 0.6,
                    n_shuffle: int = 3, edge_q: float = 0.999,
-                   seed: int = 0, placebo_seed: int | None = None) -> dict:
+                   seed: int = 0, placebo_seed: int | None = None,
+                   diag: dict | None = None) -> dict:
     """run_momentum-ready score precompute: {date: {"raw": Series, "voladj":
     Series}} covering EVERY date in `dates` (a missing date would silently fall
     back to price momentum inside run_momentum — never allowed).
@@ -167,6 +165,9 @@ def leadlag_scores(prices: pd.DataFrame, dates, elig_by_date: dict,
     `placebo_seed` permutes leader identities per date AFTER the graph is
     built (same edges, same degree distribution, scrambled attribution): a
     pipeline that 'works' under the placebo is leaking, not predicting.
+    A caller-supplied `diag` dict is filled per date with the honesty
+    numbers the page must print (edges kept vs expected-by-chance,
+    threshold, residual self-lag staleness).
     """
     out = {}
     for d in dates:
@@ -182,6 +183,11 @@ def leadlag_scores(prices: pd.DataFrame, dates, elig_by_date: dict,
             edges = leadlag_edges(rets, lags=lags, min_overlap=min_overlap,
                                   n_shuffle=n_shuffle, edge_q=edge_q,
                                   seed=_date_rng_seed(seed, d))
+            if diag is not None:
+                diag[d] = dict(n_uni=len(uni), n_kept=edges.attrs["n_kept"],
+                               n_expected_false=edges.attrs["n_expected_false"],
+                               rho_star=edges.attrs["rho_star"],
+                               mean_self_lag=edges.attrs["mean_self_lag"])
             if placebo_seed is not None and len(edges):
                 prng = np.random.default_rng([placebo_seed,
                                               _date_rng_seed(seed, d)])

@@ -18,7 +18,7 @@ from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial.distance import squareform
 
 __all__ = ["lw_shrink", "mp_clip", "corr_distance", "cluster_labels",
-           "mst_edges", "cluster_maps_by_date"]
+           "mst_edges", "cluster_maps_by_date", "rand_index"]
 
 
 def lw_shrink(returns: pd.DataFrame) -> tuple[np.ndarray, float]:
@@ -96,6 +96,24 @@ def mst_edges(corr: pd.DataFrame) -> list[tuple[str, str, float]]:
     mst = minimum_spanning_tree(csr_matrix(d + 1e-9)).tocoo()
     return [(names[i], names[j], float(max(w - 1e-9, 0.0)))
             for i, j, w in zip(mst.row, mst.col, mst.data)]
+
+
+def rand_index(labels_a: dict, labels_b: dict) -> float:
+    """Rand index between two labelings over their shared keys: fraction of
+    pairs on which the two clusterings agree (same-cluster vs different).
+    1.0 = identical partitions. 0 pairs → 0.0."""
+    keys = sorted(set(labels_a) & set(labels_b))
+    n = len(keys)
+    if n < 2:
+        return 0.0
+    agree = total = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            same_a = labels_a[keys[i]] == labels_a[keys[j]]
+            same_b = labels_b[keys[i]] == labels_b[keys[j]]
+            agree += int(same_a == same_b)
+            total += 1
+    return agree / total
 
 
 def cluster_maps_by_date(prices: pd.DataFrame, dates, elig_by_date: dict, *,

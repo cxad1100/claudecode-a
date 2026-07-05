@@ -140,3 +140,13 @@ def test_sectors_by_date_caps_cluster_concentration():
     picks = res["holdings_log"][0]["picks"]
     assert sum(cl[t] == 1 for t in picks) == 2
     assert sum(cl[t] == 2 for t in picks) == 2
+
+
+def test_rand_index_agreement_bounds():
+    from tools.corr_struct import rand_index
+    a = {"x": 1, "y": 1, "z": 2, "w": 2}
+    assert rand_index(a, a) == 1.0
+    b = {"x": 1, "y": 2, "z": 1, "w": 2}      # maximally shuffled 2x2
+    assert 0.0 <= rand_index(a, b) < 1.0
+    # disjoint keys → nan-safe 0 pairs
+    assert rand_index({"p": 1}, {"q": 2}) == 0.0
