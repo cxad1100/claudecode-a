@@ -181,13 +181,15 @@ def _search_url(von: str, bis: str, page: int = 1) -> str:
 
 
 def fetch(since: str, until: str, limit: int | None = None,
-          pace: float = 1.0) -> pathlib.Path:
+          pace: float = 1.0, cache_days: int = 7,
+          reuse_ids: bool = False) -> pathlib.Path:
     """Crawl [since, until) month windows: discover unique persons from the
-    paginated search, pull each person page once (same-day cache), archive
-    every dealing row. Resumable; safe to re-run."""
+    paginated search, pull each person page once (cached ≤ cache_days),
+    archive every dealing row. Resumable; safe to re-run; `reuse_ids` skips
+    discovery and reuses the last run's id list (chained partial crawls)."""
     ts = datetime.now().isoformat(timespec="seconds")
-    day = ts[:10]
     CACHE.mkdir(parents=True, exist_ok=True)
+    ids_cache = CACHE / "person_ids.json"
     op = _opener()
     _get(op, BASE + "?locale=de_DE")                        # open session
     def _discover(von_ts: pd.Timestamp, bis_ts: pd.Timestamp) -> None:
@@ -211,29 +213,45 @@ def fetch(since: str, until: str, limit: int | None = None,
                 return
             page += 1
 
-    months = pd.period_range(since, until, freq="M")
     person_ids: dict[str, str] = {}
-    for p in months:
-        _discover(p.start_time, p.end_time + pd.Timedelta(days=1))
-        print(f"bafin_dd: {p} → {len(person_ids)} unique persons so far",
-              flush=True)
+    if reuse_ids and ids_cache.exists():
+        import json
+        person_ids = json.loads(ids_cache.read_text())
+        print(f"bafin_dd: reusing {len(person_ids)} discovered ids", flush=True)
+    else:
+        for p in pd.period_range(since, until, freq="M"):
+            _discover(p.start_time, p.end_time + pd.Timedelta(days=1))
+            print(f"bafin_dd: {p} → {len(person_ids)} unique persons so far",
+                  flush=True)
+        import json
+        ids_cache.write_text(json.dumps(person_ids))
     ids = list(person_ids)
     if limit:
         ids = ids[:limit]
     rows: list[dict] = []
+    n_fail = 0
+    fresh_cut = time.time() - cache_days * 86400
     for i, pid in enumerate(ids):
-        cache_f = CACHE / f"person_{pid}_{day}.html"
-        if cache_f.exists():
-            html = cache_f.read_text(encoding="utf-8")
-        else:
-            html = _get(op, BASE + "ergebnisListe.do?cmd=loadEmittentenAction"
-                        f"&meldepflichtigerId={pid}")
-            cache_f.write_text(html, encoding="utf-8")
-            time.sleep(pace)
+        cache_f = CACHE / f"person_{pid}.html"
+        try:
+            if cache_f.exists() and cache_f.stat().st_mtime >= fresh_cut:
+                html = cache_f.read_text(encoding="utf-8")
+            else:
+                html = _get(op, BASE + "ergebnisListe.do?cmd=loadEmittentenAction"
+                            f"&meldepflichtigerId={pid}")
+                cache_f.write_text(html, encoding="utf-8")
+                time.sleep(pace)
+        except Exception as e:                     # skip, keep the crawl alive
+            n_fail += 1
+            print(f"bafin_dd: person {pid} failed ({e}); continuing", flush=True)
+            continue
         rows.extend(parse_person(html))
-        if (i + 1) % 25 == 0:
+        if (i + 1) % 100 == 0:
             print(f"bafin_dd: {i + 1}/{len(ids)} persons, "
                   f"{len(rows)} dealing rows", flush=True)
+    if n_fail:
+        print(f"bafin_dd: {n_fail} person pages failed — re-run to retry",
+              flush=True)
     df = normalize(rows, fetched_at=ts)
     store = pd.read_csv(STORE, dtype=str) if STORE.exists() else None
     merged = archive(df, store)
@@ -255,4 +273,4 @@ if __name__ == "__main__":
         return args[args.index(name) + 1] if name in args else default
 
     fetch(since=_opt("--since", "2026-06"), until=_opt("--until", "2026-07"),
-          limit=int(_opt("--limit", 0)) or None)
+          limit=int(_opt("--limit", 0)) or None, reuse_ids="--resume" in args)
