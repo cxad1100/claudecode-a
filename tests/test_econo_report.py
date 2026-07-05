@@ -120,3 +120,54 @@ def test_sec_phase_renders_overlays_and_verdict():
     assert "vol-target" in html and "AR-throttle" in html
     assert "verdict" in html.lower()
     assert "observational" in html.lower()
+
+
+def test_sec_events_renders_car_cells_and_verdict():
+    d = {"events": dict(
+        car_insider=dict(car={1: 0.01, 5: 0.02, 20: 0.03}, bmp_t=2.8, n=140),
+        car_insider_small=dict(car={20: 0.06}, bmp_t=3.1, n=45),
+        car_insider_big=dict(car={20: 0.005}, bmp_t=0.6, n=95),
+        car_covering=dict(car={1: 0.004, 5: 0.01, 20: 0.015}, bmp_t=2.1, n=300),
+        ct_alpha=dict(model="FF5+WML", alpha_ann=0.09, alpha_t=2.4, n=500),
+        cells=[dict(code="cover-Q", kind="signal", train=_fake_stats(),
+                    val=_fake_stats(0.6), test=_fake_stats(0.7),
+                    full=_fake_stats())],
+        headline=dict(code="cover-Q", mc_matched=dict(p_sharpe=0.03),
+                      dsr_phantom=[dict(mult=5, n=410, dsr=0.6)]),
+        insider_ready=True, n_trials=6)}
+    html = er.sec_events(d, False)
+    assert "cover-Q" in html and "CAR" in html
+    assert "small" in html.lower() and "verdict" in html.lower()
+    assert er.sec_events({}, False) == ""
+
+
+def test_sec_events_insider_pending_note():
+    d = {"events": dict(car_covering=dict(car={20: 0.01}, bmp_t=1.0, n=50),
+                        cells=[], headline={}, insider_ready=False,
+                        n_trials=4)}
+    html = er.sec_events(d, False)
+    assert "backfill" in html.lower() or "pending" in html.lower()
+
+
+def test_sec_trials_ledger_counts_and_statuses():
+    d = {"leadlag": dict(n_trials=10, cells=[], headline={}),
+         "corr": dict(n_trials=2, variants=[]),
+         "phase": dict(n_trials=0, promoted=False, rows=[]),
+         "events": dict(n_trials=4, cells=[], headline={},
+                        insider_ready=False)}
+    d["trials"] = er._gather_trials(d)
+    html = er.sec_trials(d, False)
+    assert "64" in html                       # inherited grid
+    assert "80" in html                       # 64+10+2+0+4 cumulative
+    assert "lead-lag" in html.lower()
+    assert "file drawer" in html.lower() or "killed" in html.lower()
+    # phase not promoted → its 0 trials shown, marked observational
+    assert "observational" in html.lower()
+
+
+def test_sec_trials_handles_missing_modules():
+    d = {"leadlag": None, "corr": None, "phase": None, "events": None}
+    d["trials"] = er._gather_trials(d)
+    html = er.sec_trials(d, False)
+    assert "64" in html                       # inherited always counted
+    assert "not run" in html.lower()

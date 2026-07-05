@@ -68,6 +68,30 @@ def _enabled(name: str) -> bool:
 
 # ── Data gathering ────────────────────────────────────────────────────────────
 
+def _factor_span(equity: pd.Series, returns: pd.Series | None = None) -> dict | None:
+    """FF5+WML spanning alpha of an equity curve (or a raw daily-return
+    series) — the page's shared 'real alpha' yardstick. None on any failure
+    or when FACTORS=0 (French outage never breaks the page)."""
+    if not FACTORS:
+        return None
+    try:
+        fac, fac_src = factors.fetch_factors_daily()
+        fx = cached_price_history(["EURUSD=X"], period="9y")["EURUSD=X"].dropna()
+        r = returns if returns is not None else equity.pct_change().dropna()
+        r_usd = factors.to_usd(r, fx)
+        excess = (r_usd - fac["RF"].reindex(r_usd.index)).dropna()
+        reg = factors.factor_regression(excess, fac)
+        if not reg:
+            return None
+        key = "FF5+WML" if "FF5+WML" in reg else next(iter(reg))
+        return dict(model=key, alpha_ann=reg[key]["alpha_ann"],
+                    alpha_t=reg[key]["alpha_t"], n=reg[key]["n"],
+                    source=fac_src)
+    except Exception as e:
+        print(f"[econo] factor regression skipped: {e}", file=sys.stderr)
+        return None
+
+
 def load_universe() -> dict:
     """The strategy stack's data assembly, factored once for every module:
     winsorized XETRA-calendar prices, slippage, sectors, PIT turnover and the
@@ -194,23 +218,7 @@ def _gather_leadlag(u: dict) -> dict:
     t_stat = float(dsr0["sharpe_annual"]
                    * np.sqrt(max(len(strat_rets) / ppy, 1e-9)))
 
-    factor = None
-    if FACTORS:
-        try:
-            fac, fac_src = factors.fetch_factors_daily()
-            fx = cached_price_history(["EURUSD=X"],
-                                      period="9y")["EURUSD=X"].dropna()
-            eq = hr["runs"][1.0]["equity"]
-            r_usd = factors.to_usd(eq.pct_change().dropna(), fx)
-            excess = (r_usd - fac["RF"].reindex(r_usd.index)).dropna()
-            reg = factors.factor_regression(excess, fac)
-            if reg:
-                key = "FF5+WML" if "FF5+WML" in reg else next(iter(reg))
-                factor = dict(model=key, alpha_ann=reg[key]["alpha_ann"],
-                              alpha_t=reg[key]["alpha_t"], n=reg[key]["n"],
-                              source=fac_src)
-        except Exception as e:
-            print(f"[econo] factor regression skipped: {e}", file=sys.stderr)
+    factor = _factor_span(hr["runs"][1.0]["equity"])
 
     ic = {}
     for rec in LL_RECENTS:
@@ -377,6 +385,192 @@ def _gather_phase(u: dict) -> dict:
                 chi_pct=float((c <= c.iloc[-1]).mean()) if len(c) else float("nan"))
 
 
+SHORT_STORE = ROOT / "data" / "universe" / "short_positions.csv"
+DD_STORE = ROOT / "data" / "universe" / "insider_dealings.csv"
+DD_MIN_ROWS = 200            # insider cells wait for the backfill
+CROWDED_AVOID = 2.0          # eligibility subtraction: total disclosed short ≥ 2%
+
+
+def _gather_events(u: dict) -> dict:
+    """M4: regulatory-event signals through the production gate + the event
+    study as primary evidence. Short-register cells always run (history is
+    complete); insider cells and CARs engage once the DD backfill passes
+    DD_MIN_ROWS. MC nulls are MATCHED (drawn from each signal's own candidate
+    set) — the M1 lesson, baked in."""
+    from tools.event_signal import (insider_score_by_date, interact_small,
+                                    pit_slice, short_pressure_by_date)
+    from tools.event_study import calendar_time_portfolio, car_stats, \
+        market_model_ar
+    from tools.momentum import precompute_scores
+    prices, slip, turnover, pit, sectors = (u["prices"], u["slip"],
+                                            u["turnover"], u["pit"],
+                                            u["sectors"])
+    meta_df = u["meta_df"]
+    shorts = pd.read_csv(SHORT_STORE, dtype={"pct": float}) \
+        if SHORT_STORE.exists() else None
+    if shorts is None or not len(shorts):
+        raise RuntimeError("short_positions.csv missing — run tools.short_register")
+    dd = pd.read_csv(DD_STORE, dtype=str) if DD_STORE.exists() else None
+    insider_ready = dd is not None and len(dd) >= DD_MIN_ROWS
+    isin_ticker = {str(r["isin"]): r["ticker"] for _, r in meta_df.iterrows()
+                   if pd.notna(r.get("isin"))}
+
+    cutoff = pd.Timestamp(START)
+    cand = [d for d in rebalance_dates(prices.index, "M")
+            if len(prices.loc[:d]) >= LOOKBACK + 1 and d >= cutoff]
+    elig = precompute_eligibility(prices, slip, cand, liq_max=LIQ_MAX,
+                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE,
+                                  pit=pit, turnover=turnover,
+                                  turn_floor=MIN_TURNOVER)
+    te, ve = pd.Timestamp(TRAIN_END), pd.Timestamp(VAL_END)
+
+    def _run(sbd, freq, code, elig_override=None):
+        r = run_momentum(prices, slip, k=LL_K, lookback=LOOKBACK, skip=SKIP,
+                         capital=CAPITAL, cost_mults=(1.0,), freq=freq,
+                         liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                         start=START, lazy=True, pit=pit, execute_lag=EXEC_LAG,
+                         turnover=turnover, turn_floor=MIN_TURNOVER,
+                         elig_by_date=elig_override or elig, score_by_date=sbd)
+        eq, tr = r["runs"][1.0]["equity"], r["runs"][1.0]["trades"]
+        return dict(code=code, kind="signal", freq=freq,
+                    train=_stats_slice(eq, tr, eq.index[0], te, CAPITAL),
+                    val=_stats_slice(eq, tr, te + pd.Timedelta(days=1), ve,
+                                     CAPITAL),
+                    test=_stats_slice(eq, tr, ve + pd.Timedelta(days=1),
+                                      eq.index[-1], CAPITAL),
+                    full=r["runs"][1.0]["stats"]), r
+
+    cells, runs = [], {}
+    sp = short_pressure_by_date(shorts, cand, isin_ticker, delta_days=21)
+    for freq in ("M", "Q"):
+        cell, r = _run(sp["covering"], freq, f"cover-{freq}")
+        cells.append(cell)
+        runs[cell["code"]] = r
+    # crowded-avoid: plain momentum, names with heavy disclosed shorts cut
+    mom_scores = precompute_scores(prices, cand, LOOKBACK, SKIP)
+    elig_avoid = {}
+    for d in cand:
+        hot = set(sp["crowded"][d]["raw"]
+                  [sp["crowded"][d]["raw"] >= CROWDED_AVOID].index)
+        elig_avoid[d] = elig[d] - hot
+    for freq in ("M", "Q"):
+        cell, r = _run(mom_scores, freq, f"avoid-{freq}",
+                       elig_override=elig_avoid)
+        cells.append(cell)
+        runs[cell["code"]] = r
+    if insider_ready:
+        ins = insider_score_by_date(dd, cand, isin_ticker, window_days=90,
+                                    halflife=30)
+        ins_small = {d: {"raw": interact_small(ins[d]["raw"], turnover, d),
+                         "voladj": interact_small(ins[d]["raw"], turnover, d)}
+                     for d in cand}
+        for code, sbd in (("insider-Q", ins), ("insider-small-Q", ins_small)):
+            cell, r = _run(sbd, "Q", code)
+            cells.append(cell)
+            runs[cell["code"]] = r
+
+    head_cell = max(cells, key=lambda c: min(c["train"]["sharpe"],
+                                             c["val"]["sharpe"]))
+    hr = runs[head_cell["code"]]
+    hl = hr["holdings_log"]
+    headline: dict = dict(code=head_cell["code"])
+    if hl:
+        rb = [h["date"] for h in hl] + [hl[-1]["next"]]
+        sig_scores = (sp["covering"] if head_cell["code"].startswith("cover")
+                      else mom_scores)
+        matched = {d: set(sig_scores.get(d, {}).get("raw",
+                          pd.Series(dtype=float)).index) & elig.get(d, set())
+                   for d in rb}
+        pools_m = sig.period_pools(prices, rb, matched, execute_lag=EXEC_LAG)
+        strat_rets = sig.strategy_period_returns(hl)
+        ppy = 4.0 if head_cell["freq"] == "Q" else 12.0
+        n_total = N_INHERITED_TRIALS + 10 + 2 + len(cells)
+        trial_sharpes = [c["full"]["sharpe"] for c in cells]
+        headline.update(
+            mc_matched=sig.monte_carlo_null(pools_m, strat_rets, k=LL_K,
+                                            ppy=ppy, n_trials=1000, seed=0),
+            dsr_phantom=[dict(mult=m, n=n_total * m,
+                              dsr=sig.deflated_sharpe_ratio(
+                                  strat_rets, trial_sharpes, ppy=ppy,
+                                  n_trials_effective=n_total * m)["dsr"])
+                         for m in PHANTOM_MULTS],
+            factor=_factor_span(hr["runs"][1.0]["equity"]))
+
+    # Event studies — primary evidence. Day 0 = publication.
+    spx_like = prices.mean(axis=1)          # EW universe as the market proxy
+    exits = shorts[shorts["pct"] < 0.5].copy()
+    exits["ticker"] = exits["isin"].map(isin_ticker)
+    exits = exits.dropna(subset=["ticker"])
+    # day 0 = publication; explicit frame — the stores carry their own
+    # event_date column, renaming published_at would duplicate it
+    ev_cov = pd.DataFrame({"ticker": exits["ticker"],
+                           "event_date": exits["published_at"]})
+    car_covering = car_stats(market_model_ar(prices, spx_like, ev_cov))
+    out = dict(cells=cells, headline=headline, car_covering=car_covering,
+               insider_ready=insider_ready, n_trials=len(cells))
+    if insider_ready:
+        buys = dd[dd["side"] == "buy"].copy()
+        buys["ticker"] = buys["isin"].map(isin_ticker)
+        buys = buys.dropna(subset=["ticker"])
+        evb = pd.DataFrame({"ticker": buys["ticker"],
+                            "event_date": buys["published_at"]})
+        out["car_insider"] = car_stats(market_model_ar(prices, spx_like, evb))
+        # capacity thesis: small (bottom-turnover-tercile) vs big
+        if turnover is not None and len(evb):
+            med = turnover.tail(6).median()
+            cut_lo = med.quantile(1 / 3)
+            small = evb[evb["ticker"].map(med) <= cut_lo]
+            big = evb[evb["ticker"].map(med) > cut_lo]
+            out["car_insider_small"] = car_stats(
+                market_model_ar(prices, spx_like, small))
+            out["car_insider_big"] = car_stats(
+                market_model_ar(prices, spx_like, big))
+        ct = calendar_time_portfolio(prices,
+                                     buys[["ticker", "published_at"]],
+                                     hold_days=21)
+        out["ct_alpha"] = _factor_span(pd.Series(dtype=float), returns=ct)
+    return out
+
+
+def _gather_trials(d: dict) -> dict:
+    """Program-level multiple-testing ledger, derived from whatever the
+    other modules produced THIS build. N only ever grows across the program;
+    killed modules' cells stay counted — that's the file drawer, made
+    visible. Pure: no data access."""
+    rows = [dict(module="inherited 64-config grid (strategy page)",
+                 cells=N_INHERITED_TRIALS, status="baseline search space")]
+
+    def _status(key):
+        m = d.get(key)
+        if m is None:
+            return None, "not run this build"
+        if key == "leadlag":
+            cls, _ = _verdict_leadlag(m)
+            return m.get("n_trials", 0), \
+                ("killed — cells stay in N" if cls == "neg" else "candidate")
+        if key == "corr":
+            return m.get("n_trials", 0), "construction — not promoted"
+        if key == "phase":
+            return m.get("n_trials", 0), \
+                ("promoted (+4 trials)" if m.get("promoted")
+                 else "observational (0 trials until promoted)")
+        if key == "events":
+            n = m.get("n_trials", 0)
+            note = "" if m.get("insider_ready") else "; insider cells pending"
+            return n, f"running candidate{note}"
+        return 0, "?"
+
+    for key, label in (("leadlag", "M1 lead-lag network"),
+                       ("corr", "M2 cluster-neutral construction"),
+                       ("phase", "M3 AR-throttle"),
+                       ("events", "M4 regulatory events")):
+        n, status = _status(key)
+        rows.append(dict(module=label, cells=n if n is not None else 0,
+                         status=status))
+    total = sum(r["cells"] for r in rows)
+    return dict(rows=rows, total=total, phantom=PHANTOM_MULTS)
+
+
 def gather() -> dict:
     """Run every enabled module; a disabled or failed module leaves None.
 
@@ -384,7 +578,7 @@ def gather() -> dict:
     data file) never takes the page down — the section simply doesn't render.
     """
     d: dict = {k: None for k in MODULES}
-    modules_needing_data = ("leadlag",)          # corr/phase/events join later
+    modules_needing_data = ("leadlag", "corr", "phase", "events")
     if not any(_enabled(m) for m in modules_needing_data):
         return d
     try:
@@ -407,6 +601,12 @@ def gather() -> dict:
             d["phase"] = _gather_phase(u)
         except Exception as e:
             print(f"[econo] phase skipped: {e}", file=sys.stderr)
+    if _enabled("events"):
+        try:
+            d["events"] = _gather_events(u)
+        except Exception as e:
+            print(f"[econo] events skipped: {e}", file=sys.stderr)
+    d["trials"] = _gather_trials(d)
     return d
 
 
@@ -634,16 +834,122 @@ caveat that critical-point CRASH PREDICTION has a weak out-of-sample record,
 which is why this module is a risk gauge, not a signal.</p></details>"""
 
 
-def sec_events(d: dict, public: bool) -> str:
-    if d.get("events") is None:
+def _car_row(label: str, c: dict | None) -> str:
+    if not c or not c.get("n"):
         return ""
-    return "<h2>Regulatory events</h2>"
+    car = c.get("car", {})
+    return (f"<tr><td>{label}</td>"
+            f"<td class='mono'>{car.get(1, float('nan')) * 100:+.2f}%</td>"
+            f"<td class='mono'>{car.get(5, float('nan')) * 100:+.2f}%</td>"
+            f"<td class='mono'>{car.get(20, float('nan')) * 100:+.2f}%</td>"
+            f"<td class='mono'>{c.get('bmp_t', float('nan')):.2f}</td>"
+            f"<td class='mono'>{c.get('n', 0)}</td></tr>")
+
+
+def sec_events(d: dict, public: bool) -> str:
+    e = d.get("events")
+    if e is None:
+        return ""
+    car_rows = "".join([
+        _car_row("short-covering (exit filings)", e.get("car_covering")),
+        _car_row("insider buys — all", e.get("car_insider")),
+        _car_row("insider buys — small caps", e.get("car_insider_small")),
+        _car_row("insider buys — large caps", e.get("car_insider_big"))])
+    cells = "".join(
+        f"<tr><td class='mono'>{c['code']}</td>"
+        f"<td class='mono'>{c['train']['sharpe']:.2f}</td>"
+        f"<td class='mono'>{c['val']['sharpe']:.2f}</td>"
+        f"<td class='mono'>{c['test']['sharpe']:.2f}</td>"
+        f"<td>{_pct(c['full']['net_return'] * 100)}</td></tr>"
+        for c in e.get("cells", []))
+    head = e.get("headline") or {}
+    mcm = (head.get("mc_matched") or {})
+    dsr5 = next((x.get("dsr") for x in head.get("dsr_phantom", [])
+                 if x.get("mult") == 5), None)
+    fac = head.get("factor")
+    ct = e.get("ct_alpha")
+    pending = ("" if e.get("insider_ready") else
+               "<p class='sub'>Insider cells & CARs pending — the BaFin "
+               "backfill is still accruing (store below threshold). "
+               "Short-register results below are complete.</p>")
+    ins_small = e.get("car_insider_small") or {}
+    ins_big = e.get("car_insider_big") or {}
+    cap_line = ""
+    if ins_small.get("n") and ins_big.get("n"):
+        cap_line = (f"<p>Capacity thesis: small-cap insider CAR(+20) "
+                    f"{(ins_small['car'].get(20, 0)) * 100:+.2f}% "
+                    f"(BMP t {ins_small['bmp_t']:.2f}) vs large-cap "
+                    f"{(ins_big['car'].get(20, 0)) * 100:+.2f}% "
+                    f"(t {ins_big['bmp_t']:.2f}) — the edge, if any, must "
+                    f"live in the small bucket.</p>")
+    bmp_ok = any((e.get(k) or {}).get("bmp_t", 0) >= 2.0
+                 for k in ("car_covering", "car_insider", "car_insider_small"))
+    mcp = mcm.get("p_sharpe")
+    if bmp_ok and mcp is not None and mcp < 0.05 and (dsr5 or 0) > 0.5 \
+            and fac and fac.get("alpha_t", 0) >= 2.0:
+        vcls, vtext = "pos", ("Event evidence AND the strategy gate agree — "
+                              "residual alpha candidate; keep collecting "
+                              "live history.")
+    elif bmp_ok:
+        vcls, vtext = "", ("Event study shows a market reaction, but the "
+                           "tradeable book doesn't clear the gate (null/DSR/"
+                           "spanning) at these rebalance horizons — "
+                           "observational; re-judge as live data accrues.")
+    else:
+        vcls, vtext = "neg", ("No significant post-publication reaction — "
+                              "killed at current sample; negative result "
+                              "stays on the page.")
+    fac_line = (f"FF5+WML α {fac['alpha_ann'] * 100:+.1f}%/yr "
+                f"(t {fac['alpha_t']:.2f})" if fac else "spanning n/a")
+    ct_line = (f" · calendar-time insider-buy book: α "
+               f"{ct['alpha_ann'] * 100:+.1f}%/yr (t {ct['alpha_t']:.2f}, "
+               f"n {ct['n']})" if ct else "")
+    return f"""<h2>Regulatory events — insider dealings &amp; short register</h2>
+<p class="sub">New information, not new math: BaFin Directors' Dealings
+(real publication timestamps) and the Bundesanzeiger net-short register
+(publication imputed +1bd, flagged). PIT joins strictly published-before;
+day 0 of every CAR = publication, entry t+1.</p>
+{pending}
+<table><thead><tr><th>event study (CAR)</th><th>+1d</th><th>+5d</th>
+<th>+20d</th><th>BMP t</th><th>n</th></tr></thead><tbody>{car_rows}</tbody></table>
+{cap_line}
+<table><thead><tr><th>cell</th><th>train S</th><th>val S</th><th>test S</th>
+<th>full net</th></tr></thead><tbody>{cells}</tbody></table>
+<p>Headline <span class="mono">{head.get('code', '—')}</span>:
+matched-null p(Sharpe) {mcm.get('p_sharpe', float('nan')):.3f} ·
+DSR ×5 {dsr5 if dsr5 is not None else float('nan'):.2f} · {fac_line}{ct_line}</p>
+<div class="callout"><b>Verdict:</b> <span class="{vcls}">{vtext}</span></div>
+<details><summary>Method &amp; references</summary>
+<p>Market-model event study (MacKinlay 1997) with strictly pre-event
+estimation windows; BMP (1991) standardized t. Calendar-time portfolio
+(entry t+1 after publication, 21d hold) regressed on FF5+WML — event
+evidence and the strategy gate meet on the same yardstick. Insider signal:
+signed half-life-decayed dealing counts (Lakonishok &amp; Lee 2001 — effect
+concentrated in small names, hence the turnover-tercile split: the
+capacity-edge test). Short register: crowded level (holders' latest pct,
+&lt;0.5% exits drop) and covering delta (Jank, Roling, Smajlbegovic 2021 on
+this exact register). DD portal discovery retains ~12 months; person pages
+recover deeper history for active insiders — deep-backtest coverage bias
+disclosed, fresh-window signals unbiased.</p></details>"""
 
 
 def sec_trials(d: dict, public: bool) -> str:
-    if d.get("trials") is None:
+    t = d.get("trials")
+    if t is None:
         return ""
-    return "<h2>Trial ledger</h2>"
+    rows = "".join(f"<tr><td>{r['module']}</td>"
+                   f"<td class='mono'>{r['cells']}</td>"
+                   f"<td>{r['status']}</td></tr>" for r in t.get("rows", []))
+    total = t.get("total", 0)
+    ladder = " · ".join(f"×{m}: N={total * m}" for m in t.get("phantom", ()))
+    return f"""<h2>Trial ledger — the file drawer, made visible</h2>
+<p class="sub">Every cell ever run counts forever, controls and kills
+included; N only grows. Deflated-Sharpe verdicts across the program quote
+the ×5 phantom row — the honest correction for the search you can't see.</p>
+<table><thead><tr><th>module</th><th>cells</th><th>status</th></tr></thead>
+<tbody>{rows}</tbody>
+<tfoot><tr><td><b>program N</b></td><td class='mono'><b>{total}</b></td>
+<td class='mono'>{ladder}</td></tr></tfoot></table>"""
 
 
 def sec_footer() -> str:
