@@ -25,9 +25,12 @@ def test_gather_and_build(synthetic):
     assert d["seasonal"] and d["mc"] and d["stack"]
     assert d["mc"]["p_sharpe"] < 0.05                     # the planted rebound is found
     assert d["stack"]["overlay"]["exposure"].max() <= 1.0 + 1e-12
+    assert d["sleeve_verdict"]["verdict"] in ("KEEP", "CUT")
+    assert "Run:" in d["stack_verdict"]["statement"]
     html = E.build(d)
     for needle in ("Edge Stack", "structural edge", "tax-loss rebound",
-                   "Monte-Carlo", "Honesty box", "Wachtel"):
+                   "Monte-Carlo", "Honesty box", "Wachtel",
+                   "pre-registered gates", "Sleeve calendar", "Expectations"):
         assert needle in html
 
 

@@ -39,10 +39,13 @@ def test_gather_and_build(synthetic_data):
     assert np.isfinite(d["significance"]["ci"]["sharpe"])
     assert "^GSPC" not in d["significance"]["best"]       # research proxy never certified
 
+    assert d["verdicts"]["etf"]["method"] in V.METHODS     # gates ran
+    assert d["today"]["action"]["instruction"]             # a concrete instruction
     html = V.build(d)
     for needle in ("Vol lab", "Is volatility actually predictable", "mean is not",
                    "Applied to the tradeable ETF", "Applied to the momentum strategy",
-                   "Significance", "Cost", "Moreira", "universe_prices.csv"):
+                   "Significance", "Cost", "Moreira", "universe_prices.csv",
+                   "pre-registered gates", "Today's action", "Live vs backtest"):
         assert needle in html
 
 

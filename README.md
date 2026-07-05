@@ -65,4 +65,6 @@ build_vol_report.py               ← vol lab: forecast volatility (EWMA/GARCH/H
  └─ tools/vol_forecast.py            and vol-target exposure (serve.py route /vol, local-only)
 build_edge_report.py              ← edge stack: structural retail edges — capacity, forced flows
  └─ tools/edge_seasonal.py           (tax-loss rebound), horizon, costs (route /edge, local-only)
+tools/gates.py + live_state + track ← pre-registered verdict gates, today's-action panel,
+                                      live-vs-backtest tracking with kill criteria
 ```

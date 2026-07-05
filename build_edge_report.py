@@ -28,6 +28,7 @@ from tools import theme, significance as sig, quant_grade as qg, vol_forecast as
 from tools import edge_seasonal as es
 from tools.report_html import pct as _pct, card as _card, page, fig_html
 from tools.universe_panel import load_universe_panel, momentum_net_returns
+from tools import gates, live_state
 
 ROOT = Path(__file__).parent
 
@@ -60,6 +61,13 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             d["mc"] = sig.monte_carlo_null(res["pools"], strat, k=k_eff, ppy=1.0,
                                            n_trials=2000, seed=0)
             d["mc"]["k_eff"] = k_eff
+        d["sleeve_verdict"] = gates.sleeve_verdict(d["mc"], res["years"])
+        d["stack_verdict"] = gates.stack_verdict(d["sleeve_verdict"],
+                                                 w_sleeve=W_SLEEVE, target_vol=TARGET_VOL)
+        d["sleeve_status"] = live_state.sleeve_status(uni["prices"].index,
+                                                      entry_mmdd=ENTRY_MMDD,
+                                                      exit_mmdd=EXIT_MMDD)
+        d["meta"] = uni["meta"]
 
     # the stack: momentum core ⊕ seasonal sleeve, then the vol-managed overlay.
     # No blanket except here — a corrupt panel should fail the build loudly (serve.py
@@ -92,7 +100,71 @@ def sec_edges(d: dict) -> str:
         'vol-managed overlay exists to make holding through drawdowns survivable. '
         '<b>(4)&nbsp;Costs &amp; taxes</b> — lazy rebalancing, bands, the €1 fee modelled: '
         'the only guaranteed alpha. Every sleeve maps to one edge; nothing here claims to '
-        'know tomorrow&rsquo;s price. Not advice.</div>')
+        'know tomorrow&rsquo;s price. '
+        '<br><br><b>Expectations, in writing.</b> The momentum core is the only return '
+        'engine; the overlays buy Sharpe and drawdown and usually cost total return. '
+        'Base case if the momentum premium persists: market-like or somewhat better '
+        'returns with materially shallower drawdowns. Downside case: an index fund minus '
+        'costs. Which one you get is decided by the pre-registered gates below and by '
+        'live-vs-backtest tracking (/vol) — never by a backtest headline. Not advice.</div>')
+
+
+def _gate_table(checks: list[dict]) -> str:
+    rows = "".join(
+        f"<tr><td>{c['name']}</td><td class='num mono'>{c['value']}</td>"
+        f"<td class='num mono dim'>{c['threshold']}</td>"
+        f"<td class='num' style='color:{'#46c84e' if c['passed'] else '#ef4444'}'>"
+        f"{'PASS' if c['passed'] else 'FAIL'}</td></tr>" for c in checks)
+    return ("<table><tr><th>Gate</th><th class='num'>Measured</th>"
+            f"<th class='num'>Bar</th><th class='num'>Result</th></tr>{rows}</table>")
+
+
+def sec_verdict(d: dict) -> str:
+    sv = d.get("sleeve_verdict")
+    if not sv:
+        return ""
+    stk = d.get("stack_verdict", {})
+    color = "#46c84e" if sv["verdict"] == "KEEP" else "#ef4444"
+    return ("<h2>Verdict — pre-registered gates</h2>"
+            "<p class='dim'>Thresholds committed to code before the first real-data "
+            "run (tools/gates.py); the verdict is a binding decision, not a story "
+            "fitted to the outcome.</p>"
+            f"<h3>Tax-loss sleeve: <span style='color:{color}'>{sv['verdict']}</span></h3>"
+            + _gate_table(sv["checks"]) +
+            f"<p><b>{stk.get('statement', '')}</b> <span class='dim'>(forecast method "
+            "per the /vol verdict)</span></p>")
+
+
+def sec_today(d: dict) -> str:
+    st = d.get("sleeve_status")
+    if not st:
+        return ""
+    out = ["<h2>Sleeve calendar — today</h2>"]
+    if st["in_window"]:
+        w = st["window"]
+        out.append(f"<p><b>IN WINDOW</b> — signal was {w['signal'].date()}, exit "
+                   f"{w['exit'].date()} ({st['days_left']} days left).</p>")
+        res = d.get("seasonal")
+        rec = res["years"][-1] if res and res["years"] else None
+        if rec and rec["picks"]:
+            meta = d.get("meta", {})
+            rows = []
+            for t in rec["picks"]:
+                m = meta.get(t, {})
+                isin = m.get("isin") if pd.notna(m.get("isin", np.nan)) else ""
+                rows.append(f"<tr><td class='mono'>{str(m.get('home') or t).split('.')[0]}</td>"
+                            f"<td>{m.get('name', t)}</td>"
+                            f"<td class='dim mono' style='font-size:0.72rem'>{isin}</td>"
+                            f"<td class='num'>{_pct(rec['ytd'].get(t, 0) * 100)}</td></tr>")
+            out.append("<p class='dim'>Current sleeve picks — search the ISIN in Trade "
+                       "Republic:</p><table><tr><th>Ticker</th><th>Name</th><th>ISIN</th>"
+                       "<th class='num'>YTD at signal</th></tr>" + "".join(rows) + "</table>")
+    else:
+        out.append(f"<p>Out of window — flat in cash. <b>Next signal in "
+                   f"{st['days_to_signal']} days</b> (mid-December); the sleeve then "
+                   f"buys the bottom-{K} negative-YTD liquid names and exits end of "
+                   "January.</p>")
+    return "".join(out)
 
 
 def sec_seasonal(d: dict) -> str:
@@ -228,6 +300,8 @@ def build(d: dict, public: bool = False) -> str:
         f"<p class='dim'>generated {now} · <a href='report.html'>← portfolio</a> · "
         "<a href='strategy.html'>strategy</a> · <a href='vol.html'>vol lab</a></p>",
         sec_edges(d),
+        sec_verdict(d),
+        sec_today(d),
         sec_seasonal(d),
         sec_stack(d),
         sec_method(d),

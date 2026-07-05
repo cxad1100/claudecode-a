@@ -24,6 +24,7 @@ import plotly.graph_objects as go
 
 from tools import theme, significance as sig, quant_grade as qg, vol_forecast as vf
 from tools import vol_ml as vml
+from tools import gates, live_state, track
 from tools.report_html import pct as _pct, card as _card, page, fig_html
 
 ROOT = Path(__file__).parent
@@ -120,7 +121,8 @@ def cost_grid(r_oos: pd.Series, forecast: pd.Series) -> list[dict]:
     return out
 
 
-def gather(force: bool = False, refresh: bool | None = None) -> dict:
+def gather(force: bool = False, refresh: bool | None = None,
+           track_live: bool = False) -> dict:
     refresh = force if refresh is None else refresh
     etf_ohlc = cached_ohlc(ETF, force=refresh)
     spx_ohlc = cached_ohlc(PROXY, force=refresh)
@@ -166,11 +168,119 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     ci = sig.bootstrap_sharpe_cagr_ci(best_rets, ppy=252.0, block=21, seed=0)
 
     grid = cost_grid(etf["r_oos"], etf["forecasts"][etf["winner"]])
+
+    # ── pre-registered gates + today's action + live tracking ──
+    verdicts = {"etf": gates.overlay_verdict(etf["stats"], etf["variants"])}
+    if mom:
+        verdicts["mom"] = gates.overlay_verdict(mom["stats"], mom["variants"])
+    method = verdicts["etf"]["method"]                    # the adopted forecast for the book
+    state = live_state.load_state()
+    f_adopted = etf["forecasts"][method].dropna()
+    action = live_state.vol_action(float(f_adopted.iloc[-1]), state["held_w"],
+                                   target_vol=TARGET_VOL, band=BAND, capital=CAPITAL)
+    today = dict(action=action, state=state, method=method,
+                 asof=str(f_adopted.index[-1].date()))
+    if track_live:
+        r_etf = etf["returns"].dropna()
+        row = dict(forecast=action["forecast"], w_target=action["w_target"],
+                   w_held=state["held_w"],
+                   r_live=state["held_w"] * float(r_etf.iloc[-1]))
+        track.append_snapshot(r_etf.index[-1], row)
+    tdf = track.read_track()
+    live = (track.live_vs_backtest(tdf, sharpe_lo=ci["sharpe_lo"],
+                                   backtest_max_dd=best.get("max_dd", -0.5))
+            if tdf is not None else None)
+
     return dict(etf=etf, spx=spx, mom=mom, mean_null=mean_null, grid=grid,
+                verdicts=verdicts, today=today, live=live,
                 significance=dict(dsr=dsr, ci=ci, best=f"{best_m} on {best_name}"))
 
 
 # ───────────────────────────── sections ─────────────────────────────
+
+def _gate_table(checks: list[dict]) -> str:
+    rows = "".join(
+        f"<tr><td>{c['name']}</td><td class='num mono'>{c['value']}</td>"
+        f"<td class='num mono dim'>{c['threshold']}</td>"
+        f"<td class='num' style='color:{'#46c84e' if c['passed'] else '#ef4444'}'>"
+        f"{'PASS' if c['passed'] else 'FAIL'}</td></tr>" for c in checks)
+    return ("<table><tr><th>Gate</th><th class='num'>Measured</th>"
+            f"<th class='num'>Bar</th><th class='num'>Result</th></tr>{rows}</table>")
+
+
+def sec_verdict(d: dict) -> str:
+    out = ["<h2>Verdict — pre-registered gates</h2>",
+           "<p class='dim'>These thresholds were committed to code <b>before</b> the "
+           "first real-data run (see tools/gates.py) — the verdict below is a binding "
+           "decision, not a story fitted to the outcome. A forecast model is adopted "
+           "only if it beats the incumbent trailing-63d overlay on forecast quality "
+           "AND is no worse as a strategy; ties keep the incumbent.</p>"]
+    for key, label in (("etf", ETF_NAME), ("mom", "Momentum strategy")):
+        v = d.get("verdicts", {}).get(key)
+        if not v:
+            continue
+        color = "#46c84e" if v["verdict"].startswith("ADOPT") else "#d7ba7d"
+        out.append(f"<h3>{label}: <span style='color:{color}'>{v['verdict']}</span></h3>")
+        out.append(_gate_table(v["checks"]))
+    return "".join(out)
+
+
+def sec_today(d: dict) -> str:
+    t = d.get("today")
+    if not t:
+        return ""
+    a, st = t["action"], t["state"]
+    cards = [
+        _card(f"Forecast vol ({METHOD_LABEL.get(t['method'], t['method'])})",
+              f"{a['forecast'] * 100:.1f}%" if a.get("forecast") else "—"),
+        _card("Target exposure", f"{a['w_target'] * 100:.0f}%"),
+        _card("Held exposure (state.json)", f"{a['held_w'] * 100:.0f}%"),
+        _card("Action", "TRADE" if a["trade"] else "HOLD"),
+    ]
+    upd = f" · state updated {st['updated']}" if st.get("updated") else \
+        " · no recorded state yet — set it after your first trade"
+    return ("<h2>Today's action</h2>"
+            f"<p class='dim'>As of {t['asof']}, per the adopted method and the exact "
+            f"backtest rule (min({TARGET_VOL:.0%}/σ&#770;, 100%), trade only beyond the "
+            f"{BAND:.0%} band). This page never places orders — it says what the "
+            "backtest would do.</p>"
+            f'<div class="cards">{"".join(cards)}</div>'
+            f"<p><b>{a['instruction']}</b></p>"
+            f"<p class='dim'>After trading, record it: <span class='mono'>python "
+            f"build_vol_report.py --set-exposure {a['w_target']:.2f}</span>{upd}</p>")
+
+
+def sec_live(d: dict) -> str:
+    lv = d.get("live")
+    rules = ("<p class='dim'>Pre-registered kill rules (tools/track.py): de-risk to "
+             f"cash and reassess iff the rolling {track.WINDOW}d live Sharpe sits below "
+             f"the backtest CI's lower bound for {track.PATIENCE} consecutive sessions, "
+             f"OR the live drawdown exceeds {track.DD_MULT}&times; the backtest max "
+             "drawdown. Live-vs-backtest is the only test that settles "
+             "&ldquo;profitable?&rdquo; — every /vol build appends one row of live "
+             "state to local/track.csv.</p>")
+    if lv is None:
+        return ("<h2>Live vs backtest</h2>" + rules +
+                "<p class='dim'>No live rows yet — the file starts filling once the "
+                "page is built with tracking on (python build_vol_report.py).</p>")
+    if not lv.get("enough"):
+        return ("<h2>Live vs backtest</h2>" + rules +
+                f"<p class='dim'>Collecting: {lv['n']}/{lv['needed']} live sessions "
+                "before the first evaluation.</p>")
+    color = "#ef4444" if lv["kill"] else "#46c84e"
+    status = f'<span style="color:{color}">' + \
+        ("KILL — de-risk and reassess" if lv["kill"] else "HEALTHY") + "</span>"
+    cards = "".join([
+        _card("Status", status),
+        _card("Rolling 63d live Sharpe", f"{lv['roll_sharpe_last']:.2f}"),
+        _card("Live drawdown", f"{lv['live_dd']:.1%} (limit {lv['dd_limit']:.1%})"),
+        _card("Live sessions", str(lv["n"])),
+    ])
+    reasons = "".join(f"<li>{r}</li>" for r in lv["reasons"])
+    return ("<h2>Live vs backtest</h2>" + rules +
+            f'<div class="cards">{cards}</div>'
+            + (f"<ul>{reasons}</ul>" if reasons else ""))
+
 
 def sec_thesis(d: dict) -> str:
     return (
@@ -463,12 +573,15 @@ def build(d: dict, public: bool = False) -> str:
         f"<p class='dim'>generated {now} · <a href='report.html'>← portfolio</a> · "
         "<a href='strategy.html'>strategy</a></p>",
         sec_thesis(d),
+        sec_verdict(d),
+        sec_today(d),
         sec_forecast_eval(d),
         sec_mean_null(d),
         sec_etf(d),
         sec_momentum(d),
         sec_significance(d),
         sec_costs(d),
+        sec_live(d),
         sec_method(d),
     ])
     return page("Vol lab", body)
@@ -478,8 +591,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--set-exposure", type=float, metavar="W",
+                    help="record the exposure you actually hold (0..1) after trading")
     args = ap.parse_args()
-    d = gather(refresh=args.refresh)
+    if args.set_exposure is not None:
+        st = live_state.save_state(max(0.0, min(1.0, args.set_exposure)))
+        print(f"recorded held exposure {st['held_w']:.0%} ({st['updated']})")
+        return
+    d = gather(refresh=args.refresh, track_live=True)
     local = ROOT / "local/vol.html"
     local.parent.mkdir(exist_ok=True)
     local.write_text(build(d))                            # local-only — no docs/ export
