@@ -171,3 +171,23 @@ def test_sec_trials_handles_missing_modules():
     html = er.sec_trials(d, False)
     assert "64" in html                       # inherited always counted
     assert "not run" in html.lower()
+
+
+def test_sec_ml_renders_duel_and_preregistered_rule():
+    d = {"ml": dict(
+        cells=[dict(code="ridge-Q", train=_fake_stats(0.7), val=_fake_stats(0.8),
+                    test=_fake_stats(0.9), full=_fake_stats()),
+               dict(code="mlp-Q", train=_fake_stats(0.75), val=_fake_stats(0.85),
+                    test=_fake_stats(0.95), full=_fake_stats())],
+        ic=dict(ridge=dict(mean=0.03, t=1.8, n=25),
+                mlp=dict(mean=0.035, t=2.0, n=25)),
+        headline=dict(code="mlp-Q", mc_matched=dict(p_sharpe=0.04),
+                      dsr_phantom=[dict(mult=5, n=465, dsr=0.55)],
+                      factor=dict(model="FF5+WML", alpha_ann=0.08,
+                                  alpha_t=2.1, n=2000)),
+        adopt=True, n_trials=2)}
+    html = er.sec_ml(d, False)
+    assert "ridge-Q" in html and "mlp-Q" in html
+    assert "pre-registered" in html.lower()
+    assert "adopt" in html.lower()
+    assert er.sec_ml({}, False) == ""

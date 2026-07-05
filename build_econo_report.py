@@ -43,7 +43,7 @@ ROOT = Path(__file__).parent
 OUT = ROOT / "local" / "econo.html"
 
 #: module key → env flag suffix; every gather block and section keys off this.
-MODULES = ("leadlag", "corr", "phase", "events", "trials")
+MODULES = ("leadlag", "corr", "phase", "events", "ml", "trials")
 
 # ── Lead-lag experiment grid (every cell is a counted trial) ─────────────────
 LL_K = 10                     # book size (production slots)
@@ -558,12 +558,17 @@ def _gather_trials(d: dict) -> dict:
             n = m.get("n_trials", 0)
             note = "" if m.get("insider_ready") else "; insider cells pending"
             return n, f"running candidate{note}"
+        if key == "ml":
+            return m.get("n_trials", 0), \
+                ("MLP ADOPTED over ridge" if m.get("adopt")
+                 else "ridge holds — NN not adopted")
         return 0, "?"
 
     for key, label in (("leadlag", "M1 lead-lag network"),
                        ("corr", "M2 cluster-neutral construction"),
                        ("phase", "M3 AR-throttle"),
-                       ("events", "M4 regulatory events")):
+                       ("events", "M4 regulatory events"),
+                       ("ml", "M6 NN-vs-ridge ranker duel")):
         n, status = _status(key)
         rows.append(dict(module=label, cells=n if n is not None else 0,
                          status=status))
@@ -577,6 +582,88 @@ def _gather_trials(d: dict) -> dict:
                      cells=1, status="pre-registered adoption rule"))
     total = sum(r["cells"] for r in rows)
     return dict(rows=rows, total=total, phantom=PHANTOM_MULTS)
+
+
+def _gather_ml(u: dict) -> dict:
+    """M6: does a tiny neural network CHOOSE better than ridge on the same
+    price-only features? Walk-forward duel at quarterly rebalances through
+    the full gate. ADOPTION RULE (fixed ex ante): the MLP is adopted only if
+    it beats ridge on VALIDATION Sharpe AND clears matched-null p<0.05,
+    DSR(x5)>0.5 and FF5+WML alpha t>=2. Expected outcome per Gu-Kelly-Xiu:
+    ridge ties it on price-only features — the duel decides."""
+    from tools.leadlag import rank_ic
+    from tools.xsec_ml import ml_scores
+    prices, slip, turnover, pit, sectors = (u["prices"], u["slip"],
+                                            u["turnover"], u["pit"],
+                                            u["sectors"])
+    cutoff = pd.Timestamp(START)
+    cand = [d for d in rebalance_dates(prices.index, "Q")
+            if len(prices.loc[:d]) >= LOOKBACK + 1 and d >= cutoff]
+    elig = precompute_eligibility(prices, slip, cand, liq_max=LIQ_MAX,
+                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE,
+                                  pit=pit, turnover=turnover,
+                                  turn_floor=MIN_TURNOVER)
+    te, ve = pd.Timestamp(TRAIN_END), pd.Timestamp(VAL_END)
+    scores, cells, runs, ic = {}, [], {}, {}
+    for model in ("ridge", "mlp"):
+        sc = ml_scores(prices, turnover, cand, elig, model=model,
+                       min_train=8, seed=0)
+        assert set(cand) <= set(sc), "ml score precompute must cover all dates"
+        scores[model] = sc
+        r = run_momentum(prices, slip, k=LL_K, lookback=LOOKBACK, skip=SKIP,
+                         capital=CAPITAL, cost_mults=(1.0,), freq="Q",
+                         liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                         start=START, lazy=True, pit=pit, execute_lag=EXEC_LAG,
+                         turnover=turnover, turn_floor=MIN_TURNOVER,
+                         elig_by_date=elig, score_by_date=sc)
+        eq, tr = r["runs"][1.0]["equity"], r["runs"][1.0]["trades"]
+        code = f"{model}-Q"
+        cells.append(dict(code=code, model=model,
+                          train=_stats_slice(eq, tr, eq.index[0], te, CAPITAL),
+                          val=_stats_slice(eq, tr, te + pd.Timedelta(days=1),
+                                           ve, CAPITAL),
+                          test=_stats_slice(eq, tr, ve + pd.Timedelta(days=1),
+                                            eq.index[-1], CAPITAL),
+                          full=r["runs"][1.0]["stats"]))
+        runs[code] = r
+        t = rank_ic(sc, prices, cand, elig, execute_lag=EXEC_LAG)
+        if len(t):
+            se = t["ic"].std(ddof=1) / np.sqrt(len(t))
+            ic[model] = dict(mean=float(t["ic"].mean()),
+                             t=float(t["ic"].mean() / se) if se > 0 else 0.0,
+                             n=int(len(t)))
+    by = {c["code"]: c for c in cells}
+    hr = runs["mlp-Q"]
+    hl = hr["holdings_log"]
+    headline = dict(code="mlp-Q")
+    if hl:
+        rb = [h["date"] for h in hl] + [hl[-1]["next"]]
+        matched = {d: set(scores["mlp"].get(d, {}).get(
+            "raw", pd.Series(dtype=float)).index) & elig.get(d, set())
+            for d in rb}
+        pools_m = sig.period_pools(prices, rb, matched, execute_lag=EXEC_LAG)
+        strat_rets = sig.strategy_period_returns(hl)
+        n_total = N_INHERITED_TRIALS + 10 + 2 + 6 + 7 + 2 + 1 + 2
+        trial_sharpes = [c["full"]["sharpe"] for c in cells]
+        headline.update(
+            mc_matched=sig.monte_carlo_null(pools_m, strat_rets, k=LL_K,
+                                            ppy=4.0, n_trials=1000, seed=0),
+            dsr_phantom=[dict(mult=m, n=n_total * m,
+                              dsr=sig.deflated_sharpe_ratio(
+                                  strat_rets, trial_sharpes, ppy=4.0,
+                                  n_trials_effective=n_total * m)["dsr"])
+                         for m in PHANTOM_MULTS],
+            factor=_factor_span(hr["runs"][1.0]["equity"]))
+    mcp = (headline.get("mc_matched") or {}).get("p_sharpe")
+    dsr5 = next((x["dsr"] for x in headline.get("dsr_phantom", [])
+                 if x["mult"] == 5), None)
+    fac = headline.get("factor")
+    adopt = bool(by["mlp-Q"]["val"]["sharpe"] > by["ridge-Q"]["val"]["sharpe"]
+                 and mcp is not None and mcp < 0.05
+                 and dsr5 is not None and dsr5 > 0.5
+                 and fac and fac.get("alpha_t", 0) >= 2.0)
+    return dict(cells=cells, ic=ic, headline=headline, adopt=adopt, n_trials=2)
+
 
 
 def gather() -> dict:
@@ -614,6 +701,11 @@ def gather() -> dict:
             d["events"] = _gather_events(u)
         except Exception as e:
             print(f"[econo] events skipped: {e}", file=sys.stderr)
+    if _enabled("ml"):
+        try:
+            d["ml"] = _gather_ml(u)
+        except Exception as e:
+            print(f"[econo] ml skipped: {e}", file=sys.stderr)
     d["trials"] = _gather_trials(d)
     return d
 
@@ -941,6 +1033,57 @@ recover deeper history for active insiders — deep-backtest coverage bias
 disclosed, fresh-window signals unbiased.</p></details>"""
 
 
+def sec_ml(d: dict, public: bool) -> str:
+    m = d.get("ml")
+    if m is None:
+        return ""
+    rows = "".join(
+        f"<tr><td class='mono'>{c['code']}</td>"
+        f"<td class='mono'>{c['train']['sharpe']:.2f}</td>"
+        f"<td class='mono'>{c['val']['sharpe']:.2f}</td>"
+        f"<td class='mono'>{c['test']['sharpe']:.2f}</td>"
+        f"<td>{_pct(c['full']['net_return'] * 100)}</td></tr>"
+        for c in m.get("cells", []))
+    ic_bits = " · ".join(f"{k}: mean {v['mean']:+.3f} (t {v['t']:.1f})"
+                         for k, v in sorted(m.get("ic", {}).items()))
+    head = m.get("headline") or {}
+    mcm = head.get("mc_matched") or {}
+    dsr5 = next((x["dsr"] for x in head.get("dsr_phantom", [])
+                 if x.get("mult") == 5), None)
+    fac = head.get("factor")
+    fac_line = (f"FF5+WML α {fac['alpha_ann'] * 100:+.1f}%/yr "
+                f"(t {fac['alpha_t']:.2f})" if fac else "spanning n/a")
+    verdict = ("MLP ADOPTED — beat ridge on validation and cleared the full "
+               "gate." if m.get("adopt") else
+               "Ridge holds. The net did not beat its linear null model "
+               "under the pre-registered rule — on price-only features that "
+               "is the textbook outcome (Gu–Kelly–Xiu), and the honest one. "
+               "The two cells stay in the ledger.")
+    return f"""<h2>Neural network vs ridge — the ranker duel</h2>
+<p class="sub">Walk-forward duel on identical price-only features (12-1
+momentum, 1m reversal, 63d vol, 52w-high, turnover rank): tiny tanh MLP
+(8 hidden units, L2, L-BFGS, refit each quarter on prior rebalances only)
+vs ridge — the null model that usually ties nets on this feature class.
+<b>Pre-registered</b> adoption: MLP must beat ridge on VALIDATION Sharpe and
+clear matched-null p&lt;0.05, DSR×5&gt;0.5, spanning t≥2.</p>
+<table><thead><tr><th>cell</th><th>train S</th><th>val S</th><th>test S</th>
+<th>full net</th></tr></thead><tbody>{rows}</tbody></table>
+<p>Rank IC ({ic_bits or 'n/a'}) · headline <span class="mono">
+{head.get('code', '—')}</span>: matched-null p
+{mcm.get('p_sharpe', float('nan')):.3f} ·
+DSR ×5 {dsr5 if dsr5 is not None else float('nan'):.2f} · {fac_line}</p>
+<div class="callout"><b>Verdict:</b> <span class="{'pos' if m.get('adopt') else ''}">{verdict}</span></div>
+<details><summary>Method &amp; references</summary>
+<p>Labels = cross-sectional forward-return ranks (top-k books care about
+ordering); features z-scored per rebalance, winsorised ±3σ. Capacity matched
+to ~30 quarterly rebalances of training data on purpose — one hidden layer
+is the smallest thing that can express feature interactions, which is the
+only channel where a net can beat ridge. References: Gu, Kelly &amp; Xiu
+(2020, RFS); Kelly, Malamud &amp; Zhou (2023) on the virtue of complexity —
+cited, not assumed. Both cells charged to the ledger.</p></details>"""
+
+
+
 def sec_trials(d: dict, public: bool) -> str:
     t = d.get("trials")
     if t is None:
@@ -972,6 +1115,7 @@ def build(d: dict, public: bool = False) -> str:
         sec_corr(d, public),
         sec_phase(d, public),
         sec_events(d, public),
+        sec_ml(d, public),
         sec_trials(d, public),
         sec_footer(),
     ])
