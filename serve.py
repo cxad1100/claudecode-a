@@ -43,12 +43,12 @@ PAGES = {
 # cross-page nav links shown in the top bar, in display order.
 # Pairs / Momentum-lab / Scenarios routes still exist (PAGES below) but are
 # unlinked — the live site is just Portfolio + the chosen Strategy.
+# The live site is Portfolio + Strategy (which now carries the adopted
+# vol-managed core). Lab pages (/vol /edge /econo) stay routable for research
+# but off the bar — killed and observational results don't share the stage.
 _NAV = [
     ("main",     "/",         "Portfolio"),
     ("strategy", "/strategy", "Strategy"),
-    ("vol",      "/vol",      "Vol"),
-    ("edge",     "/edge",     "Edge"),
-    ("econo",    "/econo",    "Econo"),
 ]
 
 

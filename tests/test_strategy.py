@@ -434,3 +434,19 @@ def test_factor_section_residual_alpha_verdict():
     fr["raw"]["FF5+WML"]["alpha_t"] = 2.6
     d["factor_reg"] = fr
     assert "residual selection edge" in bs.sec_factor_regression(d, public=False)
+
+
+def test_sec_vol_core_renders_adopted_overlay_and_hides_on_none():
+    import build_strategy_report as st
+    d = {"vol_core": dict(
+        etf="MSCI World (IWDA.AS)",
+        bh=dict(sharpe=0.81, ann_return=0.11, max_dd=-0.274),
+        managed=dict(sharpe=0.89, ann_return=0.10, max_dd=-0.191,
+                     avg_exposure=0.78, n_trades_per_year=9.0),
+        fc_now=0.11, w_now=1.0, asof="2026-07-04")}
+    html = st.sec_vol_core(d, public=True)
+    assert "GARCH" in html and "IWDA" in html
+    assert "0.89" in html and "0.81" in html
+    assert "pre-registered" in html.lower()
+    assert "€" not in html                        # public-safe by construction
+    assert st.sec_vol_core({}, public=True) == ""

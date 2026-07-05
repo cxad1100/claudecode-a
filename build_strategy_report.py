@@ -464,6 +464,32 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             print(f"factor regression skipped: {e}", file=sys.stderr)
             factor_reg = None
 
+    # ── Adopted overlay: GARCH vol-managed MSCI World core. The ONLY component that
+    #    cleared a pre-registered gate program-wide (vol lab: QLIKE + Sharpe + maxDD
+    #    vs the trailing-63d incumbent, thresholds committed before the data run).
+    #    Beats buy-and-hold on risk-adjusted terms; killed/observational research
+    #    stays on the lab pages, never here.
+    vol_core = None
+    try:
+        from tools import vol_forecast as vf
+        core_px = cached_price_history(["IWDA.AS"], period="9y",
+                                       force=refresh)["IWDA.AS"].dropna()
+        core_r = core_px.pct_change().dropna()
+        fc = vf.garch11_vol(core_r)
+        vm = vf.vol_managed(core_r, fc, target_vol=RISK_TARGET_VOL,
+                            band=0.10, cost_bps=5.0, fee_eur=1.0,
+                            capital=CAPITAL)
+        bh = qg.perf_metrics((1.0 + core_r).cumprod() * CAPITAL)
+        w_now = float(min(RISK_TARGET_VOL / fc.iloc[-1], 1.0)) if len(fc) else None
+        vol_core = dict(etf="MSCI World (IWDA.AS)", bh=bh,
+                        managed={k: vm[k] for k in ("sharpe", "ann_return",
+                                                    "max_dd", "avg_exposure",
+                                                    "n_trades_per_year")},
+                        fc_now=float(fc.iloc[-1]) if len(fc) else None,
+                        w_now=w_now, asof=str(core_r.index[-1].date()))
+    except Exception as e:
+        print(f"vol-core overlay skipped: {e}", file=sys.stderr)
+
     # ── Scenario fan (observational): regime-conditioned block bootstrap of the risk-conscious
     #    book's daily returns → bear/base/bull terminal-wealth bands. Sensitivity, not a forecast;
     #    never touches selection. Inherits the survivor universe (bear = bear among survivors).
@@ -508,7 +534,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
                 strategy=cfg, train=train, val=val, test=test, graveyard_hits=hits,
                 surv_inject=surv_inject, delisting_stress=delisting_stress,
-                factor_reg=factor_reg,
+                factor_reg=factor_reg, vol_core=vol_core,
                 grid=grid, n_dead=int(death_mask(meta_df).sum()),
                 turnover_pit=turnover is not None,
                 n_countries=n_countries,
@@ -1063,6 +1089,39 @@ def sec_significance(d: dict, public: bool) -> str:
             "selection you hold either way. Read it with the regime and capacity caveats below.</p>")
 
 
+def sec_vol_core(d: dict, public: bool) -> str:
+    """The adopted overlay — GARCH vol-managed MSCI World core. Only component
+    program-wide that cleared pre-registered gates AND beats buy-and-hold on
+    risk-adjusted terms; everything killed or observational lives on the lab
+    pages (/vol /edge /econo), never here. Percentages only — public-safe."""
+    v = d.get("vol_core")
+    if not v:
+        return ""
+    bh, m = v["bh"], v["managed"]
+    cards = "".join([
+        _card("B&H Sharpe", f"{bh['sharpe']:.2f}"),
+        _card("Managed Sharpe", f"{m['sharpe']:.2f}"),
+        _card("B&H max DD", _pct(bh["max_dd"] * 100)),
+        _card("Managed max DD", _pct(m["max_dd"] * 100)),
+        _card("Avg exposure", f"{m['avg_exposure'] * 100:.0f}%"),
+        _card("Trades/yr", f"{m['n_trades_per_year']:.0f}"),
+    ])
+    action = ""
+    if v.get("w_now") is not None:
+        action = (f"<p class='mono'>as of {v['asof']}: forecast vol "
+                  f"{v['fc_now'] * 100:.1f}% → target exposure "
+                  f"{v['w_now'] * 100:.0f}% (min(15%/σ̂, 100%), 10% band)</p>")
+    return f"""<h2>Adopted core — GARCH vol-managed {v['etf']}</h2>
+<p class="sub">The one overlay that cleared <b>pre-registered</b> gates
+(tools/gates.py — thresholds committed before the data run): GARCH(1,1)
+beats the trailing-63d incumbent on QLIKE forecast quality AND is no worse
+as a strategy. It buys risk-adjusted return, not raw return: same asset,
+smaller drawdowns, cash when turbulence spikes (Moreira–Muir). Full
+tournament and gate table on the vol lab page.</p>
+<div class="cards">{cards}</div>
+{action}"""
+
+
 def sec_factor_regression(d: dict, public: bool) -> str:
     """Factor-spanning table: daily USD excess returns on CAPM / FF5 / FF5+WML (Ken
     French daily factors, Newey-West t-stats). The sharpest 'is there alpha?' test the
@@ -1550,6 +1609,7 @@ def build(d: dict, public: bool = False) -> str:
         sec_curve_compare(d),
         sec_significance(d, public),      # Monte-Carlo validation right behind the honest curve
         sec_factor_regression(d, public), # spanning test: edge vs factor beta (observational)
+        sec_vol_core(d, public),          # adopted overlay: the one pre-registered-gate pass
         sec_perf_compare(d, public),
         sec_grade_compare(d, public),
         sec_yearly_compare(d, public),
