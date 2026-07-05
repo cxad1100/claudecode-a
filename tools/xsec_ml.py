@@ -92,10 +92,27 @@ class _MLP:
         return np.tanh(x @ w1 + b1) @ w2 + b2
 
     def fit(self, x: np.ndarray, y: np.ndarray):
-        def loss(w):
-            pred = self._forward(w, x)
-            return float(np.mean((pred - y) ** 2) + self.l2 * np.sum(w * w))
-        res = minimize(loss, self.w0, method="L-BFGS-B",
+        n = len(y)
+
+        def loss_grad(w):
+            w1, b1, w2, b2 = self._unpack(w)
+            h = np.tanh(x @ w1 + b1)                  # n × hidden
+            pred = h @ w2 + b2
+            err = pred - y
+            loss = float(np.mean(err ** 2) + self.l2 * np.sum(w * w))
+            # analytic gradient — numerical differentiation over the weight
+            # vector made each fit ~50x slower than the math requires
+            g_pred = 2.0 * err / n                    # dL/dpred
+            g_w2 = h.T @ g_pred
+            g_b2 = float(g_pred.sum())
+            g_h = np.outer(g_pred, w2) * (1.0 - h ** 2)
+            g_w1 = x.T @ g_h
+            g_b1 = g_h.sum(axis=0)
+            grad = np.concatenate([g_w1.ravel(), g_b1, g_w2, [g_b2]]) \
+                + 2.0 * self.l2 * w
+            return loss, grad
+
+        res = minimize(loss_grad, self.w0, method="L-BFGS-B", jac=True,
                        options=dict(maxiter=300))
         self.w = res.x
         return self
