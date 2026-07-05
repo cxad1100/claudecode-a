@@ -573,6 +573,8 @@ def _gather_trials(d: dict) -> dict:
                      cells=7, status="pre-registered gates on own page"))
     rows.append(dict(module="edge stack (tax-loss sleeve + combiner)",
                      cells=2, status="pre-registered gates on own page"))
+    rows.append(dict(module="strategy ensemble selection rule (top-3 Q)",
+                     cells=1, status="pre-registered adoption rule"))
     total = sum(r["cells"] for r in rows)
     return dict(rows=rows, total=total, phantom=PHANTOM_MULTS)
 

@@ -110,6 +110,30 @@ def feasibility(cell: dict, *, capital: float = 10_000.0, fee_eur: float = 1.0) 
                 pays_for_itself=cell["full"]["net_return"] * 100.0 > drag_pct)
 
 
+def pick_top_n(grid: dict, *, n: int = 3, freq: str = "Q",
+               capital: float = 10_000.0, fee_eur: float = 1.0) -> list:
+    """Top-n cells by worst-case robustness min(train,val) within ONE rebalance
+    frequency — the ensemble picker. Averaging near-tied configs is the
+    variance-reduction answer to pick_ultimate's knife edge (a 0.02 gap in
+    min(train,val) once flipped a 0.33-vs-0.97 test Sharpe); a single-frequency
+    ensemble keeps rebalance dates aligned so the significance machinery still
+    applies. Same filters as pick_ultimate: pays for itself, positive in BOTH
+    train and validation. Never sees test."""
+    cands = []
+    for c in grid["cells"]:
+        cfreq = c.get("freq") or (c["config"].freq if c.get("config") else None)
+        if cfreq != freq:
+            continue
+        if not feasibility(c, capital=capital, fee_eur=fee_eur)["pays_for_itself"]:
+            continue
+        if c["train"]["net_return"] <= 0 or c["val"]["net_return"] <= 0:
+            continue
+        robust = min(c["train"]["sharpe"], c["val"]["sharpe"])
+        cands.append((robust, -c["trades_per_year"], c))
+    cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [c for _, _, c in cands[:n]]
+
+
 def pick_ultimate(grid: dict, *, capital: float = 10_000.0, fee_eur: float = 1.0):
     """The 'ultimate' config: among configs that pay for themselves and are positive
     in BOTH train and validation, the one maximising min(train_Sharpe, val_Sharpe) —

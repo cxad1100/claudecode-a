@@ -33,7 +33,8 @@ from tools.momentum import (run_momentum, winsorize_prices, to_xetra_calendar,
 from tools.universe_pit import PITUniverse
 from tools.universe_assemble import delisting_map, death_map, death_mask
 from tools import universe_snapshot
-from tools.momentum_grid import MomentumConfig, _stats_slice, run_grid, ALL_CONFIGS, pick_ultimate
+from tools.momentum_grid import (MomentumConfig, _stats_slice, run_grid,
+                                 ALL_CONFIGS, pick_ultimate, pick_top_n)
 from tools.portfolio_tools import BENCHMARKS, parse_portfolio
 from tools.portfolio_analytics import build_roi_timeseries
 from tools.data_buffer import cached_price_history
@@ -490,6 +491,104 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     except Exception as e:
         print(f"vol-core overlay skipped: {e}", file=sys.stderr)
 
+    # ── Ensemble candidate (pre-registered method upgrade, +1 ledger trial):
+    #    equal-capital average of the top-3 QUARTERLY configs by min(train,val).
+    #    Rationale committed before evaluating: pick_ultimate is knife-edged —
+    #    a 0.02 robustness gap once flipped a 0.33-vs-0.97 test Sharpe; model
+    #    averaging buys selection-variance reduction with zero test peeking.
+    #    ADOPTION RULE (fixed ex ante): adopt over the single pick iff
+    #    ensemble min(train,val) ≥ single's min(train,val) − 0.05.
+    ensemble = None
+    try:
+        top3 = pick_top_n(grid, n=3, freq="Q", capital=CAPITAL, fee_eur=FEE_EUR)
+        if picked is not None and len(top3) >= 2:
+            sleeves = []
+            for c in top3:
+                rr = run_momentum(prices, slip, k=c["config"].slots,
+                                  lookback=LOOKBACK, skip=SKIP,
+                                  capital=CAPITAL / len(top3),
+                                  cost_mults=(1.0,), freq="Q",
+                                  liq_max=LIQ_MAX, fee_eur=FEE_EUR,
+                                  min_price=MIN_PRICE, start=START,
+                                  sectors=sectors, benchmark=spx, pit=pit,
+                                  execute_lag=EXEC_LAG, turnover=turnover,
+                                  turn_floor=MIN_TURNOVER,
+                                  vol_adjust=c["config"].vol_adjust,
+                                  sector_neutral=c["config"].sector_neutral,
+                                  trend_filter=c["config"].trend_filter,
+                                  lazy=c["config"].lazy)
+                sleeves.append(rr["runs"][1.0])
+            idx = sleeves[0]["equity"].index
+            for sl in sleeves[1:]:
+                idx = idx.union(sl["equity"].index)
+            parts = [sl["equity"].reindex(idx).ffill()
+                     .fillna(CAPITAL / len(top3)) for sl in sleeves]
+            ens_eq = sum(parts)
+            e_tr = _stats_slice(ens_eq, [], ens_eq.index[0], te, CAPITAL)
+            e_va = _stats_slice(ens_eq, [], te + pd.Timedelta(days=1), ve, CAPITAL)
+            e_te = _stats_slice(ens_eq, [], ve + pd.Timedelta(days=1),
+                                ens_eq.index[-1], CAPITAL)
+            ens_min = min(e_tr["sharpe"], e_va["sharpe"])
+            single_min = min(picked["train"]["sharpe"], picked["val"]["sharpe"])
+            qd = [dd for dd in rebalance_dates(ens_eq.index, "Q")]
+            pr = ens_eq.reindex(qd).dropna().pct_change().dropna()
+            dsr5 = sig.deflated_sharpe_ratio(
+                pr, trial_sharpes, ppy=4.0,
+                n_trials_effective=(n_grid + 1) * PHANTOM_MULT)["dsr"] \
+                if len(pr) > 8 else None
+            ens_alpha = None
+            if factor_reg is not None:
+                try:
+                    areg = factors.factor_regression(_excess_usd(ens_eq), fac)
+                    if areg:
+                        akey = "FF5+WML" if "FF5+WML" in areg else next(iter(areg))
+                        ens_alpha = dict(model=akey,
+                                         alpha_ann=areg[akey]["alpha_ann"],
+                                         alpha_t=areg[akey]["alpha_t"],
+                                         n=areg[akey]["n"])
+                except Exception:
+                    ens_alpha = None
+            ensemble = dict(codes=[c["code"] for c in top3], n=len(top3),
+                            train=e_tr, val=e_va, test=e_te,
+                            max_dd=qg.perf_metrics(ens_eq).get("max_dd",
+                                                               float("nan")),
+                            trades_per_year=float(sum(c["trades_per_year"]
+                                                      for c in top3)),
+                            ens_min=float(ens_min), single_min=float(single_min),
+                            single_code=picked["code"],
+                            adopt=bool(ens_min >= single_min - 0.05),
+                            dsr5=dsr5, alpha=ens_alpha, equity=ens_eq)
+    except Exception as e:
+        print(f"ensemble skipped: {e}", file=sys.stderr)
+
+    # ── Live tracking (pre-registered kill criteria, tools/track.py): one row
+    #    per build date of the headline curve; the only test that settles
+    #    'profitable?' is the live path against the backtest's own error bars.
+    track_d = None
+    try:
+        from tools import track as _track
+        live_eq = (ensemble["equity"] if ensemble and ensemble["adopt"]
+                   else variants[1]["equity"])
+        r_last = float(live_eq.pct_change().dropna().iloc[-1])
+        tpath = ROOT / "local" / "strategy_track.csv"
+        _track.append_snapshot(str(live_eq.index[-1].date()),
+                               dict(r_live=r_last,
+                                    equity=float(live_eq.iloc[-1]),
+                                    pick=(f"ens[{','.join(ensemble['codes'])}]"
+                                          if ensemble and ensemble["adopt"]
+                                          else cfg.code)),
+                               path=tpath)
+        trk = _track.read_track(tpath)
+        lv = _track.live_vs_backtest(trk, sharpe_lo=ci.get("sharpe_lo", 0.0),
+                                     backtest_max_dd=quant["perf"].get(
+                                         "max_dd", -0.3))
+        track_d = dict(n=lv.get("n", 0), needed=lv.get("needed", 63),
+                       kill=lv.get("kill", False),
+                       reasons=lv.get("reasons", []),
+                       path="local/strategy_track.csv")
+    except Exception as e:
+        print(f"tracking skipped: {e}", file=sys.stderr)
+
     # ── Scenario fan (observational): regime-conditioned block bootstrap of the risk-conscious
     #    book's daily returns → bear/base/bull terminal-wealth bands. Sensitivity, not a forecast;
     #    never touches selection. Inherits the survivor universe (bear = bear among survivors).
@@ -535,6 +634,9 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 strategy=cfg, train=train, val=val, test=test, graveyard_hits=hits,
                 surv_inject=surv_inject, delisting_stress=delisting_stress,
                 factor_reg=factor_reg, vol_core=vol_core,
+                ensemble={k: v for k, v in (ensemble or {}).items()
+                          if k != "equity"} or None,
+                track=track_d,
                 grid=grid, n_dead=int(death_mask(meta_df).sum()),
                 turnover_pit=turnover is not None,
                 n_countries=n_countries,
@@ -1122,6 +1224,59 @@ tournament and gate table on the vol lab page.</p>
 {action}"""
 
 
+def sec_ensemble(d: dict, public: bool) -> str:
+    """Pre-registered method upgrade: equal-capital top-3 quarterly ensemble
+    vs the single pick_ultimate config. Adoption rule fixed ex ante (ensemble
+    min(train,val) within 0.05 of the single pick's); +1 trial in the ledger."""
+    e = d.get("ensemble")
+    if not e:
+        return ""
+    cards = "".join([
+        _card("Train Sharpe", f"{e['train']['sharpe']:.2f}"),
+        _card("Val Sharpe", f"{e['val']['sharpe']:.2f}"),
+        _card("Test Sharpe", f"{e['test']['sharpe']:.2f}"),
+        _card("Max drawdown", _pct(e["max_dd"] * 100)),
+        _card("Trades/yr", f"{e['trades_per_year']:.0f}"),
+        _card("DSR ×5", f"{e['dsr5']:.2f}" if e.get("dsr5") is not None else "—"),
+    ])
+    a = e.get("alpha")
+    a_line = (f" · FF5+WML α {a['alpha_ann'] * 100:+.1f}%/yr "
+              f"(t {a['alpha_t']:.2f})" if a else "")
+    verdict = ("ADOPTED as the live book" if e.get("adopt")
+               else "kept on the bench (single pick retains the edge)")
+    return f"""<h2>Ensemble — top-{e['n']} quarterly configs, equal capital</h2>
+<p class="sub">Selection-variance fix, <b>pre-registered</b>: pick_ultimate's
+min(train,val) criterion is knife-edged, so the book averages the top-{e['n']}
+quarterly cells ({' + '.join(f"<span class='mono'>{c}</span>" for c in e['codes'])})
+at equal capital — fees charged per sleeve on its own third. Adoption rule fixed
+before evaluation: adopt iff ensemble min(train,val)
+({e['ens_min']:.2f}) ≥ single <span class='mono'>{e['single_code']}</span>
+({e['single_min']:.2f}) − 0.05. <b>{verdict}</b>{a_line} · +1 selection-rule
+trial charged to the program ledger.</p>
+<div class="cards">{cards}</div>"""
+
+
+def sec_track(d: dict, public: bool) -> str:
+    """Live path vs backtest — the only test that settles 'profitable?'.
+    Kill thresholds pre-registered in tools/track.py."""
+    t = d.get("track")
+    if not t:
+        return ""
+    if t["n"] < t["needed"]:
+        status = (f"accruing: {t['n']}/{t['needed']} live sessions before the "
+                  f"kill rules arm")
+    elif t["kill"]:
+        status = ("<b class='neg'>KILL</b> — " + "; ".join(t["reasons"])
+                  + " (de-risk to cash and reassess; this page never trades)")
+    else:
+        status = "live path within the backtest's error bars — no kill signal"
+    return f"""<h2>Live tracking — pre-registered kill criteria</h2>
+<p class="sub">One row per build day → <span class="mono">{t['path']}</span>.
+KILL iff rolling 63d live Sharpe sits below the backtest bootstrap CI lower
+bound for 21 straight sessions, or live drawdown exceeds 1.25× the backtest
+max. Thresholds committed before any live row existed. Status: {status}.</p>"""
+
+
 def sec_factor_regression(d: dict, public: bool) -> str:
     """Factor-spanning table: daily USD excess returns on CAPM / FF5 / FF5+WML (Ken
     French daily factors, Newey-West t-stats). The sharpest 'is there alpha?' test the
@@ -1609,7 +1764,9 @@ def build(d: dict, public: bool = False) -> str:
         sec_curve_compare(d),
         sec_significance(d, public),      # Monte-Carlo validation right behind the honest curve
         sec_factor_regression(d, public), # spanning test: edge vs factor beta (observational)
+        sec_ensemble(d, public),          # pre-registered selection-variance fix
         sec_vol_core(d, public),          # adopted overlay: the one pre-registered-gate pass
+        sec_track(d, public),             # live path vs backtest, pre-registered kills
         sec_perf_compare(d, public),
         sec_grade_compare(d, public),
         sec_yearly_compare(d, public),

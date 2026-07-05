@@ -450,3 +450,32 @@ def test_sec_vol_core_renders_adopted_overlay_and_hides_on_none():
     assert "pre-registered" in html.lower()
     assert "€" not in html                        # public-safe by construction
     assert st.sec_vol_core({}, public=True) == ""
+
+
+def test_sec_ensemble_renders_adoption_rule_and_codes():
+    import build_strategy_report as st
+    d = {"ensemble": dict(
+        codes=["···DEF", "A···EF", "····EF"], n=3,
+        train=dict(sharpe=0.78, net_return=2.1),
+        val=dict(sharpe=0.95, net_return=0.4),
+        test=dict(sharpe=1.05, net_return=0.35),
+        max_dd=-0.31, trades_per_year=24.0,
+        ens_min=0.78, single_code="A····F", single_min=0.75,
+        adopt=True, dsr5=0.61,
+        alpha=dict(model="FF5+WML", alpha_ann=0.12, alpha_t=1.9, n=2100))}
+    html = st.sec_ensemble(d, public=True)
+    assert "···DEF" in html and "A···EF" in html
+    assert "pre-registered" in html.lower()
+    assert "adopt" in html.lower()
+    assert "€" not in html
+    assert st.sec_ensemble({}, public=True) == ""
+
+
+def test_sec_track_renders_kill_status():
+    import build_strategy_report as st
+    d = {"track": dict(n=12, needed=63, kill=False, reasons=[],
+                       path="local/strategy_track.csv")}
+    html = st.sec_track(d, public=False)
+    assert "12" in html and "63" in html
+    assert "kill" in html.lower()
+    assert st.sec_track({}, public=False) == ""
