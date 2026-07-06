@@ -483,9 +483,9 @@ def test_sec_track_renders_kill_status():
 
 def test_sec_venture_renders_shadow_comparison_and_ladder():
     import build_strategy_report as st
-    d = {"venture": dict(book_xirr=0.14, shadow_xirr=0.09, excess=0.05,
-                         months=6.2, dd=-0.12, dd_state="normal",
-                         satellite=dict(live=0, cap=3),
+    d = {"venture": dict(live=True, book_xirr=0.14, shadow_xirr=0.09,
+                         excess=0.05, months=6.2, dd=-0.12,
+                         dd_state="normal", satellite=dict(live=0, cap=3),
                          deposits=3)}
     html = st.sec_venture(d, public=True)
     assert "shadow" in html.lower()
@@ -493,6 +493,10 @@ def test_sec_venture_renders_shadow_comparison_and_ladder():
     assert "pre-registered" in html.lower()
     assert "€" not in html
     assert st.sec_venture({}, public=True) == ""
+    accruing = st.sec_venture({"venture": dict(live=False, n_rows=1,
+                                               satellite=dict(live=0, cap=3))},
+                              public=True)
+    assert "arms at 2+" in accruing and "XIRR" in accruing
 
 
 def test_sec_ritual_freshness_alarms():

@@ -595,22 +595,32 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     venture = None
     ritual = None
     try:
+        from tools import track as _tr2
         from tools import venture as vt
+        # North star runs on the LIVE path only — the tracker's equity rows,
+        # never the backtest curve (a 2018-rooted curve fakes 99 months and a
+        # backtest XIRR into the venture meter).
+        trk2 = _tr2.read_track(ROOT / "local" / "strategy_track.csv")
         cf_path = ROOT / "local" / "venture_cashflows.csv"
-        live_eq2 = (ensemble["equity"] if ensemble and ensemble["adopt"]
-                    else variants[1]["equity"])
-        if not cf_path.exists():
-            cf_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame([dict(date=str(live_eq2.index[0].date()),
-                               amount=float(CAPITAL),
-                               note="seed (paper)")]).to_csv(cf_path,
-                                                             index=False)
-        cf = pd.read_csv(cf_path, parse_dates=["date"])
-        iwda = cached_price_history(["IWDA.AS"], period="9y",
-                                    force=refresh)["IWDA.AS"].dropna()
-        vs = vt.venture_summary(cf, live_eq2, iwda)
-        venture = dict(**vs, satellite=dict(live=0, cap=3),
-                       deposits=int(len(cf)))
+        if trk2 is not None and "equity" in trk2.columns \
+                and len(trk2.dropna(subset=["equity"])) >= 2:
+            live_book = trk2["equity"].dropna()
+            if not cf_path.exists():
+                cf_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame([dict(date=str(live_book.index[0].date()),
+                                   amount=float(CAPITAL),
+                                   note="seed (paper)")]).to_csv(cf_path,
+                                                                 index=False)
+            cf = pd.read_csv(cf_path, parse_dates=["date"])
+            iwda = cached_price_history(["IWDA.AS"], period="9y",
+                                        force=refresh)["IWDA.AS"].dropna()
+            vs = vt.venture_summary(cf, live_book, iwda)
+            venture = dict(**vs, live=True, satellite=dict(live=0, cap=3),
+                           deposits=int(len(cf)))
+        else:
+            n_rows = 0 if trk2 is None else int(len(trk2))
+            venture = dict(live=False, n_rows=n_rows,
+                           satellite=dict(live=0, cap=3))
     except Exception as e:
         print(f"venture section skipped: {e}", file=sys.stderr)
     try:
@@ -1287,6 +1297,13 @@ def sec_venture(d: dict, public: bool) -> str:
     if not v:
         return ""
     sat = v.get("satellite", {})
+    if not v.get("live"):
+        return f"""<h2>Venture — north star vs same-cashflow shadow</h2>
+<p class="sub">Live meter arms at 2+ tracker rows (has {v.get('n_rows', 0)}).
+The comparison is money-weighted XIRR of the LIVE path vs a same-cashflow
+IWDA shadow — backtest curves never enter this meter. Drawdown ladder
+(<b>pre-registered</b>, timing-exempt): −25% → half vol target; −35% →
+de-risk + exceptional review. Satellite {sat.get('live', 0)}/{sat.get('cap', 3)}.</p>"""
     cards = "".join([
         _card("Months / 36", f"{v['months']:.1f}"),
         _card("Book XIRR", _pct(v["book_xirr"] * 100)),
