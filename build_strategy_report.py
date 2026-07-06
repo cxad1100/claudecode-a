@@ -589,6 +589,61 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     except Exception as e:
         print(f"tracking skipped: {e}", file=sys.stderr)
 
+    # ── Venture instrumentation (charter M-A): cashflow ledger, same-cashflow
+    #    IWDA shadow, drawdown ladder, ritual freshness. Ledger seeded with the
+    #    paper capital at the tracker's first date; user appends real deposits.
+    venture = None
+    ritual = None
+    try:
+        from tools import venture as vt
+        cf_path = ROOT / "local" / "venture_cashflows.csv"
+        live_eq2 = (ensemble["equity"] if ensemble and ensemble["adopt"]
+                    else variants[1]["equity"])
+        if not cf_path.exists():
+            cf_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([dict(date=str(live_eq2.index[0].date()),
+                               amount=float(CAPITAL),
+                               note="seed (paper)")]).to_csv(cf_path,
+                                                             index=False)
+        cf = pd.read_csv(cf_path, parse_dates=["date"])
+        iwda = cached_price_history(["IWDA.AS"], period="9y",
+                                    force=refresh)["IWDA.AS"].dropna()
+        vs = vt.venture_summary(cf, live_eq2, iwda)
+        venture = dict(**vs, satellite=dict(live=0, cap=3),
+                       deposits=int(len(cf)))
+    except Exception as e:
+        print(f"venture section skipped: {e}", file=sys.stderr)
+    try:
+        items = []
+
+        def _age(name, last_iso):
+            if not last_iso:
+                items.append(dict(name=name, last="never", age_days=9999,
+                                  alarm=True))
+                return
+            age = (pd.Timestamp.now() - pd.Timestamp(last_iso)).days
+            items.append(dict(name=name, last=str(last_iso)[:10],
+                              age_days=int(age), alarm=bool(age > 35)))
+
+        snap = universe_snapshot.load_store()
+        _age("TR snapshot", snap["snapshot_date"].max() if len(snap) else None)
+        for name, path, col in (
+                ("Short-register fetch",
+                 ROOT / "data/universe/short_positions.csv", "fetched_at"),
+                ("BaFin dealings fetch",
+                 ROOT / "data/universe/insider_dealings.csv", "fetched_at")):
+            last = None
+            if path.exists():
+                df_ = pd.read_csv(path, usecols=[col])
+                last = df_[col].max()
+            _age(name, last)
+        _age("Universe price fetch",
+             pd.Timestamp(PRICES_CSV.stat().st_mtime, unit="s").isoformat()
+             if PRICES_CSV.exists() else None)
+        ritual = dict(items=items)
+    except Exception as e:
+        print(f"ritual section skipped: {e}", file=sys.stderr)
+
     # ── Scenario fan (observational): regime-conditioned block bootstrap of the risk-conscious
     #    book's daily returns → bear/base/bull terminal-wealth bands. Sensitivity, not a forecast;
     #    never touches selection. Inherits the survivor universe (bear = bear among survivors).
@@ -636,7 +691,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 factor_reg=factor_reg, vol_core=vol_core,
                 ensemble={k: v for k, v in (ensemble or {}).items()
                           if k != "equity"} or None,
-                track=track_d,
+                track=track_d, venture=venture, ritual=ritual,
                 grid=grid, n_dead=int(death_mask(meta_df).sum()),
                 turnover_pit=turnover is not None,
                 n_countries=n_countries,
@@ -1224,6 +1279,55 @@ tournament and gate table on the vol lab page.</p>
 {action}"""
 
 
+def sec_venture(d: dict, public: bool) -> str:
+    """Charter north-star instrumentation: book XIRR vs the same-cashflow
+    IWDA shadow (cashflow-fair by construction), months into the 3y window,
+    the pre-registered drawdown ladder state, satellite occupancy."""
+    v = d.get("venture")
+    if not v:
+        return ""
+    sat = v.get("satellite", {})
+    cards = "".join([
+        _card("Months / 36", f"{v['months']:.1f}"),
+        _card("Book XIRR", _pct(v["book_xirr"] * 100)),
+        _card("IWDA shadow XIRR", _pct(v["shadow_xirr"] * 100)),
+        _card("Excess (money-wt.)", _pct(v["excess"] * 100)),
+        _card("Drawdown", _pct(v["dd"] * 100)),
+        _card("DD ladder", v["dd_state"]),
+        _card("Satellite", f"{sat.get('live', 0)}/{sat.get('cap', 3)}"),
+    ])
+    return f"""<h2>Venture — north star vs same-cashflow shadow</h2>
+<p class="sub">Aspiration: 3y money-weighted XIRR ≥ IWDA shadow +3%/yr after
+tax — but 3y CAGR alone cannot certify ±3%, so verdicts condition on
+<b>pre-registered process evidence</b> (live path inside the backtest
+bootstrap band, PSR trend, slippage gap). Shadow = every deposit buys IWDA
+on the same date. Drawdown ladder (operational, timing-exempt): −25% →
+half vol target ("half-vol"); −35% → de-risk to core/cash ("derisk") +
+exceptional review. Missed ritual ⇒ hold positions, never catch-up trades.
+</p>
+<div class="cards">{cards}</div>"""
+
+
+def sec_ritual(d: dict, public: bool) -> str:
+    """Private ops checklist: data-store freshness with alarms — registers
+    have limited retention, a missed month is a permanent hole."""
+    r = d.get("ritual")
+    if public or not r:
+        return ""
+    rows = "".join(
+        f"<tr><td>{i['name']}</td><td class='mono'>{i['last']}</td>"
+        f"<td class='mono'>{i['age_days']}d</td>"
+        f"<td>{'<b class=neg>OVERDUE</b>' if i['alarm'] else 'ok'}</td></tr>"
+        for i in r.get("items", []))
+    return f"""<h2>Monthly ritual — store freshness</h2>
+<p class="sub">Fetch cadence keeps the event moats accruing (no backfill
+exists). Alarm at 35 days. Checklist: TR snapshot (2FA) · short-register
+fetch · BaFin dealings fetch · quarterly rebalance orders · tracker check.
+</p>
+<table><thead><tr><th>store</th><th>last</th><th>age</th><th>status</th>
+</tr></thead><tbody>{rows}</tbody></table>"""
+
+
 def sec_ensemble(d: dict, public: bool) -> str:
     """Pre-registered method upgrade: equal-capital top-3 quarterly ensemble
     vs the single pick_ultimate config. Adoption rule fixed ex ante (ensemble
@@ -1767,6 +1871,8 @@ def build(d: dict, public: bool = False) -> str:
         sec_ensemble(d, public),          # pre-registered selection-variance fix
         sec_vol_core(d, public),          # adopted overlay: the one pre-registered-gate pass
         sec_track(d, public),             # live path vs backtest, pre-registered kills
+        sec_venture(d, public),           # north star vs same-cashflow shadow + DD ladder
+        sec_ritual(d, public),            # private ops checklist + freshness alarms
         sec_perf_compare(d, public),
         sec_grade_compare(d, public),
         sec_yearly_compare(d, public),

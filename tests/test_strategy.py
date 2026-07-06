@@ -479,3 +479,30 @@ def test_sec_track_renders_kill_status():
     assert "12" in html and "63" in html
     assert "kill" in html.lower()
     assert st.sec_track({}, public=False) == ""
+
+
+def test_sec_venture_renders_shadow_comparison_and_ladder():
+    import build_strategy_report as st
+    d = {"venture": dict(book_xirr=0.14, shadow_xirr=0.09, excess=0.05,
+                         months=6.2, dd=-0.12, dd_state="normal",
+                         satellite=dict(live=0, cap=3),
+                         deposits=3)}
+    html = st.sec_venture(d, public=True)
+    assert "shadow" in html.lower()
+    assert "ladder" in html.lower() or "half-vol" in html.lower()
+    assert "pre-registered" in html.lower()
+    assert "€" not in html
+    assert st.sec_venture({}, public=True) == ""
+
+
+def test_sec_ritual_freshness_alarms():
+    import build_strategy_report as st
+    d = {"ritual": dict(items=[
+        dict(name="TR snapshot", last="2026-06-29", age_days=8, alarm=False),
+        dict(name="BaFin dealings fetch", last="2026-05-01", age_days=67,
+             alarm=True)])}
+    html = st.sec_ritual(d, public=False)
+    assert "TR snapshot" in html and "BaFin" in html
+    assert "alarm" in html.lower() or "overdue" in html.lower()
+    assert st.sec_ritual(d, public=True) == ""    # private only
+    assert st.sec_ritual({}, public=False) == ""
