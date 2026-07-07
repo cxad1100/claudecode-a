@@ -620,6 +620,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
         top3 = pick_top_n(grid, n=3, freq="Q", capital=CAPITAL, fee_eur=FEE_EUR)
         if picked is not None and len(top3) >= 2:
             sleeves = []
+            sleeve_books = []          # per-sleeve holdings for the buy-now panel + history
             for c in top3:
                 rr = run_momentum(prices, slip, k=c["config"].slots,
                                   lookback=LOOKBACK, skip=SKIP,
@@ -635,6 +636,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                                   trend_filter=c["config"].trend_filter,
                                   lazy=c["config"].lazy)
                 sleeves.append(rr["runs"][1.0])
+                sleeve_books.append(dict(code=c["code"], slots=c["config"].slots,
+                                         holdings_log=rr["holdings_log"]))
             idx = sleeves[0]["equity"].index
             for sl in sleeves[1:]:
                 idx = idx.union(sl["equity"].index)
@@ -666,6 +669,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                 except Exception:
                     ens_alpha = None
             ensemble = dict(codes=[c["code"] for c in top3], n=len(top3),
+                            sleeves=sleeve_books,
                             train=e_tr, val=e_va, test=e_te,
                             max_dd=qg.perf_metrics(ens_eq).get("max_dd",
                                                                float("nan")),
@@ -877,13 +881,16 @@ def sec_headline(d: dict) -> str:
     live_txt = ""
     if e:
         live_txt = ((" The <b>live tracked book is the pre-registered top-"
-                     f"{e.get('n', 3)} ensemble</b> ({', '.join(e.get('codes', []))}) — "
-                     "adopted by the ex-ante rule; the registry below compares it in "
-                     "parallel. The cards grade the single-config risk-conscious book, "
-                     "the family's reference implementation.")
+                     f"{e.get('n', 3)} ensemble</b> ({', '.join(e.get('codes', []))}); "
+                     "alongside it the adopted <b>GARCH vol-managed IWDA core</b> runs the "
+                     "passive sleeve — every strategy is analysed in parallel below "
+                     "(registry → books → windows → history). The cards grade the "
+                     "single-config risk-conscious book, the family's reference "
+                     "implementation.")
                     if e.get("adopt") else
                     " The ensemble candidate stayed on the bench (ex-ante rule); this "
-                    "single-config book is the live one.")
+                    "single-config book is the live one. Every strategy is analysed in "
+                    "parallel below (registry → books → windows → history).")
     tstat_txt = (f" Its implied Harvey t-stat is <b>{tstat:.1f}</b>." if tstat is not None else "")
     dsr_sentence = (
         "After deflating for every config scanned, <b>P(true&nbsp;Sharpe&gt;0)</b> is "
@@ -928,21 +935,12 @@ def sec_intro(d: dict) -> str:
             + ". Long-only, walk-forward, executable. Not advice.</div>")
 
 
-# ── Picks (the risk-conscious book) ─────────────────────────────────────────────
+# ── The books: what each strategy holds NOW, in parallel ────────────────────────
 
-def _picks_table(d: dict, v: dict) -> str:
-    log = v["holdings_log"]
-    cur = next((h for h in reversed(log) if h["picks"]), None)
-    head = f"<h3 style='color:{v['color']}'>{v['short']}</h3>"
-    if cur is None:
-        return head + "<p class='dim'>No eligible names at the latest rebalance.</p>"
-    picks = cur["picks"]
-    n = len(picks)
-    exp = v["exposure_latest"] if v["exposure_latest"] is not None else 1.0
-    invested = 100.0 * exp
-    w = invested / n if n else 0.0
+def _picks_rows(d: dict, cur: dict, weight_pct: float) -> str:
+    """Rows of one book: ticker / name / ISIN / country / momentum score / weight."""
     rows = []
-    for t in picks:
+    for t in cur["picks"]:
         m = d["meta"].get(t, {})
         home = str(m.get("home") or t).split(".")[0]
         isin = m.get("isin") if pd.notna(m.get("isin")) else ""
@@ -952,33 +950,86 @@ def _picks_table(d: dict, v: dict) -> str:
             f"<td class='dim mono' style='font-size:0.72rem'>{isin}</td>"
             f"<td>{m.get('country', '—')}</td>"
             f"<td class='num mono'>{sc * 100:+.1f}%</td>"
-            f"<td class='num mono'>{w:.1f}%</td></tr>")
-    cash = 100.0 - invested
-    if v["key"] == "rc" and cash > 0.05:
-        rows.append(
-            f"<tr><td class='mono dim'>CASH</td><td class='dim'>de-risked sleeve</td>"
-            f"<td></td><td></td><td class='num dim'>—</td>"
-            f"<td class='num mono'>{cash:.1f}%</td></tr>")
-    if v["key"] == "rc":
-        sub = (f"<p class='dim pick-sub'>top-{n} → <b>{invested:.0f}% invested</b> "
-               f"({cash:.0f}% cash) at current vol · {cur['date'].date()}</p>")
-    else:
-        sub = f"<p class='dim pick-sub'>top-{n} equal-weight, full-invested · {cur['date'].date()}</p>"
-    return (head + sub +
-            "<table><tr><th>Ticker</th><th>Name</th><th>ISIN</th><th>Country</th>"
-            "<th class='num'>12-1 mom</th><th class='num'>Weight</th></tr>" + "".join(rows) + "</table>")
+            f"<td class='num mono'>{weight_pct:.1f}%</td></tr>")
+    return "".join(rows)
 
 
-def sec_picks_compare(d: dict) -> str:
+_BOOK_HEAD = ("<table><tr><th>Ticker</th><th>Name</th><th>ISIN</th><th>Country</th>"
+              "<th class='num'>12-1 mom</th><th class='num'>Weight</th></tr>")
+
+
+def _book_panel(d: dict, title: str, color: str, holdings_log: list, *,
+                weight_scale: float = 1.0, exposure_latest: float | None = None,
+                sub_note: str = "") -> str:
+    """One strategy's current book as a panel: latest non-empty picks + weights.
+    `weight_scale` = this book's share of total capital (⅓ for an ensemble sleeve);
+    `exposure_latest` adds the de-risked CASH row when < 1."""
+    head = f"<h3 style='color:{color}'>{title}</h3>"
+    cur = next((h for h in reversed(holdings_log) if h["picks"]), None)
+    if cur is None:
+        return f"<div>{head}<p class='dim'>No eligible names at the latest rebalance.</p></div>"
+    n = len(cur["picks"])
+    exp = 1.0 if exposure_latest is None else float(exposure_latest)
+    invested = 100.0 * exp * weight_scale
+    w = invested / n if n else 0.0
+    rows = _picks_rows(d, cur, w)
+    cash = 100.0 * weight_scale - invested
+    if exposure_latest is not None and cash > 0.05:
+        rows += (f"<tr><td class='mono dim'>CASH</td><td class='dim'>de-risked sleeve</td>"
+                 f"<td></td><td></td><td class='num dim'>—</td>"
+                 f"<td class='num mono'>{cash:.1f}%</td></tr>")
+    sub = (f"<p class='dim pick-sub'>top-{n} · <b>{invested:.0f}% of total capital</b>"
+           f"{sub_note} · {cur['date'].date()}</p>")
+    return f"<div>{head}{sub}{_BOOK_HEAD}{rows}</table></div>"
+
+
+def sec_books(d: dict, public: bool) -> str:
+    """What to BUY, per strategy, in parallel panels: each live/candidate book's
+    current holdings with weights as % of total capital, plus the vol-core's ETF
+    action. Search the ISIN or name in Trade Republic to trade it."""
     rc = d["variants"][1]
-    cur = next((h for h in reversed(rc["holdings_log"]) if h["picks"]), None)
-    n = len(cur["picks"]) if cur else 0
-    return ("<h2>Current top picks</h2>"
-            f"<p class='dim'>The equal-weight top-{n} ranked by 12-1 momentum, scaled toward the "
-            f"{RISK_TARGET_VOL:.0%} vol target with the remainder in cash — the book you'd actually "
-            "hold. Each row shows its home ticker, name and ISIN; search the ISIN or name in Trade "
-            "Republic to trade it.</p>"
-            + _picks_table(d, rc))
+    e = d.get("ensemble") or {}
+    adopt = bool(e.get("adopt"))
+    panels = []
+    sleeves = e.get("sleeves") or []
+    if sleeves:
+        n = len(sleeves)
+        star = "★ " if adopt else ""
+        state = "the live book" if adopt else "candidate (on the bench)"
+        for i, sl in enumerate(sleeves, 1):
+            panels.append(_book_panel(
+                d, f"{star}Ensemble sleeve {i}/{n} — {sl['code']}", "#c586c0",
+                sl["holdings_log"], weight_scale=1.0 / n,
+                sub_note=f" · equal-capital sleeve of {state}"))
+    panels.append(_book_panel(
+        d, ("Risk-conscious single book" + ("" if adopt else " ★")),
+        C_RC, rc["holdings_log"],
+        exposure_latest=rc.get("exposure_latest", 1.0),
+        sub_note=" · vol-targeted, remainder in cash"
+                 + ("" if adopt else " · the live book")))
+    v = d.get("vol_core")
+    if v:
+        act = ""
+        if v.get("w_now") is not None:
+            act = (f"<p class='mono'>today's order: hold <b>{v['w_now'] * 100:.0f}%</b> of core "
+                   f"capital in IWDA.AS (forecast vol {v['fc_now'] * 100:.1f}%, "
+                   f"as of {v['asof']})</p>")
+        panels.append(
+            "<div><h3 style='color:#569cd6'>GARCH vol-managed core</h3>"
+            "<p class='dim pick-sub'>one ETF, exposure steered by the GARCH forecast · "
+            "the passive sleeve of the stack</p>"
+            + _BOOK_HEAD +
+            "<tr><td class='mono'>IWDA</td><td>iShares Core MSCI World</td>"
+            "<td class='dim mono' style='font-size:0.72rem'>IE00B4L5Y983</td>"
+            "<td>IE</td><td class='num dim'>—</td>"
+            f"<td class='num mono'>{(v.get('w_now') or 0) * 100:.0f}%</td></tr></table>"
+            + act + "</div>")
+    return ("<h2>The books — what each strategy holds now</h2>"
+            "<p class='dim'>Every live/candidate book side by side, weights as <b>% of that "
+            "strategy's total capital</b>. Search the ISIN or name in Trade Republic to trade "
+            "it. The registry above says which book is live (★); this section is the "
+            "actionable order sheet for each.</p>"
+            f"<div class='par'>{''.join(panels)}</div>")
 
 
 # ── Strategy registry: the one leaderboard + the one parallel chart ─────────────
@@ -1127,29 +1178,58 @@ def _perf_table(v: dict) -> str:
             f"<th class='num'>Max DD</th></tr>{rows}</table>")
 
 
+def _matrix_records(d: dict) -> list:
+    """Registry records that belong in the parallel analytics matrices: every
+    curve/benchmark row with canonical windows, live first; reference + portfolio
+    + ledger rows excluded."""
+    return [r for r in sreg.ordered(d.get("registry") or [])
+            if r.windows and "inflated" not in r.flags
+            and r.status in ("adopted", "candidate", "variant", "benchmark")]
+
+
 def sec_perf_compare(d: dict, public: bool) -> str:
+    """Windows × strategies matrix — every strategy analysed in parallel on the
+    same canonical basis over the same windows."""
+    recs = _matrix_records(d)
+    if not recs:
+        return ""
     rc = d["variants"][1]
     t = rc.get("windows", {}).get("test") or rc["test"]
     full_ret = (rc.get("windows", {}).get("full") or {}).get(
         "net_return", rc["full"]["net_return"])
     cards = [
-        _card("Test return", _pct(t["net_return"] * 100)),
-        _card("Test Sharpe", f"{t['sharpe']:.2f}"),
+        _card("Live test return", _pct(t["net_return"] * 100)),
+        _card("Live test Sharpe", f"{t['sharpe']:.2f}"),
         _card("Max DD", _pct(rc["perf"]["max_dd"] * 100)),
         _card("Ann. vol", _pct(rc["perf"]["ann_vol"] * 100, signed=False)),
     ]
     if not public:
         cards.append(_card("Net P&L", f"€{full_ret * d['capital']:+,.0f}"))
-    return ("<h2>Performance</h2>"
+    heads = "".join(
+        f"<th class='num' style='color:{r.color or theme.FG}'>"
+        f"{'★ ' if r.live else ''}{r.name}</th>" for r in recs)
+
+    def cell(w):
+        if not w:
+            return "<td class='num dim'>—</td>"
+        return (f"<td class='num mono'>{_pct(w['net_return'] * 100)}<br>"
+                f"<span class='dim' style='font-size:0.72rem'>S {w['sharpe']:.2f} · "
+                f"DD {w['max_dd'] * 100:.0f}%</span></td>")
+
+    rows = "".join(
+        f"<tr><td>{WIN_LABELS[k]}</td>" +
+        "".join(cell(r.windows.get(k)) for r in recs) + "</tr>"
+        for k in ("train", "val", "test", "full"))
+    return ("<h2>Performance — all strategies, same windows</h2>"
             f"<p class='dim'>Windows: <b>{WIN_LABELS['train']}</b> (used to pick the config) · "
             f"<b>{WIN_LABELS['val']}</b> (used to compare configs) · <b>{WIN_LABELS['test']} "
             "(held out — never touched the choice)</b>. "
             "<b>The test row is the only truly out-of-sample number</b> — read it, not the "
-            f"full-window total. The risk-conscious book: the selection scaled to a "
-            f"{RISK_TARGET_VOL:.0%} vol target. Same canonical metric basis as the registry "
-            "table above.</p>"
+            "full-window total. Every column is the same canonical metric basis; cells show "
+            "return, Sharpe (S) and max drawdown (DD).</p>"
             f"<div class='cards'>{''.join(cards)}</div>"
-            + _perf_table(rc))
+            "<div style='overflow-x:auto'><table><tr><th>Window</th>"
+            + heads + f"</tr>{rows}</table></div>")
 
 
 # ── Quant scorecard & grade (merged compare) ────────────────────────────────────
@@ -1256,33 +1336,45 @@ def _yearly_pnl(series: pd.Series) -> pd.Series:
 
 
 def sec_yearly_compare(d: dict, public: bool) -> str:
-    rc = d["variants"][1]
-    ceq = rc["equity"].dropna()
-    if len(ceq) < 2:
+    """Years × strategies matrix — calendar-year returns of every curve in parallel,
+    with the live book's €P&L (private builds) and the S&P 500 as the last column."""
+    recs = [r for r in _matrix_records(d)
+            if r.equity is not None and r.status != "benchmark"]
+    if not recs:
+        return ""
+    yr_by_rec = {r.id: _yearly_returns(r.equity.dropna()) for r in recs}
+    years = sorted({y for s in yr_by_rec.values() for y in s.index})
+    if not years:
         return ""
     spx = d["benchmarks"]["S&P 500"] if "S&P 500" in d["benchmarks"].columns else None
-    bret = _yearly_returns(spx.reindex(ceq.index).ffill()) if spx is not None else pd.Series(dtype=float)
+    bret = _yearly_returns(spx.dropna()) if spx is not None else pd.Series(dtype=float)
+    live = next((r for r in recs if r.live), None)
+    pnl = _yearly_pnl(live.equity.dropna()) if (live is not None and not public) else None
 
-    def ytable(v, eq):
-        sret, pnl = _yearly_returns(eq), _yearly_pnl(eq)
-        rows = []
-        for y in sorted(sret.index):
-            b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>" if y in bret.index
-                 else "<td class='num dim'>—</td>")
-            eur = f"<td class='num mono'>€{pnl.get(y, 0.0):+,.0f}</td>" if not public else ""
-            rows.append(f"<tr><td class='mono'>{y}</td>"
-                        f"<td class='num'>{_pct(sret[y] * 100)}</td>{b}{eur}</tr>")
-        eur_h = "<th class='num'>P&amp;L</th>" if not public else ""
-        return (f"<h3 style='color:{v['color']}'>{v['short']}</h3>"
-                "<table><tr><th>Year</th><th class='num'>Return</th>"
-                f"<th class='num'>S&amp;P</th>{eur_h}</tr>" + "".join(rows) + "</table>")
-
-    pnl_note = ("its actual €P&amp;L, and " if not public else "and ")
-    return ("<h2>Yearly P&amp;L</h2>"
-            "<p class='dim'>Calendar-year net return of the risk-conscious book (first year from "
-            f"inception), {pnl_note}the S&amp;P 500 over the same year. {ceq.index[0].year} and "
-            f"{ceq.index[-1].year} are part-years.</p>"
-            + ytable(rc, ceq))
+    heads = "".join(
+        f"<th class='num' style='color:{r.color or theme.FG}'>"
+        f"{'★ ' if r.live else ''}{r.name}</th>" for r in recs)
+    eur_h = "<th class='num'>★ P&amp;L</th>" if pnl is not None else ""
+    rows = []
+    for y in years:
+        cells = "".join(
+            (f"<td class='num'>{_pct(yr_by_rec[r.id][y] * 100)}</td>"
+             if y in yr_by_rec[r.id].index else "<td class='num dim'>—</td>")
+            for r in recs)
+        b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>" if y in bret.index
+             else "<td class='num dim'>—</td>")
+        eur = (f"<td class='num mono'>€{pnl.get(y, 0.0):+,.0f}</td>"
+               if pnl is not None else "")
+        rows.append(f"<tr><td class='mono'>{y}</td>{cells}{b}{eur}</tr>")
+    return ("<h2>Yearly P&amp;L — all strategies</h2>"
+            "<p class='dim'>Calendar-year net return of every strategy in parallel (first year "
+            f"from each curve's inception), vs the S&amp;P 500. {years[0]} and {years[-1]} are "
+            "part-years."
+            + (" ★ P&amp;L = the live book's euro result at paper capital." if pnl is not None
+               else "") + "</p>"
+            "<div style='overflow-x:auto'><table><tr><th>Year</th>"
+            + heads + "<th class='num'>S&amp;P 500</th>" + eur_h + "</tr>"
+            + "".join(rows) + "</table></div>")
 
 
 # ── Every rebalance, colored (two columns) ──────────────────────────────────────
@@ -1335,16 +1427,28 @@ def _timeline_col(d: dict, v: dict) -> str:
 
 
 def sec_timeline_compare(d: dict) -> str:
+    """History — every rebalance of every momentum book, one collapsible per book."""
     rc = d["variants"][1]
-    return ("<h2>Every rebalance, colored by outcome</h2>"
+    blocks = [("Risk-conscious single book", rc)]
+    e = d.get("ensemble") or {}
+    star = "★ " if e.get("adopt") else ""
+    for i, sl in enumerate(e.get("sleeves") or [], 1):
+        blocks.append((f"{star}Ensemble sleeve {i} — {sl['code']}",
+                       dict(key="sleeve", short=f"Sleeve {sl['code']}", color="#c586c0",
+                            equity=None, exposure=None,
+                            holdings_log=sl["holdings_log"])))
+    details = "".join(
+        f"<details><summary>{label}</summary>{_timeline_col(d, v)}</details>"
+        for label, v in blocks)
+    return ("<h2>History — every rebalance, colored by outcome</h2>"
             "<p class='dim'>Each line is one rebalance’s picks, colored "
             "by that holding period’s return — <span style='color:#0a6b00'>■</span> ≥+20% · "
             "<span style='color:#46c84e'>■</span> up · <span style='color:#ef4444'>■</span> down · "
             "<span style='color:#7a0000'>■</span> ≤−20% · <span style='color:#000'>■</span> "
-            "defaulted (delisted/died). Hover for the %. Each period shows the book return after "
-            "vol-scaling and its average exposure (<span class='mono'>@x%</span> invested).</p>"
-            "<details><summary>show the full rebalance timeline</summary>"
-            + _timeline_col(d, rc) + "</details>")
+            "defaulted (delisted/died). Hover for the %. One collapsible per book — the "
+            "risk-conscious book also shows its return after vol-scaling and average exposure "
+            "(<span class='mono'>@x%</span> invested).</p>"
+            + details)
 
 
 # ── Shared sections (both versions) ─────────────────────────────────────────────
@@ -2146,14 +2250,14 @@ def build(d: dict, public: bool = False) -> str:
         # ── the framework: every strategy in parallel, one basis, one chart ──
         sec_registry(d, public),
         sec_parallel_curves(d, public),
-        # ── momentum family detail ──
-        sec_picks_compare(d),
+        # ── parallel analytics: buy sheet → windows → yearly → history ──
+        sec_books(d, public),
         sec_perf_compare(d, public),
-        sec_grade_compare(d, public),
         sec_yearly_compare(d, public),
         sec_timeline_compare(d),
+        # ── method detail per strategy ──
+        sec_grade_compare(d, public),
         sec_ensemble(d, public),          # pre-registered selection-variance fix
-        # ── vol-managed core detail ──
         sec_vol_core(d, public),          # adopted overlay: the one pre-registered-gate pass
         # ── significance & factor spanning ──
         sec_significance(d, public),

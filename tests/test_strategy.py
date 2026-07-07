@@ -38,6 +38,8 @@ def _fake_d():
     # ensemble + vol-core curves for the registry (synthetic but full-shape)
     ens_full = dict(
         codes=["···DEF", "A···EF", "A···E·"], n=3,
+        sleeves=[dict(code=c, slots=5, holdings_log=res["holdings_log"])
+                 for c in ("···DEF", "A···EF", "A···E·")],
         train=dict(sharpe=0.78, net_return=2.1), val=dict(sharpe=0.95, net_return=0.4),
         test=dict(sharpe=1.05, net_return=0.35),
         max_dd=-0.31, trades_per_year=24.0,
@@ -251,9 +253,9 @@ def test_headline_leads_with_real_results():
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
     assert "Deflated Sharpe" in h or "P(true" in h
     assert "live tracked book" in h                               # names what the tracker runs
-    # it leads the page: registry and parallel chart follow, then the family detail
+    # it leads the page: registry, parallel chart, then the parallel buy sheet
     assert (html.index("The result") < html.index("Strategy registry")
-            < html.index("Walk-forward equity") < html.index("Current top picks"))
+            < html.index("Walk-forward equity") < html.index("The books"))
 
 
 def test_headline_no_euro_amounts():
@@ -298,14 +300,58 @@ def test_parallel_chart_traces():
     assert "Your portfolio" not in h
 
 
-def test_picks_shows_the_risk_conscious_book():
+def test_books_shows_every_strategy_in_parallel():
+    """The buy sheet: one panel per book — ensemble sleeves, the single book, the
+    vol core's ETF action — each with tradeable rows (ticker/ISIN/weight)."""
     d = _fake_d()
-    h = bs.sec_picks_compare(d)
-    assert "Current top picks" in h and "Risk-conscious" in h
+    h = bs.sec_books(d, public=False)
+    assert "The books" in h and "what each strategy holds now" in h
+    # every ensemble sleeve gets its own panel (the live book here)
+    for code in d["ensemble"]["codes"]:
+        assert code in h
+    assert "Ensemble sleeve 1/3" in h and "★" in h
+    # the single risk-conscious book is a parallel panel, not the page's only focus
+    assert "Risk-conscious single book" in h
+    # the vol core is actionable too: the ETF row + today's target exposure
+    assert "IWDA" in h and "IE00B4L5Y983" in h and "today's order" in h
+    # tradeable rows for the momentum picks
     picks = next(hh["picks"] for hh in reversed(d["res"]["holdings_log"]) if hh["picks"])
-    for t in picks:                                              # single column now — each name once
+    for t in picks:
         disp = str(d["meta"][t].get("home") or t).split(".")[0]
         assert f">{disp}<" in h
+    # parallel layout container
+    assert "class='par'" in h
+
+
+def test_perf_matrix_has_one_column_per_strategy():
+    d = _fake_d()
+    h = bs.sec_perf_compare(d, public=False)
+    assert "all strategies, same windows" in h
+    assert "Momentum ensemble" in h and "Risk-conscious" in h
+    assert "GARCH vol-managed IWDA core" in h
+    assert "S&amp;P 500 (buy-hold)" in h or "S&P 500 (buy-hold)" in h
+    for lbl in ("Train", "Validation", "Test", "Full"):
+        assert lbl in h
+
+
+def test_yearly_matrix_has_one_column_per_strategy():
+    d = _fake_d()
+    h = bs.sec_yearly_compare(d, public=False)
+    assert "Yearly P&amp;L — all strategies" in h
+    assert "Momentum ensemble" in h and "Risk-conscious" in h
+    assert "S&amp;P 500" in h
+    assert "★ P&amp;L" in h                       # the live book's € column (private)
+    assert "€" not in bs.sec_yearly_compare(d, public=True)
+
+
+def test_history_has_one_timeline_per_book():
+    d = _fake_d()
+    h = bs.sec_timeline_compare(d)
+    assert "History — every rebalance" in h
+    assert h.count("<details>") == 4              # rc + 3 ensemble sleeves
+    assert "Risk-conscious single book" in h
+    for code in d["ensemble"]["codes"]:
+        assert code in h
 
 
 def test_grade_section_has_no_scare_box():
@@ -336,10 +382,11 @@ def test_phantom_trials_block_shows_decay_and_harvey():
 
 def test_no_info_dropped_from_page():
     html = bs.build(_fake_d(), public=False)
-    for phrase in ["Strategy registry", "Registry ledger", "Current top picks",
-                   "Walk-forward equity", "Performance",
+    for phrase in ["Strategy registry", "Registry ledger", "The books",
+                   "what each strategy holds now",
+                   "Walk-forward equity", "Performance — all strategies",
                    "Quant scorecard", "Deflated Sharpe",
-                   "Yearly P&amp;L", "Every rebalance", "survivorship is NOT corrected",
+                   "Yearly P&amp;L", "every rebalance", "survivorship is NOT corrected",
                    "Regime", "Concentration", "Capacity", "Research lab"]:
         assert phrase in html, f"dropped: {phrase!r}"
 

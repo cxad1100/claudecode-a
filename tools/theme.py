@@ -101,6 +101,12 @@ td.num, th.num {{ text-align: right; }}
           font-family: {MONO}; text-transform: uppercase; letter-spacing: 0.05em;
           border: 1px solid {GRID}; white-space: nowrap; }}
 tr.dimrow td {{ color: {FG_DIM}; }}
+/* parallel per-strategy panels — as many columns as fit, stack on narrow screens */
+.par {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 1.2rem; align-items: start; margin: 12px 0; }}
+.par > div {{ min-width: 0; background: {BG_PANEL}; border: 1px solid {GRID};
+              border-radius: 6px; padding: 10px 14px; }}
+.par h3 {{ margin-top: 0; }}
 details {{ margin: 10px 0; }}
 summary {{ cursor: pointer; color: {ACCENT}; font-size: 0.9rem; }}
 a {{ color: {ACCENT}; text-decoration: none; }}
