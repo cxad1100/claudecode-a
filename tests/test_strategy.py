@@ -5,8 +5,11 @@ import pandas as pd
 
 import build_strategy_report as bs
 from tools import quant_grade as qg
+from tools import strategy_registry as sreg
 from tools.momentum import run_momentum
 from tools.momentum_grid import _stats_slice, MomentumConfig
+
+TE, VE = "2019-06-30", "2019-09-30"          # fixture window boundaries
 
 
 def _fake_d():
@@ -17,7 +20,7 @@ def _fake_d():
     slip = {t: 10 for t in px.columns}
     res = run_momentum(px, slip, k=5, lookback=200, skip=10, cost_mults=(1.0,))
     eq, tr = res["runs"][1.0]["equity"], res["runs"][1.0]["trades"]
-    te, ve = pd.Timestamp("2019-06-30"), pd.Timestamp("2019-09-30")
+    te, ve = pd.Timestamp(TE), pd.Timestamp(VE)
     train = _stats_slice(eq, tr, eq.index[0], te, 10_000.0)
     val = _stats_slice(eq, tr, te + pd.Timedelta(days=1), ve, 10_000.0)
     test = _stats_slice(eq, tr, ve + pd.Timedelta(days=1), eq.index[-1], 10_000.0)
@@ -31,7 +34,29 @@ def _fake_d():
         vol_target=qg.vol_target(eq, target_vol=bs.RISK_TARGET_VOL))
     variants = bs.build_variants(res, quant["vol_target"], spx, train, val, test, quant, 10_000.0,
                                  dsr=0.78, mc_p=0.04, overlap=0.02,
-                                 train_end="2019-06-30", val_end="2019-09-30")
+                                 train_end=TE, val_end=VE)
+    # ensemble + vol-core curves for the registry (synthetic but full-shape)
+    ens_full = dict(
+        codes=["···DEF", "A···EF", "A···E·"], n=3,
+        train=dict(sharpe=0.78, net_return=2.1), val=dict(sharpe=0.95, net_return=0.4),
+        test=dict(sharpe=1.05, net_return=0.35),
+        max_dd=-0.31, trades_per_year=24.0,
+        ens_min=0.86, single_code="A····F", single_min=0.85,
+        adopt=True, dsr5=0.57,
+        alpha=dict(model="FF5+WML", alpha_ann=0.17, alpha_t=1.85, n=2100),
+        equity=eq * 1.01)
+    vol_core_eq = pd.Series(10_000 * np.exp(np.cumsum(rng.normal(0.0004, 0.006, 500))), index=idx)
+    vol_core = dict(
+        etf="MSCI World (IWDA.AS)",
+        bh=dict(sharpe=0.81, ann_return=0.11, max_dd=-0.274),
+        managed=dict(sharpe=0.89, ann_return=0.10, max_dd=-0.191,
+                     avg_exposure=0.78, n_trades_per_year=9.0),
+        fc_now=0.11, w_now=1.0, asof="2026-07-04")
+    ew_eq = eq * 0.98
+    portfolio_roi = pd.Series(np.linspace(0.0, 20.0, 300), index=idx[200:])
+    registry = bs.build_registry(variants, ensemble=ens_full, vol_core=vol_core,
+                                 vol_core_eq=vol_core_eq, bench=benchmarks, ew_eq=ew_eq,
+                                 portfolio_roi=portfolio_roi)
     # observational diagnostics (synthetic, small) — read-only HMM regime + PCA effective bets
     ridx = idx[200:]
     ramp = np.linspace(0.2, 0.8, len(ridx))
@@ -42,8 +67,11 @@ def _fake_d():
                 for i, h in enumerate(res["holdings_log"]) if h["picks"]]
     return dict(prices=px, res=res, benchmarks=benchmarks, capital=10_000.0,
                 meta={t: dict(name=t, local_id="000", country="X", sector="Y") for t in px.columns},
-                strategy=bs.STRATEGY, quant=quant, variants=variants, portfolio_roi=None,
-                train=train, val=val, test=test, graveyard_hits=0,
+                strategy=bs.STRATEGY, quant=quant, variants=variants,
+                registry=registry, ew_eq=ew_eq, portfolio_roi=portfolio_roi, vs_scale=None,
+                vol_core=vol_core,
+                ensemble={k: v for k, v in ens_full.items() if k != "equity"},
+                raw_windows=dict(train=train, val=val, test=test), graveyard_hits=0,
                 surv_inject=dict(base_return=1.2, sims=15, mean_return=1.19, delta_mean=-0.01,
                                  delta_lo=-0.05, delta_hi=0.02, hits_mean=0.3, deaths_mean=12.0,
                                  avoidance_rate=0.975),
@@ -97,6 +125,117 @@ def test_two_variant_bundles():
     # vol-targeting only ever de-risks → exposure in (0, 1]
     assert 0.0 < rc["exposure_latest"] <= 1.0
     assert rc["perf"]["ann_vol"] < raw["perf"]["ann_vol"] + 1e-9   # de-risked vs raw
+    # both bundles carry the canonical display windows next to the selection windows
+    for v in (raw, rc):
+        assert set(v["windows"]) == {"train", "val", "test", "full"}
+        assert "net_return" in v["windows"]["full"]
+
+
+# ── the registry framework: one list, one basis, one chart ──────────────────────
+
+def test_registry_schema_and_single_live_row():
+    d = _fake_d()
+    recs = d["registry"]
+    assert recs, "registry empty"
+    for r in recs:
+        assert r.status in sreg.STATUSES, r.status
+        assert r.id and r.name and r.family
+    live = [r for r in recs if r.live]
+    assert len(live) == 1                        # exactly one tracked book
+    # the live flag derives from the same branch as the tracker: ensemble adopted here
+    assert live[0].id == "mom_ens" and d["ensemble"]["adopt"]
+    # the single-config book becomes a variant of the ensemble when the ensemble is live
+    rc_rec = next(r for r in recs if r.id == "mom_rc")
+    assert rc_rec.status == "variant" and rc_rec.variant_of == "mom_ens"
+    # the raw reference is flagged, never live
+    raw_rec = next(r for r in recs if r.id == "mom_raw")
+    assert raw_rec.status == "reference" and "inflated" in raw_rec.flags and not raw_rec.live
+
+
+def test_registry_live_row_follows_adoption_rule():
+    d = _fake_d()
+    ens = dict(d["ensemble"], adopt=False, equity=d["variants"][0]["equity"] * 1.01)
+    recs = bs.build_registry(d["variants"], ensemble=ens, vol_core=None, vol_core_eq=None,
+                             bench=None, ew_eq=None, portfolio_roi=None)
+    live = [r for r in recs if r.live]
+    assert len(live) == 1 and live[0].id == "mom_rc"        # bench → single book is live
+    ens_rec = next(r for r in recs if r.id == "mom_ens")
+    assert ens_rec.status == "candidate"
+
+
+def test_registry_leaderboard_renders_rows_and_ledger():
+    d = _fake_d()
+    h = bs.sec_registry(d, public=False)
+    assert "Strategy registry" in h
+    assert "★" in h                                          # live row marked
+    assert "reference, inflated" in h                        # raw row flagged
+    assert "Raw Original" not in h                           # lab marker stays unique to the lab
+    assert "GARCH vol-managed IWDA core" in h
+    assert "Your portfolio" in h                             # private build shows the real book row
+    # killed/cut strategies live ONLY inside the collapsed ledger
+    assert "Registry ledger" in h
+    for name in ("NN event", "Lead-lag", "Tax-loss"):
+        assert h.index(name.split()[0]) > h.index("<details>")
+    # status badges present
+    assert "class='badge'" in h and "adopted" in h and "killed" in h
+
+
+def test_registry_public_hides_portfolio_row_and_euro():
+    d = _fake_d()
+    h = bs.sec_registry(d, public=True)
+    assert "Your portfolio" not in h
+    euros = re.findall(r"€[0-9][0-9.,]*", h)
+    assert all(e == "€1" for e in euros), euros
+
+
+def test_registry_metrics_are_uniform_across_surfaces():
+    """The SAME canonical number (same function, same window) appears in the headline,
+    the leaderboard row and the performance table — no more four Sharpe bases."""
+    d = _fake_d()
+    t = d["variants"][1]["windows"]["test"]
+    s_txt = f"{t['sharpe']:.2f}"
+    assert s_txt in bs.sec_headline(d)
+    assert s_txt in bs.sec_registry(d, public=False)
+    assert s_txt in bs.sec_perf_compare(d, public=False)
+
+
+def test_window_labels_derive_from_constants():
+    lbl = sreg.window_labels("2018-01-01", "2021-12-31", "2023-12-31")
+    assert lbl == dict(train="Train 2018–21", val="Validation 2022–23",
+                       test="Test 2024→", full="Full 2018→")
+    lbl2 = sreg.window_labels("2019-01-01", "2022-12-31", "2024-12-31")
+    assert lbl2["test"] == "Test 2025→" and lbl2["train"] == "Train 2019–22"
+
+
+def test_future_strategy_is_one_record():
+    """The framework contract: appending ONE record adds a leaderboard row and a
+    chart trace — nothing else to edit."""
+    d = _fake_d()
+    eq = d["variants"][1]["equity"] * 1.02
+    rec = sreg.make_record("new_strat", "Shiny new thing", "test-family", "candidate",
+                           equity=eq, train_end=TE, val_end=VE,
+                           cost_model="slip + €1")
+    d2 = dict(d, registry=list(d["registry"]) + [rec])
+    assert "Shiny new thing" in bs.sec_registry(d2, public=False)
+    assert "Shiny new thing" in bs.sec_parallel_curves(d2, public=False)
+    assert rec.since == str(eq.dropna().index[0].date())
+    assert set(rec.windows) == {"train", "val", "test", "full"}
+
+
+def test_vol_core_windows_share_boundaries_with_momentum():
+    d = _fake_d()
+    mom_eq = d["variants"][1]["equity"]
+    vc = next(r for r in d["registry"] if r.id == "vol_core")
+    b_mom = sreg.window_bounds(mom_eq, bs.TRAIN_END, bs.VAL_END)
+    b_vc = sreg.window_bounds(vc.equity, bs.TRAIN_END, bs.VAL_END)
+    assert b_mom["test"][0] == b_vc["test"][0]               # same held-out start
+    assert b_mom["train"][1] == b_vc["train"][1]             # same train end
+
+
+def test_raw_windows_alias_gone():
+    d = _fake_d()
+    assert "test" not in d                                   # no ambiguous top-level raw alias
+    assert "net_return" in d["raw_windows"]["test"]
 
 
 # ── the reframe: real results lead, raw vanity gone from the top ────────────────
@@ -111,9 +250,10 @@ def test_headline_leads_with_real_results():
     assert "Monte Carlo" in h                                     # the validation up front
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
     assert "Deflated Sharpe" in h or "P(true" in h
-    # it leads the page, above the picks and the equity chart
-    assert html.index("The result") < html.index("Current top picks")
-    assert html.index("The result") < html.index("Walk-forward equity")
+    assert "live tracked book" in h                               # names what the tracker runs
+    # it leads the page: registry and parallel chart follow, then the family detail
+    assert (html.index("The result") < html.index("Strategy registry")
+            < html.index("Walk-forward equity") < html.index("Current top picks"))
 
 
 def test_headline_no_euro_amounts():
@@ -123,11 +263,12 @@ def test_headline_no_euro_amounts():
 def test_raw_vanity_is_off_the_main_page():
     html = bs.build(_fake_d(), public=False)
     main = html.split("Research lab")[0]                          # everything above the lab
-    # the raw full-invested strategy (block + equity trace) is NOT on the main page anymore
+    # the raw full-invested strategy appears above the lab ONLY as the flagged registry row
     assert "Raw Original" not in main
     assert "Original (raw, full-invested)" not in main           # no raw rocket trace up top
     assert "Two ways to run it" not in main                       # the side-by-side framing is gone
     assert "Risk-conscious" in main                               # the risk-conscious book is the focus
+    assert "reference, inflated" in main                          # the registry row is honest about it
 
 
 def test_raw_reference_lives_only_in_the_lab():
@@ -142,11 +283,19 @@ def test_raw_reference_lives_only_in_the_lab():
     assert "Research lab" not in bs.build(d, public=True)
 
 
-def test_curve_is_risk_conscious_only():
-    h = bs.sec_curve_compare(_fake_d())
+def test_parallel_chart_traces():
+    d = _fake_d()
+    h = bs.sec_parallel_curves(d, public=False)
     assert "Walk-forward equity" in h
-    assert "Original" not in h                                    # no raw rocket line on the top chart
-    assert "risk-conscious" in h.lower()
+    assert "Momentum ensemble" in h                              # the live book (★)
+    assert "★" in h or "\\u2605" in h                            # Plotly JSON-escapes the star
+    assert "Risk-conscious" in h                                 # the variant, in parallel
+    assert "IWDA core" in h                                      # the other adopted strategy
+    assert "Equal-weight" in h                                   # survivorship-honest baseline
+    assert "S&amp;P 500" in h or "S&P 500" in h                  # benchmarks overlaid
+    # exclusions: the raw rocket and the cash-flow-timed real book
+    assert "unmanaged" not in h
+    assert "Your portfolio" not in h
 
 
 def test_picks_shows_the_risk_conscious_book():
@@ -171,6 +320,8 @@ def test_significance_section_rendered_once():
     html = bs.build(_fake_d(), public=False)
     assert html.count("Significance &amp; robustness") == 1
     assert "Monte" in html or "random books" in html            # the validation is present
+    # the beat/DSR stat cards live in the headline ONLY — no duplicated card row
+    assert html.count("Beats random books") == 1
 
 
 def test_phantom_trials_block_shows_decay_and_harvey():
@@ -185,7 +336,8 @@ def test_phantom_trials_block_shows_decay_and_harvey():
 
 def test_no_info_dropped_from_page():
     html = bs.build(_fake_d(), public=False)
-    for phrase in ["Current top picks", "Walk-forward equity", "Performance",
+    for phrase in ["Strategy registry", "Registry ledger", "Current top picks",
+                   "Walk-forward equity", "Performance",
                    "Quant scorecard", "Deflated Sharpe",
                    "Yearly P&amp;L", "Every rebalance", "survivorship is NOT corrected",
                    "Regime", "Concentration", "Capacity", "Research lab"]:
@@ -223,6 +375,14 @@ def test_caveat_shows_onpopulation_survivorship_result():
     assert "membership" in html and "absent winners" in html
 
 
+def test_caveat_quotes_the_headline_test_number():
+    d = _fake_d()
+    html = bs.sec_caveat(d)
+    rc_ret = d["variants"][1]["windows"]["test"]["net_return"] * 100
+    assert f"{rc_ret:+.0f}%" in html                             # risk-conscious, not the raw figure
+    assert "risk-conscious book" in html
+
+
 def test_caveat_graceful_without_injection():
     d = _fake_d()
     d.pop("surv_inject")
@@ -244,9 +404,11 @@ def test_regime_attribution_renders_three_lenses():
     assert "Regime attribution" in html
     assert "Technology" in html and "Industrials" in html        # (1) sector strip named
     assert "risk-on" in html and "risk-off" in html              # (2) HMM-conditional split
-    assert "2023" in html                                        # (3) pre-2024 holdout
+    assert "2023" in html                                        # (3) pre-test holdout, derived
     # leads with the honest retained-Sharpe framing, not a scary single number
     assert "retained" in html and "regime-" in html
+    # the bars are the raw pre-overlay selection basis, and say so
+    assert "pre-overlay" in html and "Selection" in html
 
 
 def test_regime_attribution_in_full_page_before_caveat():
@@ -467,6 +629,7 @@ def test_sec_ensemble_renders_adoption_rule_and_codes():
     assert "···DEF" in html and "A···EF" in html
     assert "pre-registered" in html.lower()
     assert "adopt" in html.lower()
+    assert "selection basis" in html                 # the rule's basis is named explicitly
     assert "€" not in html
     assert st.sec_ensemble({}, public=True) == ""
 

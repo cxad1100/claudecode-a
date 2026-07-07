@@ -38,6 +38,7 @@ from tools.momentum_grid import (MomentumConfig, _stats_slice, run_grid,
 from tools.portfolio_tools import BENCHMARKS, parse_portfolio
 from tools.portfolio_analytics import build_roi_timeseries
 from tools.data_buffer import cached_price_history
+from tools import strategy_registry as sreg
 from build_momentum_report import (
     PRICES_CSV, META_CSV, TURN_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
     FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG, K, MIN_TURNOVER,
@@ -48,20 +49,15 @@ from build_momentum_report import (
 # Production config is chosen DYNAMICALLY: gather() runs the 64-config grid and takes
 # pick_ultimate(grid) (worst-case-robust ultimate) as the live strategy — no hardcoded config to
 # drift stale as the universe/sectors change. This constant is the FALLBACK (used only if nothing
-# in the grid qualifies) and documents the current winner — ·B·DEF = sector-neutral, top-10,
-# quarterly, lazy.
-# Sector-neutral (B) is now LIVE: tools.enrich_sectors sourced real GICS sectors per name from
-# yfinance home listings into data/universe/universe_meta.csv (99% of the LIVE universe), so B's
-# round-robin actually caps single-sector concentration instead of being the silent no-op it was
-# when every name read "Unknown". With B in the pool the full 64-config grid RE-SELECTED the
-# ultimate by worst-case min(train, validation) Sharpe — and the winner is a B config: ·B·DEF
-# (min 0.93, val 0.93, held-out test 1.47) beats the old B-off A···EF (min 0.71, test 1.27) on
-# both robustness AND the held-out test; 6 of the grid's top-8 are B configs, so B genuinely
-# earns its place. (CAVEAT: the pick is sector-coverage sensitive — at partial 48% coverage the
-# grid wrongly preferred AB····, which collapses to test 0.65 at full coverage. Trust the
-# full-coverage result.) B caps single-SECTOR concentration; it does NOT by itself raise the PCA
-# effective-bets metric (that is correlation/factor-based — sector-diverse names still co-move
-# when one macro factor dominates).
+# in the grid qualifies).
+# Sector-neutral (B) is LIVE: tools.enrich_sectors sourced real GICS sectors per name from
+# yfinance home listings into data/universe/universe_meta.csv, so B's round-robin actually caps
+# single-sector concentration. The grid selects by worst-case min(train, validation) Sharpe;
+# the pick is sector-coverage sensitive, so trust full-coverage grids only (see the lab grid
+# for the current cells — numbers are recomputed every build, never quoted here). B caps
+# single-SECTOR concentration; it does NOT by itself raise the PCA effective-bets metric
+# (that is correlation/factor-based — sector-diverse names still co-move when one macro
+# factor dominates).
 STRATEGY = MomentumConfig(sector_neutral=True, slots=10, freq="Q", lazy=True)
 
 # Risk-conscious overlay: volatility-target the book to this annualised vol (de-risk only,
@@ -121,6 +117,19 @@ SCEN_SIMS = int(os.environ.get("SCEN_SIMS", "2000"))
 # just momentum beta?" sharper than the CAPM alpha above. Env FACTORS=0 skips (offline).
 FACTORS = int(os.environ.get("FACTORS", "1"))
 
+# Multiple-testing hurdle (Harvey 2016): unseen industry-wide testing lifts the real
+# significance bar to roughly this t-stat. One constant — quoted wherever the hurdle appears.
+HARVEY_T = 3.0
+# Nominal one-way slippage the backtest models per fill (bps) — quoted in prose from here;
+# RC_TURN_BPS deliberately matches it so the overlay pays the same friction it cites.
+MODELED_SLIP_BPS = 25
+
+# Window display labels ("Train 2018–21" …) derived from the actual constants — the single
+# source for every window-date string on the page (no hardcoded years anywhere).
+WIN_LABELS = sreg.window_labels(START, TRAIN_END, VAL_END)
+TEST_FROM = f"{pd.Timestamp(VAL_END).year + 1}→"      # e.g. "2024→" (held-out test)
+PRE_TEST = f"≤{pd.Timestamp(VAL_END).year}"           # e.g. "≤2023" (train+val tape)
+
 # Head-to-head colors — gold = original (raw), teal = risk-conscious (vol-targeted).
 C_RAW = "#dcdcaa"
 C_RC = "#4ec9b0"
@@ -152,19 +161,36 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
     Selection is IDENTICAL across both (same holdings_log / trades) — vol-targeting
     scales the whole book, it does not change which names are picked. So the rc bundle
     re-derives its windowed stats / quant metrics / grade from the vol-targeted equity
-    curve, but shares the picks and the per-name trade record."""
+    curve, but shares the picks and the per-name trade record.
+
+    Each bundle carries TWO window sets: `train/val/test/full` on the pre-registered
+    selection basis (backtest_stats — what the grid/adoption rules read) and `windows`
+    on the canonical display basis (qg.window_metrics — what every comparison surface
+    renders). net_return/max drawdown agree across bases; only the Sharpe convention
+    differs (arithmetic vs geometric). The grade is display-layer, so it reads the
+    canonical test Sharpe."""
     tr = res["runs"][1.0]["trades"]
+    raw_eq = res["runs"][1.0]["equity"]
+
+    def _canon(eq):
+        return {k: qg.window_metrics(eq, lo, hi)
+                for k, (lo, hi) in sreg.window_bounds(eq, train_end, val_end).items()}
+
+    raw_windows = _canon(raw_eq)
     raw = dict(
         label=f"Original (raw, {strategy.code})", short="Original", key="raw", color=C_RAW,
-        equity=res["runs"][1.0]["equity"], holdings_log=res["holdings_log"], trades=tr,
+        equity=raw_eq, holdings_log=res["holdings_log"], trades=tr,
         train=train, val=val, test=test, full=res["runs"][1.0]["stats"],
-        perf=quant["perf"], bench=quant["bench"], roll=quant["roll"], grade=quant["grade"],
+        windows=raw_windows,
+        perf=quant["perf"], bench=quant["bench"], roll=quant["roll"],
+        grade=qg.grade(raw_windows.get("test", {}).get("sharpe", 0.0), dsr, mc_p, overlap),
         exposure=None, exposure_latest=1.0)
 
     rc_eq = vt["equity"]
     te, ve = pd.Timestamp(train_end), pd.Timestamp(val_end)
     one = pd.Timedelta(days=1)
     rc_test = _stats_slice(rc_eq, tr, ve + one, rc_eq.index[-1], capital)
+    rc_windows = _canon(rc_eq)
     rc = dict(
         label=f"Risk-conscious (vol-target {RISK_TARGET_VOL:.0%})", short="Risk-conscious",
         key="rc", color=C_RC,
@@ -173,13 +199,96 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
         val=_stats_slice(rc_eq, tr, te + one, ve, capital),
         test=rc_test,
         full=_stats_slice(rc_eq, tr, rc_eq.index[0], rc_eq.index[-1], capital),
+        windows=rc_windows,
         perf=vt,
         bench=qg.vs_benchmark(rc_eq, spx) if spx is not None else {},
         roll=qg.rolling_sharpe(rc_eq),
-        grade=qg.grade(rc_test["sharpe"], dsr, mc_p, overlap),
+        grade=qg.grade(rc_windows.get("test", {}).get("sharpe", 0.0), dsr, mc_p, overlap),
         exposure=vt.get("exposure"),
         exposure_latest=vt.get("exposure_latest", vt.get("avg_exposure", 1.0)))
     return [raw, rc]
+
+
+def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=None,
+                   bench=None, ew_eq=None, portfolio_roi=None) -> list:
+    """Normalize everything gather() computed into StrategyRecords — the ONE list every
+    comparison surface (leaderboard, parallel chart) renders. Adding a future strategy =
+    one make_record() call here (curve-bearing) or one tools.strategy_registry
+    STATIC_RECORDS entry (ledger-only). No engine calls — curves come in, records go out.
+
+    Statuses derive from the same ensemble["adopt"] branch that decides what
+    local/strategy_track.csv tracks, so the ★ live row always agrees with the tracker."""
+    raw, rc = variants
+    ens_adopt = bool(ensemble and ensemble.get("adopt"))
+    recs = []
+    if ensemble and ensemble.get("equity") is not None:
+        codes = " + ".join(ensemble["codes"])
+        recs.append(sreg.make_record(
+            "mom_ens", f"Momentum ensemble — top-{ensemble['n']} quarterly ({codes})",
+            "momentum", "adopted" if ens_adopt else "candidate",
+            equity=ensemble["equity"], train_end=TRAIN_END, val_end=VAL_END,
+            adopted="2026-07-06" if ens_adopt else None,
+            cost_model=f"slip + €{FEE_EUR:.0f}/order per sleeve",
+            avg_exposure=1.0,
+            gate=(f"pre-reg rule: min(train,val) {ensemble['ens_min']:.2f} ≥ "
+                  f"{ensemble['single_min']:.2f} − 0.05 → "
+                  + ("ADOPTED" if ens_adopt else "bench")),
+            live=ens_adopt, color="#c586c0"))
+    recs.append(sreg.make_record(
+        "mom_rc", rc["label"], "momentum",
+        "variant" if ens_adopt else "adopted",
+        variant_of="mom_ens" if ens_adopt else None,
+        equity=rc["equity"], windows=rc.get("windows"),
+        train_end=TRAIN_END, val_end=VAL_END,
+        cost_model=f"slip + €{FEE_EUR:.0f} + {RC_TURN_BPS:.0f}bp resize",
+        avg_exposure=rc["perf"].get("avg_exposure"),
+        gate=None if ens_adopt else "single pick_ultimate book (ensemble on the bench)",
+        live=not ens_adopt, color=C_RC))
+    recs.append(sreg.make_record(
+        "mom_raw", "Momentum — raw (unmanaged)", "momentum", "reference",
+        variant_of="mom_rc",
+        equity=raw["equity"], windows=raw.get("windows"),
+        train_end=TRAIN_END, val_end=VAL_END,
+        cost_model=f"slip + €{FEE_EUR:.0f} · full-invested",
+        avg_exposure=1.0,
+        verdict="reference — inflated (survivorship + full exposure on a high-vol book); "
+                "curve in the lab only",
+        flags=("inflated",), color=C_RAW))
+    if vol_core_eq is not None and vol_core:
+        recs.append(sreg.make_record(
+            "vol_core", "GARCH vol-managed IWDA core", "vol-managed core", "adopted",
+            equity=vol_core_eq, train_end=TRAIN_END, val_end=VAL_END,
+            adopted="2026-07-05",
+            cost_model="5bp band-rebalance + €1",
+            avg_exposure=vol_core.get("managed", {}).get("avg_exposure"),
+            gate="PASS (pre-registered, vol lab)", href="vol.html",
+            color="#569cd6"))
+    if bench is not None:
+        start = pd.Timestamp(START)
+        for rid, col in (("bench_msci", "MSCI World"), ("bench_spx", "S&P 500")):
+            if col in getattr(bench, "columns", []):
+                recs.append(sreg.make_record(
+                    rid, f"{col} (buy-hold)", "benchmark", "benchmark",
+                    equity=bench[col].dropna().loc[start:],
+                    train_end=TRAIN_END, val_end=VAL_END,
+                    cost_model="—", avg_exposure=1.0))
+    if ew_eq is not None:
+        recs.append(sreg.make_record(
+            "ew_baseline", "Equal-weight initial picks (buy-hold)", "benchmark",
+            "benchmark", equity=ew_eq, train_end=TRAIN_END, val_end=VAL_END,
+            cost_model="—", avg_exposure=1.0, color=theme.FG_DIM))
+    if portfolio_roi is not None and not getattr(portfolio_roi, "empty", True):
+        curve = 1.0 + portfolio_roi / 100.0
+        recs.append(sreg.make_record(
+            "portfolio", "Your portfolio (real, cash-flow-timed)", "your book",
+            "portfolio", since=str(portfolio_roi.index[0].date()),
+            windows=dict(full=qg.window_metrics(curve, curve.index[0], curve.index[-1])),
+            cost_model="real fills",
+            verdict="money-weighted real book over its own window — head-to-head below",
+            color="#ffffff"))
+    recs.extend(sreg.STATIC_RECORDS)
+    sreg.assign_colors(recs)
+    return recs
 
 
 def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return,
@@ -308,6 +417,11 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     val = _stats_slice(eq, tr, te + pd.Timedelta(days=1), ve, CAPITAL)
     test = _stats_slice(eq, tr, ve + pd.Timedelta(days=1), eq.index[-1], CAPITAL)
     hits = sum(len(h.get("dead", set())) for h in res["holdings_log"])
+    # Equal-weight buy-hold of the first rebalance's picks — the survivorship-honest
+    # baseline. Computed here (not at render time) so the registry can carry it.
+    window = _equity_window(res)
+    first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
+    ew_eq = equal_weight_curve(prices, first_picks, window, CAPITAL) if first_picks else None
 
     # ── Upper bound: drop dead names that were never TR-tradeable (ISIN domicile absent
     #    from the live TR set — e.g. the 200 Korean corpses TR never offered). Including them
@@ -380,9 +494,10 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     di = {str(r["isin"]) for r, dl in zip(meta_df.to_dict("records"), meta_df["delisting_date"])
           if pd.notna(dl) and str(r["isin"])}
     overlap = len(li & di) / max(len(di), 1)
+    test_canon = qg.window_metrics(eq, ve + pd.Timedelta(days=1), eq.index[-1])
     quant = dict(perf=qg.perf_metrics(eq), bench=qg.vs_benchmark(eq, spx),
                  trades=qg.trade_metrics(tr, CAPITAL, years), roll=qg.rolling_sharpe(eq),
-                 grade=qg.grade(test["sharpe"], dsr["dsr"], mc["p_sharpe"], overlap),
+                 grade=qg.grade(test_canon.get("sharpe", 0.0), dsr["dsr"], mc["p_sharpe"], overlap),
                  isin_overlap=overlap,
                  vol_target=qg.vol_target(eq, target_vol=RISK_TARGET_VOL, turn_cost_bps=RC_TURN_BPS))
 
@@ -471,6 +586,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     #    Beats buy-and-hold on risk-adjusted terms; killed/observational research
     #    stays on the lab pages, never here.
     vol_core = None
+    vol_core_eq = None
     try:
         from tools import vol_forecast as vf
         core_px = cached_price_history(["IWDA.AS"], period="9y",
@@ -482,6 +598,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                             capital=CAPITAL)
         bh = qg.perf_metrics((1.0 + core_r).cumprod() * CAPITAL)
         w_now = float(min(RISK_TARGET_VOL / fc.iloc[-1], 1.0)) if len(fc) else None
+        vol_core_eq = vm.get("equity")               # the registry's comparable curve
         vol_core = dict(etf="MSCI World (IWDA.AS)", bh=bh,
                         managed={k: vm[k] for k in ("sharpe", "ann_return",
                                                     "max_dd", "avg_exposure",
@@ -694,9 +811,14 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             portfolio_roi = None
 
     n_countries = len({m.get("country") for m in meta.values()} - {"—", None})
+    registry = build_registry(variants, ensemble=ensemble, vol_core=vol_core,
+                              vol_core_eq=vol_core_eq, bench=bench, ew_eq=ew_eq,
+                              portfolio_roi=portfolio_roi)
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
                 portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
-                strategy=cfg, train=train, val=val, test=test, graveyard_hits=hits,
+                registry=registry, ew_eq=ew_eq,
+                strategy=cfg, raw_windows=dict(train=train, val=val, test=test),
+                graveyard_hits=hits,
                 surv_inject=surv_inject, delisting_stress=delisting_stress,
                 factor_reg=factor_reg, vol_core=vol_core,
                 ensemble={k: v for k, v in (ensemble or {}).items()
@@ -712,11 +834,21 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                                   phantom_mult=PHANTOM_MULT))
 
 
-# ── Shared layout helper ────────────────────────────────────────────────────────
+# ── Registry rendering helpers ──────────────────────────────────────────────────
 
-def _cmp(left: str, right: str) -> str:
-    """Two-column side-by-side block (Original | Risk-conscious); collapses on mobile."""
-    return f"<div class='cmp'><div>{left}</div><div>{right}</div></div>"
+def _badge(status: str) -> str:
+    c = sreg.STATUS_COLOR.get(status, theme.FG_DIM)
+    return f"<span class='badge' style='color:{c};border-color:{c}'>{status}</span>"
+
+
+def _wm_cell(w: dict, key: str, fmt: str = "sharpe") -> str:
+    """One leaderboard cell from a qg.window_metrics dict; '—' when the window is empty."""
+    if not w or key not in w:
+        return "<td class='num dim'>—</td>"
+    v = w[key]
+    if fmt == "pct":
+        return f"<td class='num'>{_pct(v * 100)}</td>"
+    return f"<td class='num mono'>{v:.2f}</td>"
 
 
 def sec_headline(d: dict) -> str:
@@ -726,7 +858,7 @@ def sec_headline(d: dict) -> str:
     rc = d["variants"][1]
     s = d["significance"]
     mc, dsr, ci = s["mc"], s["dsr"], s["ci"]
-    t = rc["test"]
+    t = rc.get("windows", {}).get("test") or rc["test"]     # canonical basis when available
     g = rc["grade"]["letter"]
     beat = 100.0 * (1.0 - mc["p_sharpe"])
     ph = s.get("dsr_phantom") or []
@@ -741,6 +873,17 @@ def sec_headline(d: dict) -> str:
         _card("Deflated Sharpe (P real&gt;0)", f"{dsr['dsr']:.0%}" if dsr_ok else "—"),
         _card("Honest grade", g),
     ])
+    e = d.get("ensemble")
+    live_txt = ""
+    if e:
+        live_txt = ((" The <b>live tracked book is the pre-registered top-"
+                     f"{e.get('n', 3)} ensemble</b> ({', '.join(e.get('codes', []))}) — "
+                     "adopted by the ex-ante rule; the registry below compares it in "
+                     "parallel. The cards grade the single-config risk-conscious book, "
+                     "the family's reference implementation.")
+                    if e.get("adopt") else
+                    " The ensemble candidate stayed on the bench (ex-ante rule); this "
+                    "single-config book is the live one.")
     tstat_txt = (f" Its implied Harvey t-stat is <b>{tstat:.1f}</b>." if tstat is not None else "")
     dsr_sentence = (
         "After deflating for every config scanned, <b>P(true&nbsp;Sharpe&gt;0)</b> is "
@@ -750,11 +893,12 @@ def sec_headline(d: dict) -> str:
         "<h2>The result</h2>"
         f"<div class='note' style='border-left-color:{C_RC};border-left-width:6px'>"
         f"<b>Run the way you'd actually hold it — volatility-targeted to {RISK_TARGET_VOL:.0%}, "
-        "de-risk only.</b> On the <b>held-out test window (2024→, which never touched the config "
-        f"choice)</b> it returns <b>{_pct(t['net_return'] * 100)}</b> at "
+        f"de-risk only.</b> On the <b>held-out test window ({TEST_FROM}, which never touched the "
+        f"config choice)</b> it returns <b>{_pct(t['net_return'] * 100)}</b> at "
         f"<b>{rc['perf']['ann_vol'] * 100:.0f}% vol</b> for a <b>Sharpe {t['sharpe']:.2f}</b>, "
-        f"with a <b>{_pct(rc['perf']['max_dd'] * 100)}</b> max drawdown. "
-        f"<b>Monte Carlo:</b> against {mc['n_trials']:,} random books drawn from the same "
+        f"with a <b>{_pct(rc['perf']['max_dd'] * 100)}</b> max drawdown."
+        + live_txt +
+        f" <b>Monte Carlo:</b> against {mc['n_trials']:,} random books drawn from the same "
         "eligible universe on the same dates, its <i>selection</i> beats "
         f"<b>{beat:.1f}%</b> of them (p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}). "
         + dsr_sentence +
@@ -779,7 +923,7 @@ def sec_intro(d: dict) -> str:
             f"<b>Trade-Republic-investable</b> names across <b>{nc} countries</b>, each priced off "
             "its <b>home exchange × EUR FX</b> — the way Lang &amp; Schwarz actually fills you "
             "(NVIDIA on NASDAQ, Samsung on KRX, Rheinmetall on XETRA, in their own currency, "
-            "converted to EUR). Behind a <b>≥100k/day turnover</b> floor"
+            f"converted to EUR). Behind a <b>≥{MIN_TURNOVER / 1_000:.0f}k/day turnover</b> floor"
             + (", re-checked point-in-time each rebalance" if d.get("turnover_pit") else "")
             + ". Long-only, walk-forward, executable. Not advice.</div>")
 
@@ -837,54 +981,147 @@ def sec_picks_compare(d: dict) -> str:
             + _picks_table(d, rc))
 
 
-# ── Equity (one overlaid chart) ─────────────────────────────────────────────────
+# ── Strategy registry: the one leaderboard + the one parallel chart ─────────────
 
-def sec_curve_compare(d: dict) -> str:
+def sec_registry(d: dict, public: bool) -> str:
+    """The strategy registry — every strategy the program has produced, one row each,
+    on ONE canonical metric basis (qg.window_metrics over the shared train/val/test
+    windows). ★ marks the live row (what strategy_track.csv actually tracks). Killed /
+    cut / cross-page strategies live in the collapsed ledger below — visible file-drawer,
+    no curves recomputed. A future strategy = one record in build_registry()."""
+    recs = sreg.ordered(d.get("registry") or [])
+    if not recs:
+        return ""
+    main_status = ("adopted", "candidate", "variant", "benchmark", "reference", "portfolio")
+    rows = []
+    for r in recs:
+        if r.status not in main_status:
+            continue
+        if public and r.status == "portfolio":
+            continue
+        w_test, w_full = r.windows.get("test"), r.windows.get("full")
+        name = f"<b>★ {r.name}</b>" if r.live else r.name
+        if "inflated" in r.flags:
+            name += " <span class='dim'>— reference, inflated</span>"
+        if r.href:
+            name += f" <a href='{r.href}' class='dim'>↗</a>"
+        sub = []
+        if r.since:
+            sub.append(f"since {r.since}")
+        if r.adopted:
+            sub.append(f"adopted {r.adopted}")
+        meta_line = f"<div class='dim' style='font-size:0.72rem'>{' · '.join(sub)}</div>" if sub else ""
+        exp = (f"{r.avg_exposure * 100:.0f}%" if r.avg_exposure is not None else "—")
+        gate = r.gate or r.verdict or "—"
+        cls = " class='dimrow'" if ("inflated" in r.flags or r.status == "benchmark") else ""
+        rows.append(
+            f"<tr{cls}><td>{_badge(r.status)}</td>"
+            f"<td style='color:{r.color or theme.FG}'>{name}{meta_line}</td>"
+            + _wm_cell(w_test, "sharpe") + _wm_cell(w_test, "net_return", "pct")
+            + _wm_cell(w_test, "max_dd", "pct") + _wm_cell(w_full, "sharpe")
+            + _wm_cell(w_full, "ann_vol", "pct")
+            + f"<td class='num mono'>{exp}</td>"
+            f"<td class='dim' style='font-size:0.78rem'>{r.cost_model or '—'}</td>"
+            f"<td class='dim' style='font-size:0.78rem'>{gate}</td></tr>")
+    ledger = []
+    for r in recs:
+        if r.status not in ("killed", "cut", "research"):
+            continue
+        link = f" <a href='{r.href}'>lab ↗</a>" if r.href else ""
+        ledger.append(
+            f"<tr class='dimrow'><td>{_badge(r.status)}</td><td>{r.name}</td>"
+            f"<td>{r.family}</td><td style='font-size:0.78rem'>{r.verdict}{link}</td></tr>")
+    ledger_html = ""
+    if ledger:
+        ledger_html = (
+            "<details><summary>Registry ledger — killed &amp; cross-page strategies "
+            f"({len(ledger)})</summary>"
+            "<p class='dim'>The visible file-drawer: every strategy the program tried and did "
+            "not promote, with its pre-registered verdict. Nothing is recomputed here — the "
+            "lab pages hold the full workings.</p>"
+            "<table><tr><th>Status</th><th>Strategy</th><th>Family</th><th>Verdict</th></tr>"
+            + "".join(ledger) + "</table></details>")
+    return (
+        "<h2>Strategy registry — every strategy, one basis</h2>"
+        "<p class='dim'>One row per strategy, all metrics computed by the <b>same canonical "
+        "function</b> (geometric daily basis) over the <b>same windows</b> — "
+        f"<b>{WIN_LABELS['test']}</b> is the held-out comparison window, Full = each curve's "
+        "own history. <b>★ = the live tracked book.</b> Cost models differ by row (the Costs "
+        "column names each); the Monte-Carlo / deflated-Sharpe numbers further down use a "
+        "<i>gross per-rebalance</i> basis by design — selection vs noise, costs hit a random "
+        "book equally. A future strategy joins this table (and the chart below) as one "
+        "registry record.</p>"
+        "<table><tr><th>Status</th><th>Strategy</th>"
+        f"<th class='num'>{WIN_LABELS['test']} Sharpe</th><th class='num'>Test ret</th>"
+        "<th class='num'>Test maxDD</th><th class='num'>Full Sharpe</th>"
+        "<th class='num'>Ann. vol</th><th class='num'>Avg exp</th>"
+        "<th>Costs</th><th>Gate / verdict</th></tr>"
+        + "".join(rows) + "</table>"
+        + ledger_html)
+
+
+def sec_parallel_curves(d: dict, public: bool) -> str:
+    """Every curve-bearing strategy in parallel — index = 100 at the common window
+    start — against the equal-weight baseline and the benchmarks. The raw reference
+    curve is lab-only by decision; the real portfolio is cash-flow-timed, so it gets
+    the honest head-to-head section instead of a fake index-100 rebase."""
     res = d["res"]
     window = _equity_window(res)
-    rc = d["variants"][1]
+    recs = [r for r in sreg.ordered(d.get("registry") or [])
+            if r.equity is not None and "inflated" not in r.flags
+            and r.status in ("adopted", "candidate", "variant")]
+    if not recs:
+        return ""
     fig = go.Figure()
-    eq = rc["equity"].reindex(window).ffill()
-    fig.add_trace(go.Scatter(x=eq.index, y=eq / d["capital"] * 100.0,
-                             name="Risk-conscious (vol-targeted)",
-                             line=dict(color=C_RC, width=2.6)))
-    first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
-    if first_picks:
-        ew = equal_weight_curve(d["prices"], first_picks, window, d["capital"])
-        fig.add_trace(go.Scatter(x=ew.index, y=ew / d["capital"] * 100.0,
-                                 name="Equal-weight (initial picks, buy-hold)",
-                                 line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
+    for r in recs:
+        s = r.equity.reindex(window).ffill().dropna()
+        if len(s) < 2:
+            continue
+        name = f"★ {r.name}" if r.live else r.name
+        fig.add_trace(go.Scatter(x=s.index, y=s / s.iloc[0] * 100.0, name=name,
+                                 line=dict(color=r.color, width=2.6 if r.live else 1.8)))
+    ew = d.get("ew_eq")
+    if ew is not None:
+        s = ew.reindex(window).ffill().dropna()
+        if len(s) >= 2:
+            fig.add_trace(go.Scatter(x=s.index, y=s / s.iloc[0] * 100.0,
+                                     name="Equal-weight (initial picks, buy-hold)",
+                                     line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
     for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():
         fig.add_trace(go.Scatter(x=curve.index, y=curve / d["capital"] * 100.0,
-                                 name=name, line=dict(width=1.4)))
+                                 name=name, line=dict(width=1.2)))
     fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
-    fig.update_layout(height=480, yaxis_title="Index (start = 100)",
+    fig.update_layout(height=500, yaxis_title="Index (start = 100)",
                       hovermode="x unified", margin=dict(t=20))
-    return ("<h2>Walk-forward equity vs benchmarks</h2>"
-            "<p class='dim'>The <b>risk-conscious</b> strategy (the same 12-1 momentum selection, "
-            f"volatility-targeted to {RISK_TARGET_VOL:.0%}) since the first rebalance with enough "
-            "history, vs a buy-hold equal-weight basket of today's top picks (a survivorship-honest "
-            "baseline) and the MSCI World / S&amp;P 500. It holds cash in turbulence, so it rides "
-            "lower in calm rallies but falls far less in the drawdowns. "
-            "<i>(The raw full-invested curve — far higher and far more volatile, inflated by "
-            "survivorship and by running a high-vol book at full exposure — is in the research lab, "
-            "not quoted here.)</i></p>"
+    pf_note = ("" if public else
+               " Your real book is cash-flow-timed, so it is compared honestly in "
+               "<b>You vs the strategies</b> below, not force-rebased onto this chart.")
+    return ("<h2>Walk-forward equity — strategies vs benchmarks</h2>"
+            "<p class='dim'>Every live/candidate strategy over the <b>same walk-forward "
+            "window</b>, rebased to 100 at the common start, vs the equal-weight basket of "
+            "the first picks (survivorship-honest baseline) and the benchmark ETFs. Click "
+            "legend entries to toggle lines. <i>(The raw full-invested curve — inflated by "
+            "survivorship and full exposure — stays in the research lab.)</i>"
+            + pf_note + "</p>"
             f"<div class='chart'>{fig_html(fig)}</div>")
 
 
 # ── Performance (merged compare table) ──────────────────────────────────────────
 
 def _perf_cells(s: dict) -> str:
+    """Cells from one canonical qg.window_metrics dict ('—' when the window is empty)."""
+    if not s:
+        return "<td class='num dim'>—</td>" * 3
     return (f"<td class='num'>{_pct(s['net_return'] * 100)}</td>"
             f"<td class='num mono'>{s['sharpe']:.2f}</td>"
-            f"<td class='num'>{_pct(s['max_drawdown'] * 100)}</td>")
+            f"<td class='num'>{_pct(s['max_dd'] * 100)}</td>")
 
 
 def _perf_table(v: dict) -> str:
+    w = v.get("windows", {})
     rows = "".join(
-        f"<tr><td>{label}</td>{_perf_cells(v[k])}</tr>"
-        for label, k in (("Train 2018–21", "train"), ("Validation 2022–23", "val"),
-                         ("Test 2024→", "test"), ("Full 2018→", "full")))
+        f"<tr><td>{WIN_LABELS[k]}</td>{_perf_cells(w.get(k, {}))}</tr>"
+        for k in ("train", "val", "test", "full"))
     return (f"<h3 style='color:{v['color']}'>{v['short']}</h3>"
             "<table><tr><th>Window</th><th class='num'>Ret</th><th class='num'>Sharpe</th>"
             f"<th class='num'>Max DD</th></tr>{rows}</table>")
@@ -892,20 +1129,25 @@ def _perf_table(v: dict) -> str:
 
 def sec_perf_compare(d: dict, public: bool) -> str:
     rc = d["variants"][1]
+    t = rc.get("windows", {}).get("test") or rc["test"]
+    full_ret = (rc.get("windows", {}).get("full") or {}).get(
+        "net_return", rc["full"]["net_return"])
     cards = [
-        _card("Test return", _pct(rc["test"]["net_return"] * 100)),
-        _card("Test Sharpe", f"{rc['test']['sharpe']:.2f}"),
+        _card("Test return", _pct(t["net_return"] * 100)),
+        _card("Test Sharpe", f"{t['sharpe']:.2f}"),
         _card("Max DD", _pct(rc["perf"]["max_dd"] * 100)),
         _card("Ann. vol", _pct(rc["perf"]["ann_vol"] * 100, signed=False)),
     ]
     if not public:
-        cards.append(_card("Net P&L", f"€{rc['full']['net_return'] * d['capital']:+,.0f}"))
+        cards.append(_card("Net P&L", f"€{full_ret * d['capital']:+,.0f}"))
     return ("<h2>Performance</h2>"
-            "<p class='dim'>Train = 2018–21 (used to pick the config), validation = 2022–23 "
-            "(used to compare configs), <b>test = 2024→ (held out — never touched the choice)</b>. "
+            f"<p class='dim'>Windows: <b>{WIN_LABELS['train']}</b> (used to pick the config) · "
+            f"<b>{WIN_LABELS['val']}</b> (used to compare configs) · <b>{WIN_LABELS['test']} "
+            "(held out — never touched the choice)</b>. "
             "<b>The test row is the only truly out-of-sample number</b> — read it, not the "
             f"full-window total. The risk-conscious book: the selection scaled to a "
-            f"{RISK_TARGET_VOL:.0%} vol target.</p>"
+            f"{RISK_TARGET_VOL:.0%} vol target. Same canonical metric basis as the registry "
+            "table above.</p>"
             f"<div class='cards'>{''.join(cards)}</div>"
             + _perf_table(rc))
 
@@ -1038,8 +1280,8 @@ def sec_yearly_compare(d: dict, public: bool) -> str:
     pnl_note = ("its actual €P&amp;L, and " if not public else "and ")
     return ("<h2>Yearly P&amp;L</h2>"
             "<p class='dim'>Calendar-year net return of the risk-conscious book (first year from "
-            f"inception), {pnl_note}the S&amp;P 500 over the same year. 2018 and 2026 are "
-            "part-years.</p>"
+            f"inception), {pnl_note}the S&amp;P 500 over the same year. {ceq.index[0].year} and "
+            f"{ceq.index[-1].year} are part-years.</p>"
             + ytable(rc, ceq))
 
 
@@ -1101,7 +1343,8 @@ def sec_timeline_compare(d: dict) -> str:
             "<span style='color:#7a0000'>■</span> ≤−20% · <span style='color:#000'>■</span> "
             "defaulted (delisted/died). Hover for the %. Each period shows the book return after "
             "vol-scaling and its average exposure (<span class='mono'>@x%</span> invested).</p>"
-            + _timeline_col(d, rc))
+            "<details><summary>show the full rebalance timeline</summary>"
+            + _timeline_col(d, rc) + "</details>")
 
 
 # ── Shared sections (both versions) ─────────────────────────────────────────────
@@ -1141,6 +1384,18 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
                              line=dict(color="#ffffff", width=2.6)))
     fig.add_trace(go.Scatter(x=line.index, y=line.values, name=line_name,
                              line=dict(color=C_RC, width=2.6)))
+    # the other adopted strategy, same window: the GARCH vol-managed IWDA core
+    # (scale-free % curve; its €1/order drag is negligible at any scale)
+    vc_roi = None
+    vc_rec = next((r for r in (d.get("registry") or [])
+                   if r.id == "vol_core" and r.equity is not None), None)
+    if vc_rec is not None:
+        vcw = vc_rec.equity[vc_rec.equity.index >= start].dropna()
+        if len(vcw) >= 5:
+            vc_roi = (vcw / vcw.iloc[0] - 1.0) * 100.0
+            fig.add_trace(go.Scatter(x=vc_roi.index, y=vc_roi.values,
+                                     name="GARCH vol-managed IWDA core",
+                                     line=dict(color=vc_rec.color or "#569cd6", width=1.8)))
     fig.add_hline(y=0, line_dash="dash", line_color=theme.FG_DIM)
     fig.update_layout(height=440, yaxis=dict(title="Cumulative ROI (%)", ticksuffix="%"),
                       hovermode="x unified", margin=dict(t=20))
@@ -1155,13 +1410,19 @@ def sec_vs_portfolio(d: dict, public: bool) -> str:
             f"<td class='num mono'>{ps:.2f}</td><td class='num'>{_pct(pdd)}</td></tr>"
             f"<tr><td>{line_name}</td><td class='num'>{_pct(lt)}</td>"
             f"<td class='num mono'>{ls:.2f}</td><td class='num'>{_pct(ldd)}</td></tr>")
+    if vc_roi is not None:
+        vt_, vs_, vdd = stat(vc_roi)
+        rows += (f"<tr><td>GARCH vol-managed IWDA core</td><td class='num'>{_pct(vt_)}</td>"
+                 f"<td class='num mono'>{vs_:.2f}</td><td class='num'>{_pct(vdd)}</td></tr>")
     lead = lt - pt
     return (
-        "<h2>You vs the strategy</h2>"
+        "<h2>You vs the strategies</h2>"
         f"<p class='dim'>Same window — since your first trade ({start.date()}, ~{yrs:.1f}y). "
         "<span style='color:#fff'>White</span> = your real book; "
         f"<span style='color:{C_RC}'>teal</span> = the risk-conscious (vol-targeted) strategy — "
-        "hypothetical, lump-sum. "
+        "hypothetical, lump-sum"
+        + ("; the third line = the adopted GARCH vol-managed IWDA core, same window"
+           if vc_roi is not None else "") + ". "
         + (f"It is run at <b>your invested scale (€{vs['capital']:,.0f})</b>, so the flat "
            "€1/transaction fee is the same % drag it is on your book (on €10k it's a negligible "
            "~0.15%). " if vs.get("capital") else "")
@@ -1192,12 +1453,7 @@ def sec_significance(d: dict, public: bool) -> str:
                       xaxis_title="Gross annualised Sharpe (per-rebalance)",
                       yaxis_title="random books", margin=dict(t=20))
 
-    cards = [
-        _card("p-value vs random", f"{mc['p_sharpe']:.3f}"),
-        _card("Beats random books", f"{pct_beat:.1f}%"),
-        _card("Deflated Sharpe (P real>0)", "—" if dsr['dsr'] != dsr['dsr'] else f"{dsr['dsr']:.0%}"),
-        _card(f"Sharpe {ci['conf']}% CI", f"{ci['sharpe_lo']:.2f} – {ci['sharpe_hi']:.2f}"),
-    ]
+    # (Headline cards already carry beat/DSR/CI — no duplicate card row here.)
     verdict = ("clears" if mc["p_sharpe"] < 0.05 else "does <b>not</b> clear")
     dsr_txt = ("—" if dsr["dsr"] != dsr["dsr"] else
                f"After haircutting for the <b>{dsr['n_trials']} configs we scanned</b>, the return "
@@ -1216,7 +1472,7 @@ def sec_significance(d: dict, public: bool) -> str:
                   "—" if p["dsr"] != p["dsr"] else f"{p['dsr']:.0%}")
             for p in ph)
         pworst = ph[-1]
-        harvey = ("clears" if (t_stat or 0) >= 3.0 else "sits below")
+        harvey = ("clears" if (t_stat or 0) >= HARVEY_T else "sits below")
         phantom_html = (
             "<h3>(4) The file-drawer — phantom trials</h3>"
             f'<div class="cards">{pcards}</div>'
@@ -1230,7 +1486,7 @@ def sec_significance(d: dict, public: bool) -> str:
             f"<b>×{pworst['mult']}</b> it is <b>{pworst['dsr']:.0%}</b> — the dispersion of the grid "
             "Sharpes stays fixed, only the deflation bar rises. "
             + (f"Complementary hurdle: Harvey (2016) argues industry-wide unseen testing lifts the "
-               f"real bar to a <b>t-stat of 3.0</b>; this strategy's implied t-stat is "
+               f"real bar to a <b>t-stat of {HARVEY_T:.1f}</b>; this strategy's implied t-stat is "
                f"<b>{t_stat:.1f}</b>, which <b>{harvey}</b> it. " if t_stat is not None else "")
             + "This is a subjective estimate, shown as a <i>range</i> — not a precise correction. It "
             "is the honest ceiling on confidence, and the edge survives it.</p>")
@@ -1247,7 +1503,6 @@ def sec_significance(d: dict, public: bool) -> str:
             .format(k=d["strategy"].slots, verdict=verdict, p=mc["p_sharpe"], dsr=dsr_txt,
                     conf=ci["conf"], slo=ci["sharpe_lo"], shi=ci["sharpe_hi"],
                     clo=ci["cagr_lo"] * 100, chi=ci["cagr_hi"] * 100) +
-            f'<div class="cards">{"".join(cards)}</div>'
             f"<div class='chart'>{fig_html(fig)}</div>"
             + phantom_html +
             "<p class='dim'>A low p-value says the <i>selection</i> adds value over drawing names "
@@ -1353,9 +1608,6 @@ def sec_ensemble(d: dict, public: bool) -> str:
     if not e:
         return ""
     cards = "".join([
-        _card("Train Sharpe", f"{e['train']['sharpe']:.2f}"),
-        _card("Val Sharpe", f"{e['val']['sharpe']:.2f}"),
-        _card("Test Sharpe", f"{e['test']['sharpe']:.2f}"),
         _card("Max drawdown", _pct(e["max_dd"] * 100)),
         _card("Trades/yr", f"{e['trades_per_year']:.0f}"),
         _card("DSR ×5", f"{e['dsr5']:.2f}" if e.get("dsr5") is not None else "—"),
@@ -1373,7 +1625,10 @@ at equal capital — fees charged per sleeve on its own third. Adoption rule fix
 before evaluation: adopt iff ensemble min(train,val)
 ({e['ens_min']:.2f}) ≥ single <span class='mono'>{e['single_code']}</span>
 ({e['single_min']:.2f}) − 0.05. <b>{verdict}</b>{a_line} · +1 selection-rule
-trial charged to the program ledger.</p>
+trial charged to the program ledger. <span class="dim">Rule numbers are on the
+pre-registered selection basis (arithmetic √252, momentum_grid) and deliberately
+stay on it; the registry table quotes the canonical geometric basis — its
+window Sharpes for this book live there, not here.</span></p>
 <div class="cards">{cards}</div>"""
 
 
@@ -1573,21 +1828,21 @@ def sec_regime(d: dict, public: bool) -> str:
     # bar chart: the three shocks on ONE comparable basis (held-out compound-annualised Sharpe
     # from the same _stats_slice). The HMM risk-on/off split is a different (daily) Sharpe basis,
     # so it lives in the prose as a ratio — never bar-charted next to these.
-    labels = ["Full<br>(test)", "Ex&nbsp;AI+Defense", "≤2023<br>(pre-regime)"]
+    labels = ["Full<br>(test)", "Ex&nbsp;AI+Defense", f"{PRE_TEST}<br>(pre-regime)"]
     vals = [full_sh, strip_sh, pre["sharpe"]]
     colors = [C_RAW, "#ef4444", "#569cd6"]
     fig = go.Figure(go.Bar(x=labels, y=[round(v, 2) for v in vals], marker_color=colors,
                            text=[f"{v:.2f}" for v in vals], textposition="outside"))
     fig.add_hline(y=full_sh, line_dash="dash", line_color=theme.FG_DIM,
-                  annotation_text="full test Sharpe", annotation_position="top right")
+                  annotation_text="selection test Sharpe", annotation_position="top right")
     fig.update_layout(height=360, margin=dict(t=30), showlegend=False,
-                      yaxis_title="Held-out Sharpe (compound-annualised)", xaxis_title="")
+                      yaxis_title="Selection (raw, pre-overlay) test Sharpe", xaxis_title="")
 
     cards = [
-        _card("Test Sharpe — full", f"{full_sh:.2f}"),
-        _card("Test Sharpe — ex AI/Defense", f"{strip_sh:.2f}"),
+        _card("Selection test Sharpe", f"{full_sh:.2f}"),
+        _card("Ex AI/Defense", f"{strip_sh:.2f}"),
         _card("Sharpe retained", _pct(retain, signed=False)),
-        _card("≤2023 Sharpe (regime-out)", f"{pre['sharpe']:.2f}"),
+        _card(f"{PRE_TEST} Sharpe (regime-out)", f"{pre['sharpe']:.2f}"),
     ]
     cond_txt = ""
     if cond:
@@ -1607,16 +1862,18 @@ def sec_regime(d: dict, public: bool) -> str:
             f"re-discover, at the cost of more parameters to overfit.")
     return (
         "<h2>Regime attribution — is the Sharpe AI/Defense beta in disguise?</h2>"
-        "<p class='dim'>The single most-cited worry: the 2024–25 tape was a momentum dream (AI "
+        "<p class='dim'>The single most-cited worry: the recent test tape was a momentum dream (AI "
         "semiconductors + defense spending), so is the held-out Sharpe borrowed from a once-a-decade "
         "macro regime? Three <b>observational</b> shocks, each a re-run/re-slice of the <b>same</b> "
-        "config — none touch selection, so none spend deflated-Sharpe budget. "
+        "config — none touch selection, so none spend deflated-Sharpe budget. All three run on the "
+        "<b>raw pre-overlay selection curve</b> on its own basis — internally consistent, and "
+        "deliberately <i>not</i> the headline's risk-conscious number. "
         f"<b>(1) Sector beta?</b> Dropping <b>Technology + Industrials</b> (the AI &amp; defense "
         f"tailwind — {st['n_dropped']:,} names, coarse: defense is a slice of Industrials) and "
         f"re-running leaves a held-out test Sharpe of <b>{strip_sh:.2f}</b> vs <b>{full_sh:.2f}</b> "
         f"full — it <b>{strip_verdict}</b> (<b>{retain:.0f}%</b> retained).{cond_txt} "
-        f"<b>(3) Pre-regime?</b> On the <b>≤2023</b> tape (train+val — momentum’s hard 2022 mean-"
-        f"reverting year included) the Sharpe was <b>{pre['sharpe']:.2f}</b> — positive, so the edge "
+        f"<b>(3) Pre-regime?</b> On the <b>{PRE_TEST}</b> tape (train+val — momentum’s hard mean-"
+        f"reverting stretch included) the Sharpe was <b>{pre['sharpe']:.2f}</b> — positive, so the edge "
         "predates the AI/defense boom.</p>"
         f'<div class="cards">{"".join(cards)}</div>'
         f"<div class='chart'>{fig_html(fig)}</div>"
@@ -1628,7 +1885,10 @@ def sec_regime(d: dict, public: bool) -> str:
 
 def sec_caveat(d: dict) -> str:
     hits = d.get("graveyard_hits", 0)
-    test_ret = d["test"]["net_return"] * 100
+    # Quote the SAME held-out number the headline leads with (risk-conscious, canonical
+    # basis) — never the raw selection figure under the same "test" label.
+    rc = d["variants"][1]
+    test_ret = (rc.get("windows", {}).get("test") or rc["test"])["net_return"] * 100
     surv = (f"it held <b>0</b> of them into death" if hits == 0 else
             f"it held <b>{hits}</b> into delisting, liquidated by the graveyard at the last price")
     nlive = d.get("n_live")
@@ -1684,13 +1944,15 @@ def sec_caveat(d: dict) -> str:
         f'do <b>not</b> fix it.{bound_txt} This is the single biggest reason to distrust the raw '
         f'level, and is why the raw full-invested curve is kept in the lab, not on the main '
         f'page.{trade}{onpop}{ledger}'
-        f'<br><br>The other caveats: <b>(1) Regime</b> — 2024→ was an exceptional small-cap momentum '
-        f'tape; even the held-out {test_ret:+.0f}% test figure is regime-specific and will <b>not</b> '
+        f'<br><br>The other caveats: <b>(1) Regime</b> — {TEST_FROM} was an exceptional small-cap '
+        f'momentum tape; even the held-out {test_ret:+.0f}% test figure (risk-conscious book, the '
+        f'same number the headline quotes) is regime-specific and will <b>not</b> '
         f'repeat. <b>(2) Concentration</b> — top-{d["strategy"].slots}; sector-neutral (B) now caps '
         f'single-sector piling, but with no per-name weight cap a few big movers still drive the '
         f'curve, and sectors are sourced for only part of the universe (rest fall in one “Unknown” '
         f'bucket). <b>(3) Capacity</b> — picks '
-        f'are liquid enough for a small account, but modeled slippage (25bps) understates real fills '
+        f'are liquid enough for a small account, but modeled slippage ({MODELED_SLIP_BPS}bps) '
+        f'understates real fills '
         f'in size. <b>(4) Mechanics</b> — daily closes, €1/order, slippage modeled not measured, and '
         f'<b>past performance is not future returns</b>.'
         f'<br><br><b style="color:{C_RC}">Risk-conscious version.</b> Volatility-targeting directly '
@@ -1867,37 +2129,44 @@ def sec_raw_reference(d: dict) -> str:
 
 
 def build(d: dict, public: bool = False) -> str:
-    """One page, two strategies side by side: a shared intro + on-top summary, then the
-    side-by-side compare (picks → equity → performance → scorecard → yearly → every
-    rebalance), then the shared head-to-head / significance / caveats, then (private only)
-    the research lab — the 64-config grid the config was chosen from + supporting data."""
+    """One page, one framework: the adopted-stack headline, then the strategy REGISTRY
+    (every strategy on one canonical basis + the parallel equity chart), then per-family
+    detail (momentum book, ensemble, vol core), significance, live ops, risk &
+    robustness, caveats — and (private only) the research lab with the raw reference
+    and the 64-config grid."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cfg = d["strategy"]
     body = "".join([
-        "<h1>Momentum strategy — risk-managed</h1>",
+        "<h1>Strategy — adopted stack &amp; registry</h1>",
         f"<p class='dim'>generated {now} · config {cfg.code} · "
         f"<a href='report.html'>← portfolio</a></p>",
         # ── the real result, up top: risk-conscious out-of-sample + Monte-Carlo validation ──
         sec_headline(d),
         sec_intro(d),
-        # ── the risk-conscious book, front to back ──
+        # ── the framework: every strategy in parallel, one basis, one chart ──
+        sec_registry(d, public),
+        sec_parallel_curves(d, public),
+        # ── momentum family detail ──
         sec_picks_compare(d),
-        sec_curve_compare(d),
-        sec_significance(d, public),      # Monte-Carlo validation right behind the honest curve
-        sec_factor_regression(d, public), # spanning test: edge vs factor beta (observational)
-        sec_ensemble(d, public),          # pre-registered selection-variance fix
-        sec_vol_core(d, public),          # adopted overlay: the one pre-registered-gate pass
-        sec_track(d, public),             # live path vs backtest, pre-registered kills
-        sec_venture(d, public),           # north star vs same-cashflow shadow + DD ladder
-        sec_ritual(d, public),            # private ops checklist + freshness alarms
         sec_perf_compare(d, public),
         sec_grade_compare(d, public),
         sec_yearly_compare(d, public),
         sec_timeline_compare(d),
+        sec_ensemble(d, public),          # pre-registered selection-variance fix
+        # ── vol-managed core detail ──
+        sec_vol_core(d, public),          # adopted overlay: the one pre-registered-gate pass
+        # ── significance & factor spanning ──
+        sec_significance(d, public),
+        sec_factor_regression(d, public),
+        # ── live operations ──
+        sec_track(d, public),             # live path vs backtest, pre-registered kills
+        sec_venture(d, public),           # north star vs same-cashflow shadow + DD ladder
+        sec_ritual(d, public),            # private ops checklist + freshness alarms
+        sec_vs_portfolio(d, public),
+        # ── risk & robustness ──
         sec_diagnostics(d, public),
         sec_regime(d, public),
         sec_scenarios(d, public),
-        sec_vs_portfolio(d, public),
         # ── the limitations, in their own section (not the headline) ──
         sec_caveat(d),
         sec_delisting_stress(d, public),
@@ -1923,7 +2192,8 @@ def main():
     local = ROOT / "local/strategy.html"
     local.parent.mkdir(exist_ok=True)
     local.write_text(build(d))                          # live/local only — no docs/ export
-    print(f"wrote {local}  (strategy {d['strategy'].code}: original + risk-conscious + lab)")
+    print(f"wrote {local}  (strategy {d['strategy'].code}: registry of "
+          f"{len(d.get('registry') or [])} records + lab)")
     if args.open:
         webbrowser.open(local.as_uri())
 

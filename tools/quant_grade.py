@@ -47,6 +47,23 @@ def perf_metrics(equity: pd.Series) -> dict:
                 worst_day=float(r.min()), best_day=float(r.max()))
 
 
+def window_metrics(equity: pd.Series, lo, hi) -> dict:
+    """Canonical display metrics over the [lo, hi] slice of an equity curve:
+    `perf_metrics` of the slice plus the slice's net_return. Slice boundaries follow
+    the same convention as momentum_grid._stats_slice (lo/hi inclusive via .loc), so
+    the canonical numbers cover exactly the dates the pre-registered selection stats
+    cover — only the Sharpe basis differs (geometric here vs arithmetic there).
+    Display-only: selection/adoption rules never read this."""
+    eq = equity.dropna().loc[lo:hi]
+    if len(eq) < 21:
+        return {}
+    m = perf_metrics(eq)
+    if not m:
+        return {}
+    m["net_return"] = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
+    return m
+
+
 def vs_benchmark(equity: pd.Series, bench: pd.Series) -> dict:
     """CAPM-style attribution vs a benchmark equity/price series: beta, annual alpha,
     correlation, tracking error, information ratio, up/down capture."""

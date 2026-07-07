@@ -366,7 +366,9 @@ def sec_grid(d: dict) -> str:
             "<b>validation</b> Sharpe; train = 2018–21 "
             "(picks the config), validation = 2022–23, <b>test = 2024→ (held out, never "
             "informs the pick)</b>. A config you'd trust holds up across all three — "
-            "especially test.</p>"
+            "especially test. <i>Basis note: these Sharpes are the pre-registered selection "
+            "criterion (arithmetic √252 per window) — intentionally not the canonical geometric "
+            "basis the strategy page's registry table quotes.</i></p>"
             "<table><tr><th>Cfg</th><th class='num'>Train ret</th><th class='num'>Train Sh</th>"
             "<th class='num'>Val ret</th><th class='num'>Val Sh</th>" + test_hdr +
             "<th class='num'>Trades/yr</th></tr>" + "".join(rows) + "</table>")

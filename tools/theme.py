@@ -97,6 +97,10 @@ td.num, th.num {{ text-align: right; }}
 .cmp.stretch > .note {{ height: 100%; margin: 0; }}      /* notes fill the cell, same level */
 .cmp .pick-sub {{ min-height: 2em; margin-bottom: 6px; }} /* align table tops across columns */
 @media (max-width: 760px) {{ .cmp {{ grid-template-columns: 1fr; }} }}
+.badge {{ display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 0.68rem;
+          font-family: {MONO}; text-transform: uppercase; letter-spacing: 0.05em;
+          border: 1px solid {GRID}; white-space: nowrap; }}
+tr.dimrow td {{ color: {FG_DIM}; }}
 details {{ margin: 10px 0; }}
 summary {{ cursor: pointer; color: {ACCENT}; font-size: 0.9rem; }}
 a {{ color: {ACCENT}; text-decoration: none; }}
