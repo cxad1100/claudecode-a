@@ -69,7 +69,8 @@ def _fake_d():
     eff_bets = [dict(date=h["date"], n_eff_pca=3.0 + 0.1 * i, pc1_share=0.4,
                      n_eff_weight=5.0, k=5)
                 for i, h in enumerate(res["holdings_log"]) if h["picks"]]
-    return dict(prices=px, res=res, benchmarks=benchmarks, capital=10_000.0,
+    track = dict(n=12, needed=63, kill=False, reasons=[], path="local/strategy_track.csv")
+    return dict(prices=px, res=res, benchmarks=benchmarks, capital=10_000.0, track=track,
                 meta={t: dict(name=t, local_id="000", country="X", sector="Y") for t in px.columns},
                 strategy=bs.STRATEGY, quant=quant, variants=variants,
                 registry=registry, ew_eq=ew_eq, portfolio_roi=portfolio_roi, vs_scale=None,
@@ -204,6 +205,22 @@ def test_registry_metrics_are_uniform_across_surfaces():
     assert s_txt in ui.sec_perf_compare(d, public=False)
     # and the headline names the live book instead of quoting a different variant
     assert live.name.split(" — ")[0] in ui.sec_headline(d)
+
+
+def test_family_frames_and_scoped_momentum_data():
+    d = _fake_d()
+    html = bs.build(d, public=False)
+    # one framed block per family, variants nested inside
+    assert html.count("class='family'") == 2          # momentum + vol-managed core
+    assert "Momentum family</h2>" in html and "Vol-managed core</h2>" in html
+    assert "★ contains the live tracked book" in html
+    # live tracking sits INSIDE the live momentum dossier, not in Operations
+    assert html.index("Live tracking — pre-registered kill criteria") \
+        < html.index("Operations — stack-level")
+    # the lab is explicitly momentum-scoped
+    assert "Research lab — momentum family" in html
+    # data-first: explainer paragraphs fold behind the tables, legends stay one-line
+    assert "how to read this table" in html and "class='legend'" in html
 
 
 def test_family_ordering_is_contiguous():

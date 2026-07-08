@@ -75,6 +75,15 @@ details.ev > summary {{ color: {theme.FG}; font-size: 0.88rem; }}
 details.ev > summary .eyebrow {{ display: inline; margin-right: 10px; }}
 details.ev[open] {{ padding-bottom: 14px; }}
 details.ev h2 {{ margin-top: 18px; font-size: 1.0rem; }}
+/* one FAMILY = one framed block; its variants are the nested dossier cards */
+.family {{ border: 1px solid {theme.GRID}; border-top: 3px solid {theme.ACCENT};
+           border-radius: 10px; padding: 6px 18px 12px; margin: 28px 0;
+           background: {theme.BG}; }}
+.family > .famhead {{ display: flex; flex-wrap: wrap; gap: 4px 14px;
+                      align-items: baseline; margin: 8px 0 2px; }}
+.family > .famhead h2 {{ margin: 0; border: 0; padding: 0; font-size: 1.2rem; }}
+.family > .famhead .dim {{ font-size: 0.82rem; }}
+.legend {{ color: {theme.FG_DIM}; font-size: 0.82rem; margin: 4px 0 8px; }}
 </style>"""
 
 
@@ -322,20 +331,24 @@ def sec_registry(d: dict, public: bool) -> str:
             "<div class='scroll'><table><tr><th>Status</th><th>Strategy</th><th>Family</th>"
             "<th>Verdict</th></tr>"
             + "".join(ledger) + "</table></div></details>")
+    how = ("<p class='dim'>One row per strategy, all metrics computed by the <b>same "
+           "canonical function</b> (geometric daily basis) over the <b>same windows</b> — "
+           f"<b>{WIN_LABELS['test']}</b> is the held-out comparison window. Cost models "
+           "differ by row (the Costs column names each); the Monte-Carlo / deflated-Sharpe "
+           "numbers in the momentum dossier use a <i>gross per-rebalance</i> basis by design "
+           "— selection vs noise, costs hit a random book equally. A future strategy joins "
+           "this table (and everything below) as one registry record.</p>")
     return (
         "<h2>Strategy registry — every strategy, one basis</h2>"
-        "<p class='dim'>One row per strategy, all metrics computed by the <b>same canonical "
-        "function</b> (geometric daily basis) over the <b>same windows</b> — "
-        f"<b>{WIN_LABELS['test']}</b> is the held-out comparison window. <b>★ = the live "
-        "tracked book.</b> Cost models differ by row; Monte-Carlo / deflated-Sharpe numbers "
-        "in the momentum dossier use a <i>gross per-rebalance</i> basis by design. A future "
-        "strategy joins this table (and everything below) as one registry record.</p>"
+        f"<p class='legend'>★ = live tracked book · {WIN_LABELS['test']} = held-out window "
+        "· one canonical metric basis</p>"
         "<div class='scroll'><table><tr><th>Status</th><th>Strategy</th>"
         f"<th class='num'>{WIN_LABELS['test']} Sharpe</th><th class='num'>Test ret</th>"
         "<th class='num'>Test maxDD</th><th class='num'>Full Sharpe</th>"
         "<th class='num'>Ann. vol</th><th class='num'>Avg exp</th>"
         "<th>Costs</th><th>Gate / verdict</th></tr>"
         + "".join(rows) + "</table></div>"
+        + _fold("how to read this table", "metric basis, windows, cost models", how)
         + ledger_html)
 
 
@@ -373,14 +386,16 @@ def sec_parallel_curves(d: dict, public: bool) -> str:
     pf_note = ("" if public else
                " Your real book is cash-flow-timed, so it is compared honestly in "
                "<b>You vs the strategies</b> below, not force-rebased onto this chart.")
+    how = ("<p class='dim'>Every live/candidate strategy over the <b>same walk-forward "
+           "window</b>, rebased to 100 at the common start, vs the equal-weight basket of "
+           "the first picks (survivorship-honest baseline) and the benchmark ETFs. "
+           "<i>(The raw full-invested curve — inflated by survivorship and full exposure — "
+           "stays in the research lab.)</i>" + pf_note + "</p>")
     return ("<h2>Walk-forward equity — strategies vs benchmarks</h2>"
-            "<p class='dim'>Every live/candidate strategy over the <b>same walk-forward "
-            "window</b>, rebased to 100 at the common start, vs the equal-weight basket of "
-            "the first picks (survivorship-honest baseline) and the benchmark ETFs. Click "
-            "legend entries to toggle lines. <i>(The raw full-invested curve — inflated by "
-            "survivorship and full exposure — stays in the research lab.)</i>"
-            + pf_note + "</p>"
-            f"<div class='chart'>{fig_html(fig)}</div>")
+            "<p class='legend'>index = 100 at common start · click legend entries to "
+            "toggle lines</p>"
+            f"<div class='chart'>{fig_html(fig)}</div>"
+            + _fold("how to read this chart", "window, rebasing, what's excluded", how))
 
 
 def _matrix_records(d: dict) -> list:
@@ -426,15 +441,18 @@ def sec_perf_compare(d: dict, public: bool) -> str:
         f"<tr><td>{WIN_LABELS[k]}</td>" +
         "".join(cell(r.windows.get(k)) for r in recs) + "</tr>"
         for k in ("train", "val", "test", "full"))
+    how = (f"<p class='dim'>Windows: <b>{WIN_LABELS['train']}</b> (used to pick the config) · "
+           f"<b>{WIN_LABELS['val']}</b> (used to compare configs) · <b>{WIN_LABELS['test']} "
+           "(held out — never touched the choice)</b>. "
+           "<b>The test row is the only truly out-of-sample number</b>. Cells show return, "
+           "Sharpe (S) and max drawdown (DD) on the canonical basis.</p>")
     return ("<h2>Performance — all strategies, same windows</h2>"
-            f"<p class='dim'>Windows: <b>{WIN_LABELS['train']}</b> (used to pick the config) · "
-            f"<b>{WIN_LABELS['val']}</b> (used to compare configs) · <b>{WIN_LABELS['test']} "
-            "(held out — never touched the choice)</b>. "
-            "<b>The test row is the only truly out-of-sample number</b>. Cells show return, "
-            "Sharpe (S) and max drawdown (DD) on the canonical basis.</p>"
+            f"<p class='legend'>cells: return · S = Sharpe · DD = max drawdown — "
+            f"<b>{WIN_LABELS['test']} row is the out-of-sample one</b></p>"
             f"<div class='cards'>{''.join(cards)}</div>"
             "<div class='scroll'><table><tr><th>Window</th>"
-            + heads + f"</tr>{rows}</table></div>")
+            + heads + f"</tr>{rows}</table></div>"
+            + _fold("how to read these windows", "what train/validation/test mean", how))
 
 
 def _yearly_returns(series: pd.Series) -> pd.Series:
@@ -488,11 +506,10 @@ def sec_yearly_compare(d: dict, public: bool) -> str:
                if pnl is not None else "")
         rows.append(f"<tr><td class='mono'>{y}</td>{cells}{b}{eur}</tr>")
     return ("<h2>Yearly P&amp;L — all strategies</h2>"
-            "<p class='dim'>Calendar-year net return of every strategy in parallel (first year "
-            f"from each curve's inception), vs the S&amp;P 500. {years[0]} and {years[-1]} are "
-            "part-years."
-            + (" ★ P&amp;L = the live book's euro result at paper capital." if pnl is not None
-               else "") + "</p>"
+            f"<p class='legend'>calendar-year net returns · {years[0]} and {years[-1]} are "
+            "part-years"
+            + (" · ★ P&amp;L = live book € at paper capital" if pnl is not None else "")
+            + "</p>"
             "<div class='scroll'><table><tr><th>Year</th>"
             + heads + "<th class='num'>S&amp;P 500</th>" + eur_h + "</tr>"
             + "".join(rows) + "</table></div>")
@@ -588,6 +605,22 @@ def _timeline_col(d: dict, v: dict) -> str:
     return f"<div style='font-size:0.78rem;line-height:1.7'>{''.join(lines)}</div>"
 
 
+def _track_fold(d: dict, public: bool) -> str:
+    """Live-tracking fold for whichever dossier is the ★ live book — the kill
+    criteria belong to the tracked strategy, not to the page."""
+    t = d.get("track")
+    body = sec_track(d, public)
+    if not t or not body:
+        return ""
+    if t["n"] < t["needed"]:
+        s = f"accruing {t['n']}/{t['needed']} sessions — kill rules not armed yet"
+    elif t.get("kill"):
+        s = "<b class='neg'>KILL signal live</b>"
+    else:
+        s = "no kill signal — live path within the backtest's error bars"
+    return _fold("live tracking", s, body)
+
+
 _TIMELINE_KEY = ("Each line = one rebalance's picks, colored by that period's return — "
                  "<span style='color:#0a6b00'>■</span> ≥+20% · "
                  "<span style='color:#46c84e'>■</span> up · "
@@ -614,6 +647,7 @@ def _dossier_mom_ens(d: dict, r, public: bool) -> str:
         for sl in sleeves)
     method = _fold("method", "Pre-registered selection-variance fix — adoption rule "
                              "and basis", sec_ensemble(d, public))
+    track = _track_fold(d, public) if r.live else ""
     return _dossier(
         r.color,
         ("adopted · ★ live book" if adopt else "candidate · on the bench"),
@@ -622,7 +656,8 @@ def _dossier_mom_ens(d: dict, r, public: bool) -> str:
         f"single {e.get('single_min', 0):.2f} − 0.05 → "
         + ("<b>ADOPTED</b>" if adopt else "bench") +
         " · fees per sleeve · buy every sleeve to hold this book",
-        (f"<div class='par'>{panels}</div>" if panels else "") + method + history)
+        (f"<div class='par'>{panels}</div>" if panels else "")
+        + track + method + history)
 
 
 def _dossier_mom_rc(d: dict, r, public: bool) -> str:
@@ -638,6 +673,7 @@ def _dossier_mom_rc(d: dict, r, public: bool) -> str:
                     f"<p class='dim'>{_TIMELINE_KEY} Shows the book return after "
                     "vol-scaling and average exposure (<span class='mono'>@x%</span>).</p>"
                     + _timeline_col(d, rc))
+    track = _track_fold(d, public) if r.live else ""
     return _dossier(
         r.color,
         ("variant · single-config reference" if ens_live else "adopted · ★ live book"),
@@ -646,7 +682,7 @@ def _dossier_mom_rc(d: dict, r, public: bool) -> str:
         f"remainder in cash · honest grade "
         f"<b style='color:{_GRADE_COLOR[grade['letter']]}'>{grade['letter']}</b>"
         + ("" if ens_live else " · the tracked book"),
-        f"<div class='par'>{book}</div>" + g_details + history)
+        f"<div class='par'>{book}</div>" + track + g_details + history)
 
 
 def _dossier_vol_core(d: dict, r, public: bool) -> str:
@@ -752,24 +788,40 @@ def _momentum_evidence(d: dict, public: bool) -> str:
         body)
 
 
+_FAMILY_TITLE = {"momentum": "Momentum family",
+                 "vol-managed core": "Vol-managed core"}
+
+
 def sec_dossiers(d: dict, public: bool) -> str:
-    """One dossier per strategy, registry-driven. Families render contiguously; the
-    momentum family's shared evidence closes its block. Any future registry record
-    gets a card automatically (generic fallback)."""
+    """One FRAMED block per strategy family (the drawn line), its variants as nested
+    dossier cards inside, the family's shared evidence closing the block. Registry-
+    driven: any future record gets a card automatically (generic fallback)."""
     recs = [r for r in sreg.family_ordered(d.get("registry") or [])
             if r.status in ("adopted", "candidate", "variant")]
     if not recs:
         return ""
     fam_order = list(dict.fromkeys(r.family for r in recs))
-    cards = []
+    blocks = []
     for fam in fam_order:
-        for r in (r for r in recs if r.family == fam):
-            cards.append(DOSSIER_BUILDERS.get(r.id, _dossier_generic)(d, r, public))
-        if fam == "momentum":              # family evidence closes the momentum family
+        members = [r for r in recs if r.family == fam]
+        color = next((r.color for r in members if r.live),
+                     members[0].color or theme.ACCENT)
+        cards = [DOSSIER_BUILDERS.get(r.id, _dossier_generic)(d, r, public)
+                 for r in members]
+        if fam == "momentum":              # family evidence closes the momentum block
             cards.append(_momentum_evidence(d, public))
+        live_note = ("★ contains the live tracked book"
+                     if any(r.live for r in members) else
+                     f"{len(members)} variant{'s' if len(members) != 1 else ''}")
+        title = _FAMILY_TITLE.get(fam, fam.capitalize())
+        blocks.append(
+            f"<section class='family' style='border-top-color:{color}'>"
+            f"<div class='famhead'><span class='eyebrow'>strategy family</span>"
+            f"<h2>{title}</h2><span class='dim'>{live_note}</span></div>"
+            + "".join(cards) + "</section>")
     return ("<div class='band'><span class='eyebrow'>Strategy dossiers — "
             "what each strategy holds now, its verdict, its method, its history</span>"
-            + "".join(cards) + "</div>")
+            + "".join(blocks) + "</div>")
 
 
 # ── Per-family method / evidence sections (rendered inside dossiers) ─────────────
@@ -1610,16 +1662,17 @@ def render(d: dict, public: bool = False) -> str:
               sec_perf_compare(d, public),
               sec_yearly_compare(d, public)),
         sec_dossiers(d, public),
-        _band("Operations — the live path is the only test that settles it",
-              sec_track(d, public),
+        _band("Operations — stack-level: north star, ritual, your real book",
               sec_venture(d, public),
               sec_ritual(d, public),
               sec_vs_portfolio(d, public)),
         ("".join([
             "<hr style='margin:3rem 0;border:0;border-top:2px solid #333'>",
-            "<h1>Research lab</h1><p class='dim'>How the config above was chosen — the whole "
-            "64-config grid it was picked from, the raw full-invested reference, and the supporting "
-            "data. Skip unless you want the workings.</p>",
+            "<h1>Research lab — momentum family (private)</h1>"
+            "<p class='dim'>The momentum family's workings only: how its config was chosen "
+            "(the whole 64-config grid), the raw full-invested reference, and the supporting "
+            "data. Other families keep their workings on their own lab pages (vol lab, edge, "
+            "econo). Skip unless you want the details.</p>",
             sec_raw_reference(d), sec_survivorship(d), sec_grid(d), sec_feasibility(d),
             sec_timelines(d), sec_method(),
         ]) if not public else ""),
