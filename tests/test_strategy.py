@@ -253,9 +253,9 @@ def test_headline_leads_with_real_results():
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
     assert "Deflated Sharpe" in h or "P(true" in h
     assert "live tracked book" in h                               # names what the tracker runs
-    # it leads the page: registry, parallel chart, then the parallel buy sheet
+    # it leads the page: overview band (registry, chart), then the dossiers
     assert (html.index("The result") < html.index("Strategy registry")
-            < html.index("Walk-forward equity") < html.index("The books"))
+            < html.index("Walk-forward equity") < html.index("Strategy dossiers"))
 
 
 def test_headline_no_euro_amounts():
@@ -300,18 +300,19 @@ def test_parallel_chart_traces():
     assert "Your portfolio" not in h
 
 
-def test_books_shows_every_strategy_in_parallel():
-    """The buy sheet: one panel per book — ensemble sleeves, the single book, the
-    vol core's ETF action — each with tradeable rows (ticker/ISIN/weight)."""
+def test_dossiers_show_every_strategy_in_parallel():
+    """One dossier card per strategy — ensemble (sleeve order sheets), the single
+    book, the vol core's ETF action — each clearly bounded and tradeable."""
     d = _fake_d()
-    h = bs.sec_books(d, public=False)
-    assert "The books" in h and "what each strategy holds now" in h
-    # every ensemble sleeve gets its own panel (the live book here)
+    h = bs.sec_dossiers(d, public=False)
+    assert "Strategy dossiers" in h and "what each strategy holds now" in h
+    assert h.count("class='dossier'") == 3          # ensemble · single book · vol core
+    # every ensemble sleeve gets its own order sheet (the live book here)
     for code in d["ensemble"]["codes"]:
         assert code in h
-    assert "Ensemble sleeve 1/3" in h and "★" in h
-    # the single risk-conscious book is a parallel panel, not the page's only focus
-    assert "Risk-conscious single book" in h
+    assert "Sleeve 1/3" in h and "★ live book" in h
+    # the single risk-conscious book is its own dossier, not the page's only focus
+    assert "Momentum single book" in h
     # the vol core is actionable too: the ETF row + today's target exposure
     assert "IWDA" in h and "IE00B4L5Y983" in h and "today's order" in h
     # tradeable rows for the momentum picks
@@ -319,8 +320,28 @@ def test_books_shows_every_strategy_in_parallel():
     for t in picks:
         disp = str(d["meta"][t].get("home") or t).split(".")[0]
         assert f">{disp}<" in h
-    # parallel layout container
-    assert "class='par'" in h
+    # method folded inside each dossier, parallel panel layout inside
+    assert "class='par'" in h and h.count("details class='ev'") >= 3
+
+
+def test_command_strip_reads_the_stack_state():
+    d = _fake_d()
+    h = bs.sec_command(d, public=False)
+    assert "live book" in h and "★" in h
+    assert "ens[" in h                               # ensemble adopted in the fixture
+    assert "core exposure" in h and "IWDA" in h
+    assert "grade" in h
+    assert "€" not in bs.sec_command(d, public=True)
+
+
+def test_evidence_band_folds_with_visible_verdicts():
+    html = bs.build(_fake_d(), public=False)
+    assert "Evidence &amp; risk" in html
+    # verdict summaries visible, workings folded
+    assert "selection beats" in html and "random books (p" in html
+    assert "details class='ev'" in html
+    # the survivorship caveat is NOT folded away as a whole
+    assert "The dominant caveat" in html
 
 
 def test_perf_matrix_has_one_column_per_strategy():
@@ -382,7 +403,7 @@ def test_phantom_trials_block_shows_decay_and_harvey():
 
 def test_no_info_dropped_from_page():
     html = bs.build(_fake_d(), public=False)
-    for phrase in ["Strategy registry", "Registry ledger", "The books",
+    for phrase in ["Strategy registry", "Registry ledger", "Strategy dossiers",
                    "what each strategy holds now",
                    "Walk-forward equity", "Performance — all strategies",
                    "Quant scorecard", "Deflated Sharpe",

@@ -107,6 +107,27 @@ tr.dimrow td {{ color: {FG_DIM}; }}
 .par > div {{ min-width: 0; background: {BG_PANEL}; border: 1px solid {GRID};
               border-radius: 6px; padding: 10px 14px; }}
 .par h3 {{ margin-top: 0; }}
+/* ── strategy-dossier system (strategy page) ─────────────────────────────── */
+.eyebrow {{ font-family: {MONO}; font-size: 0.66rem; text-transform: uppercase;
+            letter-spacing: 0.14em; color: {FG_DIM}; display: block; margin-bottom: 2px; }}
+.band {{ margin-top: 64px; }}
+.band > .eyebrow {{ border-bottom: 1px solid {GRID}; padding-bottom: 6px;
+                    margin-bottom: 14px; font-size: 0.72rem; }}
+.dossier {{ border: 1px solid {GRID}; border-left: 4px solid {ACCENT}; border-radius: 8px;
+            background: {BG_PANEL}; padding: 16px 20px 14px; margin: 18px 0; }}
+.dossier > h3 {{ margin: 0 0 2px; font-size: 1.05rem; }}
+.dossier .vline {{ margin: 4px 0 10px; font-size: 0.85rem; color: {FG_DIM}; }}
+.dossier .par > div {{ background: {BG}; }}
+.cmd {{ display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: baseline;
+        font-family: {MONO}; font-size: 0.82rem; background: {BG_PANEL};
+        border: 1px solid {GRID}; border-radius: 8px; padding: 10px 16px; margin: 14px 0; }}
+.cmd b {{ font-weight: 600; }}
+details.ev {{ border: 1px solid {GRID}; border-radius: 6px; padding: 8px 14px;
+              margin: 10px 0; background: {BG_PANEL}; }}
+details.ev > summary {{ color: {FG}; font-size: 0.88rem; }}
+details.ev > summary .eyebrow {{ display: inline; margin-right: 10px; }}
+details.ev[open] {{ padding-bottom: 14px; }}
+details.ev h2 {{ margin-top: 18px; font-size: 1.0rem; }}
 details {{ margin: 10px 0; }}
 summary {{ cursor: pointer; color: {ACCENT}; font-size: 0.9rem; }}
 a {{ color: {ACCENT}; text-decoration: none; }}
