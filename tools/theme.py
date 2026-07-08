@@ -84,7 +84,7 @@ table {{ border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.88
 th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid {GRID}; }}
 th {{ color: {FG_DIM}; font-weight: 500; font-size: 0.78rem; text-transform: uppercase;
      letter-spacing: 0.04em; }}
-td.num, th.num {{ text-align: right; }}
+td.num, th.num {{ text-align: right; white-space: nowrap; }}
 .note {{ background: {BG_PANEL}; border-left: 3px solid {ACCENT}; border-radius: 4px;
          padding: 10px 14px; margin: 12px 0; font-size: 0.88rem; }}
 .warn {{ border-left-color: {YELLOW}; }}
@@ -102,11 +102,13 @@ td.num, th.num {{ text-align: right; }}
           border: 1px solid {GRID}; white-space: nowrap; }}
 tr.dimrow td {{ color: {FG_DIM}; }}
 /* parallel per-strategy panels — as many columns as fit, stack on narrow screens */
-.par {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+.par {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
         gap: 1.2rem; align-items: start; margin: 12px 0; }}
 .par > div {{ min-width: 0; background: {BG_PANEL}; border: 1px solid {GRID};
-              border-radius: 6px; padding: 10px 14px; }}
+              border-radius: 6px; padding: 10px 14px; overflow-x: auto; }}
 .par h3 {{ margin-top: 0; }}
+.par table {{ font-size: 0.8rem; }}
+.par td, .par th {{ padding: 4px 8px; }}
 /* ── strategy-dossier system (strategy page) ─────────────────────────────── */
 .eyebrow {{ font-family: {MONO}; font-size: 0.66rem; text-transform: uppercase;
             letter-spacing: 0.14em; color: {FG_DIM}; display: block; margin-bottom: 2px; }}

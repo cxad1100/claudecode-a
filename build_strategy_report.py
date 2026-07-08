@@ -958,24 +958,21 @@ def sec_intro(d: dict) -> str:
 # ── The books: what each strategy holds NOW, in parallel ────────────────────────
 
 def _picks_rows(d: dict, cur: dict, weight_pct: float) -> str:
-    """Rows of one book: ticker / name / ISIN / country / momentum score / weight."""
+    """Rows of one book: ticker / name / ISIN / weight (ISIN is the tradeable id)."""
     rows = []
     for t in cur["picks"]:
         m = d["meta"].get(t, {})
         home = str(m.get("home") or t).split(".")[0]
         isin = m.get("isin") if pd.notna(m.get("isin")) else ""
-        sc = cur["scores"].get(t, float("nan"))
         rows.append(
             f"<tr><td class='mono'>{home}</td><td>{_name(m, t)}</td>"
             f"<td class='dim mono' style='font-size:0.72rem'>{isin}</td>"
-            f"<td>{m.get('country', '—')}</td>"
-            f"<td class='num mono'>{sc * 100:+.1f}%</td>"
             f"<td class='num mono'>{weight_pct:.1f}%</td></tr>")
     return "".join(rows)
 
 
-_BOOK_HEAD = ("<table><tr><th>Ticker</th><th>Name</th><th>ISIN</th><th>Country</th>"
-              "<th class='num'>12-1 mom</th><th class='num'>Weight</th></tr>")
+_BOOK_HEAD = ("<table><tr><th>Ticker</th><th>Name</th><th>ISIN</th>"
+              "<th class='num'>Weight</th></tr>")
 
 
 def _book_panel(d: dict, title: str, color: str, holdings_log: list, *,
@@ -996,8 +993,7 @@ def _book_panel(d: dict, title: str, color: str, holdings_log: list, *,
     cash = 100.0 * weight_scale - invested
     if exposure_latest is not None and cash > 0.05:
         rows += (f"<tr><td class='mono dim'>CASH</td><td class='dim'>de-risked sleeve</td>"
-                 f"<td></td><td></td><td class='num dim'>—</td>"
-                 f"<td class='num mono'>{cash:.1f}%</td></tr>")
+                 f"<td></td><td class='num mono'>{cash:.1f}%</td></tr>")
     sub = (f"<p class='dim pick-sub'>top-{n} · <b>{invested:.0f}% of total capital</b>"
            f"{sub_note} · {cur['date'].date()}</p>")
     return f"<div>{head}{sub}{_BOOK_HEAD}{rows}</table></div>"
@@ -1022,72 +1018,183 @@ def _fold(eyebrow: str, summary: str, body: str) -> str:
             f"{summary}</summary>{body}</details>")
 
 
-def sec_dossiers(d: dict, public: bool) -> str:
-    """One dossier per strategy — what it holds now (the order sheet), its verdict
-    and gate, and its method folded underneath. Clear distinction, equal billing."""
-    rc = d["variants"][1]
+def _dossier_mom_ens(d: dict, r, public: bool) -> str:
     e = d.get("ensemble") or {}
     adopt = bool(e.get("adopt"))
-    out = ["<div class='band'><span class='eyebrow'>Strategy dossiers — "
-           "what each strategy holds now, its verdict, its method</span>"]
-
     sleeves = e.get("sleeves") or []
-    if e:
-        panels = "".join(
-            _book_panel(d, f"Sleeve {i}/{len(sleeves)} — {sl['code']}", "#c586c0",
-                        sl["holdings_log"], weight_scale=1.0 / len(sleeves),
-                        sub_note=" · equal capital")
-            for i, sl in enumerate(sleeves, 1)) if sleeves else ""
-        method = _fold("method", "Pre-registered selection-variance fix — adoption rule "
-                                 "and basis", sec_ensemble(d, public))
-        out.append(_dossier(
-            "#c586c0",
-            ("adopted · ★ live book" if adopt else "candidate · on the bench"),
-            f"Momentum ensemble — top-{e.get('n', 3)} quarterly, equal capital",
-            f"Adoption rule (ex ante): ensemble min(train,val) {e.get('ens_min', 0):.2f} ≥ "
-            f"single {e.get('single_min', 0):.2f} − 0.05 → "
-            + ("<b>ADOPTED</b>" if adopt else "bench") +
-            " · fees per sleeve · buy every sleeve to hold this book",
-            (f"<div class='par'>{panels}</div>" if panels else "") + method))
+    panels = "".join(
+        _book_panel(d, f"Sleeve {i}/{len(sleeves)} — {sl['code']}", r.color,
+                    sl["holdings_log"], weight_scale=1.0 / len(sleeves),
+                    sub_note=" · equal capital")
+        for i, sl in enumerate(sleeves, 1)) if sleeves else ""
+    history = "".join(
+        _fold("history", f"Every rebalance — sleeve {sl['code']}",
+              _timeline_col(d, dict(key="sleeve", short=f"Sleeve {sl['code']}",
+                                    color=r.color, equity=None, exposure=None,
+                                    holdings_log=sl["holdings_log"])))
+        for sl in sleeves)
+    method = _fold("method", "Pre-registered selection-variance fix — adoption rule "
+                             "and basis", sec_ensemble(d, public))
+    return _dossier(
+        r.color,
+        ("adopted · ★ live book" if adopt else "candidate · on the bench"),
+        f"Momentum ensemble — top-{e.get('n', 3)} quarterly, equal capital",
+        f"Adoption rule (ex ante): ensemble min(train,val) {e.get('ens_min', 0):.2f} ≥ "
+        f"single {e.get('single_min', 0):.2f} − 0.05 → "
+        + ("<b>ADOPTED</b>" if adopt else "bench") +
+        " · fees per sleeve · buy every sleeve to hold this book",
+        (f"<div class='par'>{panels}</div>" if panels else "") + method + history)
 
+
+def _dossier_mom_rc(d: dict, r, public: bool) -> str:
+    rc = d["variants"][1]
+    ens_live = r.status == "variant"       # variant ⇔ the ensemble is the live book
     grade = rc["grade"]
+    book = _book_panel(d, "Current book", r.color, rc["holdings_log"],
+                       exposure_latest=rc.get("exposure_latest", 1.0),
+                       sub_note=" · vol-targeted, rest in cash")
     g_details = _fold("method", "Quant scorecard &amp; honest grade — the full metric set",
                       sec_grade_compare(d, public))
-    out.append(_dossier(
-        C_RC,
-        ("variant · single-config reference" if adopt else "adopted · ★ live book"),
+    history = _fold("history", "Every rebalance — risk-conscious book",
+                    _timeline_col(d, rc))
+    return _dossier(
+        r.color,
+        ("variant · single-config reference" if ens_live else "adopted · ★ live book"),
         f"Momentum single book — risk-conscious (vol-target {RISK_TARGET_VOL:.0%})",
         f"The same selection, one config, scaled to {RISK_TARGET_VOL:.0%} vol with the "
         f"remainder in cash · honest grade "
-        f"<b style='color:{_GRADE_COLOR[grade['letter']]}'>{grade['letter']}</b>",
-        f"<div class='par'>{_book_panel(d, 'Current book', C_RC, rc['holdings_log'], exposure_latest=rc.get('exposure_latest', 1.0), sub_note=' · vol-targeted, rest in cash')}</div>"
-        + g_details))
+        f"<b style='color:{_GRADE_COLOR[grade['letter']]}'>{grade['letter']}</b>"
+        + ("" if ens_live else " · the tracked book"),
+        f"<div class='par'>{book}</div>" + g_details + history)
 
-    v = d.get("vol_core")
-    if v:
-        act = ""
-        if v.get("w_now") is not None:
-            act = (f"<p class='mono'>today's order: hold <b>{v['w_now'] * 100:.0f}%</b> of core "
-                   f"capital in IWDA.AS (forecast vol {v['fc_now'] * 100:.1f}%, "
-                   f"as of {v['asof']})</p>")
-        book = ("<div><h3 style='color:#569cd6'>Current book</h3>"
-                "<p class='dim pick-sub'>one ETF, exposure steered by the GARCH forecast</p>"
-                + _BOOK_HEAD +
-                "<tr><td class='mono'>IWDA</td><td>iShares Core MSCI World</td>"
-                "<td class='dim mono' style='font-size:0.72rem'>IE00B4L5Y983</td>"
-                "<td>IE</td><td class='num dim'>—</td>"
-                f"<td class='num mono'>{(v.get('w_now') or 0) * 100:.0f}%</td></tr></table>"
-                + act + "</div>")
-        method = _fold("method", "GARCH(1,1) forecast, band rebalancing, gate table",
-                       sec_vol_core(d, public))
-        out.append(_dossier(
-            "#569cd6", "adopted · passive sleeve",
-            "GARCH vol-managed IWDA core",
-            "The one overlay that cleared <b>pre-registered</b> gates (vol lab) — "
-            "risk-adjusted return on the same asset: smaller drawdowns, cash in turbulence",
-            f"<div class='par'>{book}</div>" + method))
-    out.append("</div>")
-    return "".join(out)
+
+def _dossier_vol_core(d: dict, r, public: bool) -> str:
+    v = d.get("vol_core") or {}
+    act = ""
+    if v.get("w_now") is not None:
+        act = (f"<p class='mono'>today's order: hold <b>{v['w_now'] * 100:.0f}%</b> of core "
+               f"capital in IWDA.AS (forecast vol {v['fc_now'] * 100:.1f}%, "
+               f"as of {v['asof']})</p>")
+    book = ("<div><h3 style='color:#569cd6'>Current book</h3>"
+            "<p class='dim pick-sub'>one ETF, exposure steered by the GARCH forecast</p>"
+            + _BOOK_HEAD +
+            "<tr><td class='mono'>IWDA</td><td>iShares Core MSCI World</td>"
+            "<td class='dim mono' style='font-size:0.72rem'>IE00B4L5Y983</td>"
+            f"<td class='num mono'>{(v.get('w_now') or 0) * 100:.0f}%</td></tr></table>"
+            + act + "</div>")
+    method = _fold("method", "GARCH(1,1) forecast, band rebalancing, gate table — full "
+                             "tournament on the vol lab page", sec_vol_core(d, public))
+    return _dossier(
+        r.color, "adopted · passive sleeve",
+        "GARCH vol-managed IWDA core",
+        "The one overlay that cleared <b>pre-registered</b> gates (vol lab) — "
+        "risk-adjusted return on the same asset: smaller drawdowns, cash in turbulence",
+        f"<div class='par'>{book}</div>" + method)
+
+
+def _dossier_generic(d: dict, r, public: bool) -> str:
+    """Any future registry record renders a dossier automatically: status, verdict,
+    canonical windows, link to its lab page. Richer detail = add a builder to
+    _DOSSIER_BUILDERS — that plus the make_record() call is the whole contract."""
+    rows = "".join(
+        f"<tr><td>{WIN_LABELS[k]}</td>{_perf_cells(r.windows.get(k, {}))}</tr>"
+        for k in ("train", "val", "test", "full")) if r.windows else ""
+    body = (("<table><tr><th>Window</th><th class='num'>Ret</th><th class='num'>Sharpe</th>"
+             f"<th class='num'>Max DD</th></tr>{rows}</table>") if rows else "")
+    if r.href:
+        body += f"<p class='dim'><a href='{r.href}'>full workings ↗</a></p>"
+    return _dossier(
+        r.color or theme.ACCENT,
+        r.status + (" · ★ live book" if r.live else ""),
+        r.name, r.gate or r.verdict or "—", body)
+
+
+# Bespoke dossier builders by registry id; anything else falls back to the generic
+# card. Adding a future strategy = one make_record() (it renders immediately) and,
+# when it earns one, a builder entry here.
+_DOSSIER_BUILDERS = {
+    "mom_ens": _dossier_mom_ens,
+    "mom_rc": _dossier_mom_rc,
+    "vol_core": _dossier_vol_core,
+}
+
+
+def _momentum_evidence(d: dict, public: bool) -> str:
+    """The momentum family's shared evidence — significance, factor spanning,
+    diagnostics, regime, scenarios, survivorship, delisting stress. These grade the
+    SELECTION shared by the ensemble and the single book; they are family-scoped,
+    not page-global (the vol core has its own gate table on the vol lab page)."""
+    s = d["significance"]
+    mc, dsr = s["mc"], s["dsr"]
+    beat = 100.0 * (1.0 - mc["p_sharpe"])
+    dsr_txt = f" · DSR {dsr['dsr']:.0%}" if dsr["dsr"] == dsr["dsr"] else ""
+    sig_sum = (f"selection beats <b>{beat:.1f}%</b> of random books "
+               f"(p {mc['p_sharpe']:.3f}){dsr_txt} — Monte Carlo, deflation, bootstrap")
+    fr = d.get("factor_reg")
+    fac_sum = ""
+    if fr:
+        key = "FF5+WML" if "FF5+WML" in fr["raw"] else next(iter(fr["raw"]))
+        m = fr["raw"][key]
+        fac_sum = (f"{key} α {m['alpha_ann'] * 100:+.1f}%/yr (t {m['alpha_t']:.1f}) — "
+                   + ("residual selection edge" if m["alpha_t"] >= 2.0
+                      else "not separable from momentum beta"))
+    ra = d.get("regime_attr")
+    reg_sum = ""
+    if ra:
+        st_ = ra["strip"]
+        retain = (st_["strip_test_sharpe"] / st_["full_test_sharpe"] * 100
+                  if st_["full_test_sharpe"] else 0.0)
+        reg_sum = (f"<b>{retain:.0f}%</b> of the selection Sharpe survives ex AI/Defense; "
+                   f"pre-{TEST_FROM[:-1]} tape positive — regime-boosted, not regime-created")
+    sc = d.get("scenarios")
+    scen_sum = ""
+    if sc:
+        t50 = (float(sc["scenarios"]["base"]["term_p50"]) - 1) * 100
+        b50 = (float(sc["scenarios"]["bear"]["term_p50"]) - 1) * 100
+        scen_sum = (f"1y medians — base <b>{t50:+.0f}%</b>, bear <b>{b50:+.0f}%</b> "
+                    "(block bootstrap, sensitivity not forecast)")
+    body = "".join([
+        _fold("significance", sig_sum, sec_significance(d, public)),
+        _fold("factor spanning", fac_sum, sec_factor_regression(d, public)),
+        _fold("diagnostics", "HMM regime + PCA effective bets — observational, never "
+                             "traded", sec_diagnostics(d, public)),
+        _fold("regime attribution", reg_sum, sec_regime(d, public)),
+        _fold("scenario fan", scen_sum, sec_scenarios(d, public)),
+        sec_caveat(d),
+        _fold("delisting stress", "bull/base/bear injected-delisting grid — does the "
+                                  "edge survive missing corpses?",
+              sec_delisting_stress(d, public)),
+    ])
+    return _dossier(
+        theme.FG_DIM, "momentum family · shared evidence",
+        "Momentum family — evidence &amp; risk",
+        "These tests grade the momentum <b>selection</b> shared by the ensemble and the "
+        "single book — family-scoped, not page-global. Verdicts visible; workings folded.",
+        body)
+
+
+def sec_dossiers(d: dict, public: bool) -> str:
+    """One dossier per strategy, registry-driven — what it holds now, its verdict, its
+    method and its history, all inside its own card. Any future registry record gets a
+    card automatically (generic fallback); the momentum family's shared evidence is its
+    own clearly-scoped card at the end of the family."""
+    recs = [r for r in sreg.ordered(d.get("registry") or [])
+            if r.status in ("adopted", "candidate", "variant")]
+    if not recs:
+        return ""
+    # group by family (families in first-appearance order) so one strategy family
+    # reads as one contiguous block; its shared evidence closes the block
+    fam_order = list(dict.fromkeys(r.family for r in recs))
+    cards = []
+    for fam in fam_order:
+        members = [r for r in recs if r.family == fam]
+        for r in members:
+            cards.append(_DOSSIER_BUILDERS.get(r.id, _dossier_generic)(d, r, public))
+        if fam == "momentum":              # family evidence closes the momentum family
+            cards.append(_momentum_evidence(d, public))
+    return ("<div class='band'><span class='eyebrow'>Strategy dossiers — "
+            "what each strategy holds now, its verdict, its method, its history</span>"
+            + "".join(cards) + "</div>")
 
 
 # ── Strategy registry: the one leaderboard + the one parallel chart ─────────────
@@ -2308,41 +2415,6 @@ def build(d: dict, public: bool = False) -> str:
     OPERATIONS → HISTORY — and (private) the research lab."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cfg = d["strategy"]
-
-    # one-line verdicts for the evidence folds (the body carries the workings)
-    s = d["significance"]
-    mc, dsr = s["mc"], s["dsr"]
-    beat = 100.0 * (1.0 - mc["p_sharpe"])
-    dsr_txt = f" · DSR {dsr['dsr']:.0%}" if dsr["dsr"] == dsr["dsr"] else ""
-    sig_sum = (f"selection beats <b>{beat:.1f}%</b> of random books "
-               f"(p {mc['p_sharpe']:.3f}){dsr_txt} — Monte Carlo, deflation, bootstrap")
-    fr = d.get("factor_reg")
-    fac_sum = ""
-    if fr:
-        key = "FF5+WML" if "FF5+WML" in fr["raw"] else next(iter(fr["raw"]))
-        m = fr["raw"][key]
-        fac_sum = (f"{key} α {m['alpha_ann'] * 100:+.1f}%/yr (t {m['alpha_t']:.1f}) — "
-                   + ("residual selection edge" if m["alpha_t"] >= 2.0
-                      else "not separable from momentum beta"))
-    ra = d.get("regime_attr")
-    reg_sum = ""
-    if ra:
-        st_ = ra["strip"]
-        retain = (st_["strip_test_sharpe"] / st_["full_test_sharpe"] * 100
-                  if st_["full_test_sharpe"] else 0.0)
-        reg_sum = (f"<b>{retain:.0f}%</b> of the selection Sharpe survives ex AI/Defense; "
-                   f"pre-{TEST_FROM[:-1]} tape positive — regime-boosted, not regime-created")
-    sc = d.get("scenarios")
-    scen_sum = ""
-    if sc:
-        t50 = (float(sc["scenarios"]["base"]["term_p50"]) - 1) * 100
-        b50 = (float(sc["scenarios"]["bear"]["term_p50"]) - 1) * 100
-        scen_sum = (f"1y medians — base <b>{t50:+.0f}%</b>, bear <b>{b50:+.0f}%</b> "
-                    "(block bootstrap, sensitivity not forecast)")
-    diag_sum = "HMM regime + PCA effective bets — observational, never traded"
-    stress_sum = ("bull/base/bear injected-delisting grid — does the edge survive "
-                  "missing corpses?")
-
     body = "".join([
         "<h1>Strategy — adopted stack &amp; registry</h1>",
         f"<p class='dim'>generated {now} · config {cfg.code} · "
@@ -2351,32 +2423,21 @@ def build(d: dict, public: bool = False) -> str:
         sec_command(d, public),
         sec_headline(d),
         sec_intro(d),
-        # ── OVERVIEW: every strategy on one basis ──
+        # ── OVERVIEW: every strategy on one basis (the comparison, first) ──
         _band("Overview — every strategy, one canonical basis",
               sec_registry(d, public),
               sec_parallel_curves(d, public),
               sec_perf_compare(d, public),
               sec_yearly_compare(d, public)),
-        # ── STRATEGY DOSSIERS (emits its own band) ──
+        # ── STRATEGY DOSSIERS: one self-contained card per strategy —
+        #    book, verdict, method, history; family evidence scoped inside ──
         sec_dossiers(d, public),
-        # ── EVIDENCE & RISK: verdicts visible, workings folded; caveat unfolded ──
-        _band("Evidence &amp; risk — verdicts up front, workings folded",
-              _fold("significance", sig_sum, sec_significance(d, public)),
-              _fold("factor spanning", fac_sum, sec_factor_regression(d, public)),
-              _fold("diagnostics", diag_sum, sec_diagnostics(d, public)),
-              _fold("regime attribution", reg_sum, sec_regime(d, public)),
-              _fold("scenario fan", scen_sum, sec_scenarios(d, public)),
-              sec_caveat(d),
-              _fold("delisting stress", stress_sum, sec_delisting_stress(d, public))),
         # ── OPERATIONS: live path, north star, ritual, your real book ──
         _band("Operations — the live path is the only test that settles it",
               sec_track(d, public),
               sec_venture(d, public),
               sec_ritual(d, public),
               sec_vs_portfolio(d, public)),
-        # ── HISTORY ──
-        _band("History — every rebalance of every book",
-              sec_timeline_compare(d)),
         # ── the lab (private/live only): how this config was chosen + the raw reference ──
         ("".join([
             "<hr style='margin:3rem 0;border:0;border-top:2px solid #333'>",

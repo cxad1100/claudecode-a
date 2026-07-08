@@ -306,7 +306,14 @@ def test_dossiers_show_every_strategy_in_parallel():
     d = _fake_d()
     h = bs.sec_dossiers(d, public=False)
     assert "Strategy dossiers" in h and "what each strategy holds now" in h
-    assert h.count("class='dossier'") == 3          # ensemble · single book · vol core
+    # ensemble · single book · family evidence · vol core — each its own card
+    assert h.count("class='dossier'") == 4
+    # the shared evidence is explicitly family-scoped, and closes the momentum family
+    assert "Momentum family — evidence" in h and "family-scoped, not page-global" in h
+    assert (h.index("Momentum single book") < h.index("Momentum family — evidence")
+            < h.index("GARCH vol-managed IWDA core"))
+    # per-book history folds live inside the dossiers
+    assert "Every rebalance — sleeve" in h and "Every rebalance — risk-conscious" in h
     # every ensemble sleeve gets its own order sheet (the live book here)
     for code in d["ensemble"]["codes"]:
         assert code in h
@@ -336,7 +343,7 @@ def test_command_strip_reads_the_stack_state():
 
 def test_evidence_band_folds_with_visible_verdicts():
     html = bs.build(_fake_d(), public=False)
-    assert "Evidence &amp; risk" in html
+    assert "evidence &amp; risk" in html
     # verdict summaries visible, workings folded
     assert "selection beats" in html and "random books (p" in html
     assert "details class='ev'" in html
@@ -407,7 +414,7 @@ def test_no_info_dropped_from_page():
                    "what each strategy holds now",
                    "Walk-forward equity", "Performance — all strategies",
                    "Quant scorecard", "Deflated Sharpe",
-                   "Yearly P&amp;L", "every rebalance", "survivorship is NOT corrected",
+                   "Yearly P&amp;L", "Every rebalance", "survivorship is NOT corrected",
                    "Regime", "Concentration", "Capacity", "Research lab"]:
         assert phrase in html, f"dropped: {phrase!r}"
 
