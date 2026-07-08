@@ -59,7 +59,8 @@ def _fake_d():
     portfolio_roi = pd.Series(np.linspace(0.0, 20.0, 300), index=idx[200:])
     registry = bs.build_registry(variants, ensemble=ens_full, vol_core=vol_core,
                                  vol_core_eq=vol_core_eq, bench=benchmarks, ew_eq=ew_eq,
-                                 portfolio_roi=portfolio_roi)
+                                 portfolio_roi=portfolio_roi,
+                                 train_end=TE, val_end=VE)
     # observational diagnostics (synthetic, small) — read-only HMM regime + PCA effective bets
     ridx = idx[200:]
     ramp = np.linspace(0.2, 0.8, len(ridx))
@@ -192,14 +193,30 @@ def test_registry_public_hides_portfolio_row_and_euro():
 
 
 def test_registry_metrics_are_uniform_across_surfaces():
-    """The SAME canonical number (same function, same window) appears in the headline,
-    the leaderboard row and the performance table — no more four Sharpe bases."""
+    """The SAME canonical number (same function, same window) for the ★ LIVE book
+    appears in the headline, the leaderboard row and the performance matrix — no
+    more different numbers under the same label."""
     d = _fake_d()
-    t = d["variants"][1]["windows"]["test"]
-    s_txt = f"{t['sharpe']:.2f}"
+    live = next(r for r in d["registry"] if r.live)
+    s_txt = f"{live.windows['test']['sharpe']:.2f}"
     assert s_txt in ui.sec_headline(d)
     assert s_txt in ui.sec_registry(d, public=False)
     assert s_txt in ui.sec_perf_compare(d, public=False)
+    # and the headline names the live book instead of quoting a different variant
+    assert live.name.split(" — ")[0] in ui.sec_headline(d)
+
+
+def test_family_ordering_is_contiguous():
+    d = _fake_d()
+    recs = sreg.family_ordered(d["registry"])
+    fams = [r.family for r in recs if r.status in ("adopted", "candidate", "variant",
+                                                   "reference")]
+    # momentum block unbroken: ens, rc, raw together, never split by vol core
+    first_mom, last_mom = fams.index("momentum"), len(fams) - 1 - fams[::-1].index("momentum")
+    assert all(f == "momentum" for f in fams[first_mom:last_mom + 1])
+    h = ui.sec_registry(d, public=False)
+    assert (h.index("Momentum ensemble") < h.index("Risk-conscious")
+            < h.index("raw (unmanaged)") < h.index("GARCH vol-managed IWDA core"))
 
 
 def test_window_labels_derive_from_constants():

@@ -192,48 +192,52 @@ def sec_command(d: dict, public: bool) -> str:
     return f"<div class='cmd'>{''.join(items)}</div>"
 
 
+def _live_record(d: dict):
+    return next((r for r in (d.get("registry") or []) if r.live), None)
+
+
 def sec_headline(d: dict) -> str:
-    """The real result, up top — two sentences and the stat tiles, no essay. The
-    inflated raw full-invested number lives in the research lab."""
+    """The real result, up top — the ★ LIVE book's own numbers (never a different
+    variant's under the same label), two sentences, stat tiles. The inflated raw
+    full-invested number lives in the research lab."""
     rc = d["variants"][1]
+    live = _live_record(d)
+    lw = (live.windows if live is not None else None) or {}
+    t = lw.get("test") or rc.get("windows", {}).get("test") or rc["test"]
+    full = lw.get("full") or rc.get("windows", {}).get("full") or {}
+    ann_vol = full.get("ann_vol", rc["perf"]["ann_vol"])
+    max_dd = full.get("max_dd", rc["perf"]["max_dd"])
+    live_name = live.name if live is not None else rc["label"]
     s = d["significance"]
     mc, dsr, ci = s["mc"], s["dsr"], s["ci"]
-    t = rc.get("windows", {}).get("test") or rc["test"]     # canonical basis
     g = rc["grade"]["letter"]
     beat = 100.0 * (1.0 - mc["p_sharpe"])
     ph = s.get("dsr_phantom") or []
     worst = ph[-1]["dsr"] if ph else dsr["dsr"]
     dsr_ok = dsr["dsr"] == dsr["dsr"]                       # not NaN
     cards = "".join([
-        _card("Out-of-sample Sharpe", f"{t['sharpe']:.2f}"),
-        _card("Out-of-sample return", _pct(t["net_return"] * 100)),
-        _card("Max drawdown", _pct(rc["perf"]["max_dd"] * 100)),
+        _card("★ Live test Sharpe", f"{t['sharpe']:.2f}"),
+        _card("★ Live test return", _pct(t["net_return"] * 100)),
+        _card("★ Live max drawdown", _pct(max_dd * 100)),
         _card("Beats random books", f"{beat:.1f}%"),
         _card("Deflated Sharpe (P real&gt;0)", f"{dsr['dsr']:.0%}" if dsr_ok else "—"),
-        _card("Honest grade", g),
+        _card("Single-book grade", g),
     ])
-    e = d.get("ensemble")
-    live_txt = ""
-    if e:
-        live_txt = ((f" The <b>live tracked book</b> is the pre-registered top-{e.get('n', 3)} "
-                     "ensemble; the adopted GARCH IWDA core runs the passive sleeve — every "
-                     "strategy has its own dossier below.")
-                    if e.get("adopt") else
-                    " The ensemble stayed on the bench (ex-ante rule); the single config is "
-                    "the <b>live tracked book</b>. Every strategy has its own dossier below.")
     dsr_txt = (f" · Deflated Sharpe P(true&gt;0) <b>{dsr['dsr']:.0%}</b>"
                f" (phantom-worst {worst:.0%})" if dsr_ok else "")
     return (
         "<h2>The result</h2>"
         f"<div class='note' style='border-left-color:{C_RC};border-left-width:6px'>"
-        f"On the <b>held-out test window ({TEST_FROM})</b>, run the way you'd hold it "
-        f"(vol-targeted {_rc_target(d):.0%}, de-risk only): <b>{_pct(t['net_return'] * 100)}</b> "
-        f"at <b>{rc['perf']['ann_vol'] * 100:.0f}% vol</b>, <b>Sharpe {t['sharpe']:.2f}</b>, "
-        f"max drawdown <b>{_pct(rc['perf']['max_dd'] * 100)}</b>.{live_txt} "
-        f"<b>Monte Carlo</b>: the selection beats <b>{beat:.1f}%</b> of {mc['n_trials']:,} random "
-        f"books (p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}){dsr_txt} · bootstrap {ci['conf']}% Sharpe CI "
-        f"<b>{ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}</b> — full evidence inside the momentum "
-        "family dossier below.</div>"
+        f"On the <b>held-out test window ({TEST_FROM})</b> the ★ <b>live tracked book</b> — "
+        f"<b>{live_name}</b> — made <b>{_pct(t['net_return'] * 100)}</b> at "
+        f"<b>{ann_vol * 100:.0f}% vol</b>, <b>Sharpe {t['sharpe']:.2f}</b>, max drawdown "
+        f"<b>{_pct(max_dd * 100)}</b> (canonical basis; full-history risk). "
+        f"<b>Monte Carlo</b>, selection-level: it beats <b>{beat:.1f}%</b> of "
+        f"{mc['n_trials']:,} random books (p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}){dsr_txt} · "
+        f"bootstrap {ci['conf']}% Sharpe CI <b>{ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}</b>. "
+        f"The honest grade <b style='color:{_GRADE_COLOR[g]}'>{g}</b> scores the single-config "
+        "risk-conscious variant. Every strategy has its own dossier below; the full evidence "
+        "sits in the momentum family card.</div>"
         f"<div class='cards'>{cards}</div>")
 
 
@@ -265,7 +269,7 @@ def sec_registry(d: dict, public: bool) -> str:
     """The strategy registry — every strategy the program has produced, one row each,
     on ONE canonical metric basis. ★ = the live tracked book. Killed / cut /
     cross-page strategies live in the collapsed ledger below — visible file-drawer."""
-    recs = sreg.ordered(d.get("registry") or [])
+    recs = sreg.family_ordered(d.get("registry") or [])
     if not recs:
         return ""
     main_status = ("adopted", "candidate", "variant", "benchmark", "reference", "portfolio")
@@ -340,7 +344,7 @@ def sec_parallel_curves(d: dict, public: bool) -> str:
     start — against the equal-weight baseline and the benchmarks."""
     res = d["res"]
     window = _equity_window(res)
-    recs = [r for r in sreg.ordered(d.get("registry") or [])
+    recs = [r for r in sreg.family_ordered(d.get("registry") or [])
             if r.equity is not None and "inflated" not in r.flags
             and r.status in ("adopted", "candidate", "variant")]
     if not recs:
@@ -381,7 +385,7 @@ def sec_parallel_curves(d: dict, public: bool) -> str:
 
 def _matrix_records(d: dict) -> list:
     """Registry records that belong in the parallel analytics matrices."""
-    return [r for r in sreg.ordered(d.get("registry") or [])
+    return [r for r in sreg.family_ordered(d.get("registry") or [])
             if r.windows and "inflated" not in r.flags
             and r.status in ("adopted", "candidate", "variant", "benchmark")]
 
@@ -393,17 +397,20 @@ def sec_perf_compare(d: dict, public: bool) -> str:
     if not recs:
         return ""
     rc = d["variants"][1]
-    t = rc.get("windows", {}).get("test") or rc["test"]
-    full_ret = (rc.get("windows", {}).get("full") or {}).get(
-        "net_return", rc["full"]["net_return"])
+    live = _live_record(d)
+    lw = (live.windows if live is not None else None) or rc.get("windows", {})
+    t = lw.get("test") or rc["test"]
+    full = lw.get("full") or {}
     cards = [
-        _card("Live test return", _pct(t["net_return"] * 100)),
-        _card("Live test Sharpe", f"{t['sharpe']:.2f}"),
-        _card("Max DD", _pct(rc["perf"]["max_dd"] * 100)),
-        _card("Ann. vol", _pct(rc["perf"]["ann_vol"] * 100, signed=False)),
+        _card("★ Live test return", _pct(t["net_return"] * 100)),
+        _card("★ Live test Sharpe", f"{t['sharpe']:.2f}"),
+        _card("★ Live max DD", _pct(full.get("max_dd", rc["perf"]["max_dd"]) * 100)),
+        _card("★ Live ann. vol",
+              _pct(full.get("ann_vol", rc["perf"]["ann_vol"]) * 100, signed=False)),
     ]
-    if not public:
-        cards.append(_card("Net P&L", f"€{full_ret * d['capital']:+,.0f}"))
+    if not public and full.get("net_return") is not None:
+        cards.append(_card("Net P&L (live, full)",
+                           f"€{full['net_return'] * d['capital']:+,.0f}"))
     heads = "".join(
         f"<th class='num' style='color:{r.color or theme.FG}'>"
         f"{'★ ' if r.live else ''}{r.name}</th>" for r in recs)
@@ -749,7 +756,7 @@ def sec_dossiers(d: dict, public: bool) -> str:
     """One dossier per strategy, registry-driven. Families render contiguously; the
     momentum family's shared evidence closes its block. Any future registry record
     gets a card automatically (generic fallback)."""
-    recs = [r for r in sreg.ordered(d.get("registry") or [])
+    recs = [r for r in sreg.family_ordered(d.get("registry") or [])
             if r.status in ("adopted", "candidate", "variant")]
     if not recs:
         return ""

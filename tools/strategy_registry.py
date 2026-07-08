@@ -103,6 +103,31 @@ def ordered(records) -> list:
     return sorted(records, key=lambda r: _STATUS_RANK.get(r.status, 99))
 
 
+# Strategy statuses (a family's own rows) vs context rows appended after them.
+_STRAT_STATUS = ("adopted", "candidate", "variant", "reference")
+
+
+def family_ordered(records) -> list:
+    """Family-contiguous ordering: strategy families render as unbroken blocks
+    (ranked by each family's best status), members within a family by status rank,
+    then the context rows (benchmarks, portfolio) and the ledger states. This is the
+    reading order for the registry table, the matrices and the dossiers — a family's
+    variants never get split by another strategy."""
+    strat = [r for r in records if r.status in _STRAT_STATUS]
+    rest = ordered([r for r in records if r.status not in _STRAT_STATUS])
+    fam_rank = {}
+    for r in strat:
+        rank = _STATUS_RANK.get(r.status, 99)
+        if r.family not in fam_rank or rank < fam_rank[r.family]:
+            fam_rank[r.family] = rank
+    fams = sorted(fam_rank, key=lambda f: fam_rank[f])
+    out = []
+    for f in fams:
+        out.extend(sorted((r for r in strat if r.family == f),
+                          key=lambda r: _STATUS_RANK.get(r.status, 99)))
+    return out + rest
+
+
 def assign_colors(records) -> None:
     """Fill missing colors from the theme palette, skipping colors already claimed."""
     used = {r.color for r in records if r.color}

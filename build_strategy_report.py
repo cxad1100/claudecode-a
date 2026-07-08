@@ -146,7 +146,8 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
 
 
 def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=None,
-                   bench=None, ew_eq=None, portfolio_roi=None) -> list:
+                   bench=None, ew_eq=None, portfolio_roi=None,
+                   train_end=TRAIN_END, val_end=VAL_END) -> list:
     """Normalize everything gather() computed into StrategyRecords — the ONE list every
     comparison surface (leaderboard, parallel chart, dossiers) renders. Adding a future
     strategy = one make_record() call here (curve-bearing) or one STATIC_RECORDS entry
@@ -162,7 +163,7 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
         recs.append(sreg.make_record(
             "mom_ens", f"Momentum ensemble — top-{ensemble['n']} quarterly ({codes})",
             "momentum", "adopted" if ens_adopt else "candidate",
-            equity=ensemble["equity"], train_end=TRAIN_END, val_end=VAL_END,
+            equity=ensemble["equity"], train_end=train_end, val_end=val_end,
             adopted="2026-07-06" if ens_adopt else None,
             cost_model=f"slip + €{FEE_EUR:.0f}/order per sleeve",
             avg_exposure=1.0,
@@ -175,7 +176,7 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
         "variant" if ens_adopt else "adopted",
         variant_of="mom_ens" if ens_adopt else None,
         equity=rc["equity"], windows=rc.get("windows"),
-        train_end=TRAIN_END, val_end=VAL_END,
+        train_end=train_end, val_end=val_end,
         cost_model=f"slip + €{FEE_EUR:.0f} + {RC_TURN_BPS:.0f}bp resize",
         avg_exposure=rc["perf"].get("avg_exposure"),
         gate=None if ens_adopt else "single pick_ultimate book (ensemble on the bench)",
@@ -184,7 +185,7 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
         "mom_raw", "Momentum — raw (unmanaged)", "momentum", "reference",
         variant_of="mom_rc",
         equity=raw["equity"], windows=raw.get("windows"),
-        train_end=TRAIN_END, val_end=VAL_END,
+        train_end=train_end, val_end=val_end,
         cost_model=f"slip + €{FEE_EUR:.0f} · full-invested",
         avg_exposure=1.0,
         verdict="reference — inflated (survivorship + full exposure on a high-vol book); "
@@ -193,7 +194,7 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
     if vol_core_eq is not None and vol_core:
         recs.append(sreg.make_record(
             "vol_core", "GARCH vol-managed IWDA core", "vol-managed core", "adopted",
-            equity=vol_core_eq, train_end=TRAIN_END, val_end=VAL_END,
+            equity=vol_core_eq, train_end=train_end, val_end=val_end,
             adopted="2026-07-05",
             cost_model="5bp band-rebalance + €1",
             avg_exposure=vol_core.get("managed", {}).get("avg_exposure"),
@@ -206,12 +207,12 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
                 recs.append(sreg.make_record(
                     rid, f"{col} (buy-hold)", "benchmark", "benchmark",
                     equity=bench[col].dropna().loc[start:],
-                    train_end=TRAIN_END, val_end=VAL_END,
+                    train_end=train_end, val_end=val_end,
                     cost_model="—", avg_exposure=1.0))
     if ew_eq is not None:
         recs.append(sreg.make_record(
             "ew_baseline", "Equal-weight initial picks (buy-hold)", "benchmark",
-            "benchmark", equity=ew_eq, train_end=TRAIN_END, val_end=VAL_END,
+            "benchmark", equity=ew_eq, train_end=train_end, val_end=val_end,
             cost_model="—", avg_exposure=1.0, color=theme.FG_DIM))
     if portfolio_roi is not None and not getattr(portfolio_roi, "empty", True):
         curve = 1.0 + portfolio_roi / 100.0
