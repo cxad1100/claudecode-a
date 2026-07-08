@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 import build_strategy_report as bs
+import strategy_ui as ui
 from tools import quant_grade as qg
 from tools import strategy_registry as sreg
 from tools.momentum import run_momentum
@@ -167,7 +168,7 @@ def test_registry_live_row_follows_adoption_rule():
 
 def test_registry_leaderboard_renders_rows_and_ledger():
     d = _fake_d()
-    h = bs.sec_registry(d, public=False)
+    h = ui.sec_registry(d, public=False)
     assert "Strategy registry" in h
     assert "★" in h                                          # live row marked
     assert "reference, inflated" in h                        # raw row flagged
@@ -184,7 +185,7 @@ def test_registry_leaderboard_renders_rows_and_ledger():
 
 def test_registry_public_hides_portfolio_row_and_euro():
     d = _fake_d()
-    h = bs.sec_registry(d, public=True)
+    h = ui.sec_registry(d, public=True)
     assert "Your portfolio" not in h
     euros = re.findall(r"€[0-9][0-9.,]*", h)
     assert all(e == "€1" for e in euros), euros
@@ -196,9 +197,9 @@ def test_registry_metrics_are_uniform_across_surfaces():
     d = _fake_d()
     t = d["variants"][1]["windows"]["test"]
     s_txt = f"{t['sharpe']:.2f}"
-    assert s_txt in bs.sec_headline(d)
-    assert s_txt in bs.sec_registry(d, public=False)
-    assert s_txt in bs.sec_perf_compare(d, public=False)
+    assert s_txt in ui.sec_headline(d)
+    assert s_txt in ui.sec_registry(d, public=False)
+    assert s_txt in ui.sec_perf_compare(d, public=False)
 
 
 def test_window_labels_derive_from_constants():
@@ -218,8 +219,8 @@ def test_future_strategy_is_one_record():
                            equity=eq, train_end=TE, val_end=VE,
                            cost_model="slip + €1")
     d2 = dict(d, registry=list(d["registry"]) + [rec])
-    assert "Shiny new thing" in bs.sec_registry(d2, public=False)
-    assert "Shiny new thing" in bs.sec_parallel_curves(d2, public=False)
+    assert "Shiny new thing" in ui.sec_registry(d2, public=False)
+    assert "Shiny new thing" in ui.sec_parallel_curves(d2, public=False)
     assert rec.since == str(eq.dropna().index[0].date())
     assert set(rec.windows) == {"train", "val", "test", "full"}
 
@@ -247,7 +248,7 @@ def test_headline_leads_with_real_results():
     html = bs.build(d, public=False)
     # the old alarmist "the headline is inflated" banner is gone
     assert "Read this first" not in html
-    h = bs.sec_headline(d)
+    h = ui.sec_headline(d)
     assert "The result" in h                                      # confident, real-results lead
     assert "Monte Carlo" in h                                     # the validation up front
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
@@ -259,7 +260,7 @@ def test_headline_leads_with_real_results():
 
 
 def test_headline_no_euro_amounts():
-    assert "€" not in bs.sec_headline(_fake_d())                  # percentages / Sharpe only
+    assert "€" not in ui.sec_headline(_fake_d())                  # percentages / Sharpe only
 
 
 def test_raw_vanity_is_off_the_main_page():
@@ -279,7 +280,7 @@ def test_raw_reference_lives_only_in_the_lab():
     # raw isn't deleted — it's demoted to the lab as an inflation reference
     marker = "Raw Original — reference only"
     assert marker in html and html.index(marker) > html.index("Research lab")
-    h = bs.sec_raw_reference(d)
+    h = ui.sec_raw_reference(d)
     assert "reference" in h.lower() and "inflated" in h.lower()   # framed as inflated, not a headline
     # public build drops the whole lab (and the raw with it)
     assert "Research lab" not in bs.build(d, public=True)
@@ -287,7 +288,7 @@ def test_raw_reference_lives_only_in_the_lab():
 
 def test_parallel_chart_traces():
     d = _fake_d()
-    h = bs.sec_parallel_curves(d, public=False)
+    h = ui.sec_parallel_curves(d, public=False)
     assert "Walk-forward equity" in h
     assert "Momentum ensemble" in h                              # the live book (★)
     assert "★" in h or "\\u2605" in h                            # Plotly JSON-escapes the star
@@ -304,7 +305,7 @@ def test_dossiers_show_every_strategy_in_parallel():
     """One dossier card per strategy — ensemble (sleeve order sheets), the single
     book, the vol core's ETF action — each clearly bounded and tradeable."""
     d = _fake_d()
-    h = bs.sec_dossiers(d, public=False)
+    h = ui.sec_dossiers(d, public=False)
     assert "Strategy dossiers" in h and "what each strategy holds now" in h
     # ensemble · single book · family evidence · vol core — each its own card
     assert h.count("class='dossier'") == 4
@@ -333,12 +334,12 @@ def test_dossiers_show_every_strategy_in_parallel():
 
 def test_command_strip_reads_the_stack_state():
     d = _fake_d()
-    h = bs.sec_command(d, public=False)
+    h = ui.sec_command(d, public=False)
     assert "live book" in h and "★" in h
     assert "ens[" in h                               # ensemble adopted in the fixture
     assert "core exposure" in h and "IWDA" in h
     assert "grade" in h
-    assert "€" not in bs.sec_command(d, public=True)
+    assert "€" not in ui.sec_command(d, public=True)
 
 
 def test_evidence_band_folds_with_visible_verdicts():
@@ -353,7 +354,7 @@ def test_evidence_band_folds_with_visible_verdicts():
 
 def test_perf_matrix_has_one_column_per_strategy():
     d = _fake_d()
-    h = bs.sec_perf_compare(d, public=False)
+    h = ui.sec_perf_compare(d, public=False)
     assert "all strategies, same windows" in h
     assert "Momentum ensemble" in h and "Risk-conscious" in h
     assert "GARCH vol-managed IWDA core" in h
@@ -364,26 +365,24 @@ def test_perf_matrix_has_one_column_per_strategy():
 
 def test_yearly_matrix_has_one_column_per_strategy():
     d = _fake_d()
-    h = bs.sec_yearly_compare(d, public=False)
+    h = ui.sec_yearly_compare(d, public=False)
     assert "Yearly P&amp;L — all strategies" in h
     assert "Momentum ensemble" in h and "Risk-conscious" in h
     assert "S&amp;P 500" in h
     assert "★ P&amp;L" in h                       # the live book's € column (private)
-    assert "€" not in bs.sec_yearly_compare(d, public=True)
+    assert "€" not in ui.sec_yearly_compare(d, public=True)
 
 
-def test_history_has_one_timeline_per_book():
+def test_history_folds_live_inside_dossiers():
     d = _fake_d()
-    h = bs.sec_timeline_compare(d)
-    assert "History — every rebalance" in h
-    assert h.count("<details>") == 4              # rc + 3 ensemble sleeves
-    assert "Risk-conscious single book" in h
-    for code in d["ensemble"]["codes"]:
-        assert code in h
+    h = ui.sec_dossiers(d, public=False)
+    # one history fold per momentum book: 3 sleeves + the single rc book
+    assert h.count("Every rebalance — sleeve") == 3
+    assert h.count("Every rebalance — risk-conscious") == 1
 
 
 def test_grade_section_has_no_scare_box():
-    h = bs.sec_grade_compare(_fake_d(), public=False)
+    h = ui.sec_grade_compare(_fake_d(), public=False)
     assert "Quant scorecard" in h
     assert "not clean alpha" not in h.lower()                    # the mid-page red box is gone
     # the grade + honest deductions still render, just calmly
@@ -399,7 +398,7 @@ def test_significance_section_rendered_once():
 
 
 def test_phantom_trials_block_shows_decay_and_harvey():
-    html = bs.sec_significance(_fake_d(), public=False)
+    html = ui.sec_significance(_fake_d(), public=False)
     assert "file-drawer" in html.lower() and "phantom trials" in html.lower()
     # the ladder shows the grid-only and the raised lifetime counts
     assert "Grid only" in html and "×5 lifetime" in html and "×10 lifetime" in html
@@ -426,7 +425,7 @@ def test_strategy_public_no_euro_amounts():
 
 
 def test_diagnostics_section_renders_both_lenses():
-    html = bs.sec_diagnostics(_fake_d(), public=False)
+    html = ui.sec_diagnostics(_fake_d(), public=False)
     assert "HMM" in html and "Effective bets" in html
     assert "not traded" in html                                   # observational framing, explicit
     assert "agreement" in html.lower() and "sector-neutral" in html  # the candid takeaways
@@ -440,7 +439,7 @@ def test_diagnostics_sits_before_caveats_in_page():
 
 def test_caveat_shows_onpopulation_survivorship_result():
     d = _fake_d()
-    html = bs.sec_caveat(d)
+    html = ui.sec_caveat(d)
     # the on-population injection answers the ~2%-overlap complaint with a number
     assert "On-population" in html
     assert "held a name into its delisting" in html
@@ -452,7 +451,7 @@ def test_caveat_shows_onpopulation_survivorship_result():
 
 def test_caveat_quotes_the_headline_test_number():
     d = _fake_d()
-    html = bs.sec_caveat(d)
+    html = ui.sec_caveat(d)
     rc_ret = d["variants"][1]["windows"]["test"]["net_return"] * 100
     assert f"{rc_ret:+.0f}%" in html                             # risk-conscious, not the raw figure
     assert "risk-conscious book" in html
@@ -461,7 +460,7 @@ def test_caveat_quotes_the_headline_test_number():
 def test_caveat_graceful_without_injection():
     d = _fake_d()
     d.pop("surv_inject")
-    html = bs.sec_caveat(d)                                       # gather() may have skipped it
+    html = ui.sec_caveat(d)                                       # gather() may have skipped it
     assert "On-population" not in html                            # no half-rendered study
     assert "survivorship is NOT corrected" in html.lower() or "NOT corrected" in html
 
@@ -470,12 +469,12 @@ def test_diagnostics_absent_renders_nothing():
     d = _fake_d()
     d.pop("regime")
     d.pop("eff_bets")
-    assert bs.sec_diagnostics(d, public=False) == ""             # graceful when gather skipped them
+    assert ui.sec_diagnostics(d, public=False) == ""             # graceful when gather skipped them
 
 
 def test_regime_attribution_renders_three_lenses():
     d = _fake_d()
-    html = bs.sec_regime(d, public=False)
+    html = ui.sec_regime(d, public=False)
     assert "Regime attribution" in html
     assert "Technology" in html and "Industrials" in html        # (1) sector strip named
     assert "risk-on" in html and "risk-off" in html              # (2) HMM-conditional split
@@ -495,17 +494,17 @@ def test_regime_attribution_in_full_page_before_caveat():
 def test_regime_attribution_absent_renders_nothing():
     d = _fake_d()
     d.pop("regime_attr")
-    assert bs.sec_regime(d, public=False) == ""                  # graceful when gather skipped it
+    assert ui.sec_regime(d, public=False) == ""                  # graceful when gather skipped it
 
 
 def test_regime_attribution_public_no_euro():
     d = _fake_d()
-    assert "€" not in bs.sec_regime(d, public=True)              # ratios/percentages only
+    assert "€" not in ui.sec_regime(d, public=True)              # ratios/percentages only
 
 
 def test_scenario_fan_renders_bear_base_bull():
     d = _fake_d()
-    h = bs.sec_scenarios(d, public=False)
+    h = ui.sec_scenarios(d, public=False)
     assert "Scenario fan" in h
     assert "Bear" in h and "Base" in h and "Bull" in h
     assert "block bootstrap" in h.lower()
@@ -517,11 +516,11 @@ def test_scenario_fan_renders_bear_base_bull():
 def test_scenario_absent_renders_nothing():
     d = _fake_d()
     d.pop("scenarios")
-    assert bs.sec_scenarios(d, public=False) == ""              # graceful when gather skipped it
+    assert ui.sec_scenarios(d, public=False) == ""              # graceful when gather skipped it
 
 
 def test_scenario_public_no_euro():
-    assert "€" not in bs.sec_scenarios(_fake_d(), public=True)  # multiples / percentages only
+    assert "€" not in ui.sec_scenarios(_fake_d(), public=True)  # multiples / percentages only
 
 
 def test_scenario_sits_after_regime_before_caveat():
@@ -611,14 +610,14 @@ def _fake_stress():
 
 
 def test_delisting_band_public_percentages_only():
-    html = bs.sec_delisting_stress({"delisting_stress": _fake_stress()}, public=True)
+    html = ui.sec_delisting_stress({"delisting_stress": _fake_stress()}, public=True)
     assert "%" in html
     assert "€" not in html                          # public invariant
     assert "delisting" in html.lower()
 
 
 def test_delisting_table_private_has_all_presets():
-    html = bs.sec_delisting_stress({"delisting_stress": _fake_stress()}, public=False)
+    html = ui.sec_delisting_stress({"delisting_stress": _fake_stress()}, public=False)
     for token in ("Bull", "Base", "Bear", "Original", "Risk-conscious"):
         assert token in html
     assert "€" not in html
@@ -627,8 +626,8 @@ def test_delisting_table_private_has_all_presets():
 
 
 def test_delisting_stub_when_absent():
-    assert bs.sec_delisting_stress({"delisting_stress": None}, public=True) == ""
-    stub = bs.sec_delisting_stress({"delisting_stress": None}, public=False)
+    assert ui.sec_delisting_stress({"delisting_stress": None}, public=True) == ""
+    stub = ui.sec_delisting_stress({"delisting_stress": None}, public=False)
     assert "SURV_SIMS" in stub
 
 
@@ -649,13 +648,13 @@ def _fake_factor_reg():
 
 
 def test_factor_section_hidden_without_data():
-    assert bs.sec_factor_regression(_fake_d(), public=False) == ""
+    assert ui.sec_factor_regression(_fake_d(), public=False) == ""
 
 
 def test_factor_section_renders_models_and_verdict():
     d = _fake_d()
     d["factor_reg"] = _fake_factor_reg()
-    html = bs.sec_factor_regression(d, public=False)
+    html = ui.sec_factor_regression(d, public=False)
     assert "Factor spanning" in html and "Newey-West" in html and "Developed" in html
     assert html.count("CAPM") >= 2 and html.count("FF5+WML") >= 2   # both books, all models
     assert "0.60" in html or "0.6" in html                          # WML loading shown
@@ -670,11 +669,11 @@ def test_factor_section_residual_alpha_verdict():
     fr = _fake_factor_reg()
     fr["raw"]["FF5+WML"]["alpha_t"] = 2.6
     d["factor_reg"] = fr
-    assert "residual selection edge" in bs.sec_factor_regression(d, public=False)
+    assert "residual selection edge" in ui.sec_factor_regression(d, public=False)
 
 
 def test_sec_vol_core_renders_adopted_overlay_and_hides_on_none():
-    import build_strategy_report as st
+    import strategy_ui as st
     d = {"vol_core": dict(
         etf="MSCI World (IWDA.AS)",
         bh=dict(sharpe=0.81, ann_return=0.11, max_dd=-0.274),
@@ -690,7 +689,7 @@ def test_sec_vol_core_renders_adopted_overlay_and_hides_on_none():
 
 
 def test_sec_ensemble_renders_adoption_rule_and_codes():
-    import build_strategy_report as st
+    import strategy_ui as st
     d = {"ensemble": dict(
         codes=["···DEF", "A···EF", "····EF"], n=3,
         train=dict(sharpe=0.78, net_return=2.1),
@@ -710,7 +709,7 @@ def test_sec_ensemble_renders_adoption_rule_and_codes():
 
 
 def test_sec_track_renders_kill_status():
-    import build_strategy_report as st
+    import strategy_ui as st
     d = {"track": dict(n=12, needed=63, kill=False, reasons=[],
                        path="local/strategy_track.csv")}
     html = st.sec_track(d, public=False)
@@ -720,7 +719,7 @@ def test_sec_track_renders_kill_status():
 
 
 def test_sec_venture_renders_shadow_comparison_and_ladder():
-    import build_strategy_report as st
+    import strategy_ui as st
     d = {"venture": dict(live=True, book_xirr=0.14, shadow_xirr=0.09,
                          excess=0.05, months=6.2, dd=-0.12,
                          dd_state="normal", satellite=dict(live=0, cap=3),
@@ -738,7 +737,7 @@ def test_sec_venture_renders_shadow_comparison_and_ladder():
 
 
 def test_sec_ritual_freshness_alarms():
-    import build_strategy_report as st
+    import strategy_ui as st
     d = {"ritual": dict(items=[
         dict(name="TR snapshot", last="2026-06-29", age_days=8, alarm=False),
         dict(name="BaFin dealings fetch", last="2026-05-01", age_days=67,
