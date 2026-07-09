@@ -9,6 +9,7 @@ import pandas as pd
 from tools.megacap import (run_arms, cap_panel, yoy_growth_panel, load_cache,
                            candidate_pool, coverage_report, ARMS, CACHE)
 from tools.momentum import (rebalance_dates, to_xetra_calendar, winsorize_prices)
+from tools.report_html import page
 
 ROOT = pathlib.Path(__file__).resolve().parent
 PRICES_CSV = ROOT / "data" / "universe" / "universe_prices.csv"
@@ -65,7 +66,7 @@ def build_html(data: dict) -> str:
     empty = ("<p class='prompt'><em>No market-cap data yet — run the live EODHD "
              "fetch (see the plan's runtime note), then rebuild.</em></p>"
              if cov["covered"] == 0 else "")
-    return (
+    body = (
         "<h1>Mega-cap PIT screen — size / growth / momentum</h1>"
         f"<p class='coverage'>Cap coverage: {cov['covered']}/{cov['candidates']} "
         f"candidates ({cov['pct']}%).</p>"
@@ -75,6 +76,7 @@ def build_html(data: dict) -> str:
         f"<table><thead><tr><th>screen</th><th>arm</th>{head}</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
+    return page("Mega-cap PIT screen — size / growth / momentum", body)
 
 
 def main():
