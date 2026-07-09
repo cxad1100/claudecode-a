@@ -58,3 +58,34 @@ def yoy_growth_panel(rev_hist: dict, dates, *, tol_days: int = 45) -> pd.DataFra
         if col:
             out[t] = pd.Series(col)
     return pd.DataFrame(out).reindex(dates)
+
+
+def megacap_screen(cap: pd.DataFrame, dates, n: int) -> dict:
+    """{date: set of the top-`n` tickers by PIT cap}. Names with NaN cap at a date
+    are not rankable and are excluded (never crash)."""
+    out = {}
+    for d in dates:
+        if d not in cap.index:
+            out[d] = set()
+            continue
+        row = cap.loc[d].dropna().sort_values(ascending=False)
+        out[d] = set(row.head(n).index)
+    return out
+
+
+def _scores_by_date(panel: pd.DataFrame, dates) -> dict:
+    """{date: {'raw': Series, 'voladj': Series}} from a per-date score panel — both
+    keys identical, matching the `score_by_date` contract `run_momentum` consumes."""
+    out = {}
+    for d in dates:
+        s = panel.loc[d].dropna() if d in panel.index else pd.Series(dtype=float)
+        out[d] = {"raw": s, "voladj": s}
+    return out
+
+
+def cap_scores_by_date(cap: pd.DataFrame, dates) -> dict:
+    return _scores_by_date(cap, dates)
+
+
+def growth_scores_by_date(yoy: pd.DataFrame, dates) -> dict:
+    return _scores_by_date(yoy, dates)

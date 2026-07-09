@@ -31,3 +31,32 @@ def test_yoy_growth_pit_and_value():
     g = yoy_growth_panel(rev, [before, after])
     assert np.isnan(g.loc[before, "A"])                        # no prior-year pair available yet
     assert abs(g.loc[after, "A"] - (550.0 / 500.0 - 1.0)) < 1e-9
+
+
+from tools.megacap import megacap_screen, cap_scores_by_date, growth_scores_by_date
+
+
+def _cap_frame():
+    dates = [pd.Timestamp("2022-01-31"), pd.Timestamp("2022-02-28")]
+    return pd.DataFrame({"BIG": [100.0, 100.0], "MID": [50.0, 50.0],
+                         "SMALL": [10.0, np.nan]}, index=dates), dates
+
+
+def test_megacap_screen_topn_excludes_nan():
+    cap, dates = _cap_frame()
+    scr = megacap_screen(cap, dates, n=2)
+    assert scr[dates[0]] == {"BIG", "MID"}
+    assert scr[dates[1]] == {"BIG", "MID"}          # SMALL is NaN in Feb -> excluded anyway
+
+
+def test_megacap_screen_n1():
+    cap, dates = _cap_frame()
+    assert megacap_screen(cap, dates, n=1)[dates[0]] == {"BIG"}
+
+
+def test_scores_by_date_shape():
+    cap, dates = _cap_frame()
+    sc = cap_scores_by_date(cap, dates)
+    assert set(sc[dates[0]]) == {"raw", "voladj"}
+    assert sc[dates[0]]["raw"].equals(sc[dates[0]]["voladj"])
+    assert sc[dates[0]]["raw"]["BIG"] == 100.0
