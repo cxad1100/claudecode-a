@@ -312,10 +312,10 @@ def test_raw_reference_lives_only_in_the_lab():
     d = _fake_d()
     html = bs.build(d, public=False)
     # raw isn't deleted — it's demoted to the lab as an inflation reference
-    marker = "Raw Original — reference only"
+    marker = "Survivorship-inflated — not achievable"
     assert marker in html and html.index(marker) > html.index("Research lab")
     h = ui.sec_raw_reference(d)
-    assert "reference" in h.lower() and "inflated" in h.lower()   # framed as inflated, not a headline
+    assert "inflated" in h.lower() and "not achievable" in h.lower()  # framed as inflated, not a headline
     # public build drops the whole lab (and the raw with it)
     assert "Research lab" not in bs.build(d, public=True)
 
