@@ -789,3 +789,14 @@ def test_sec_ritual_freshness_alarms():
     assert "alarm" in html.lower() or "overdue" in html.lower()
     assert st.sec_ritual(d, public=True) == ""    # private only
     assert st.sec_ritual({}, public=False) == ""
+
+
+def test_megacap_record_present_and_pending():
+    d = _fake_d()
+    rec = next((r for r in d["registry"] if r.id == "megacap"), None)
+    assert rec is not None
+    assert rec.status == "research"
+    assert rec.equity is None
+    assert rec.family == "mega-cap"
+    assert rec.href == "megacap.html"
+    assert "awaiting_data" in rec.flags

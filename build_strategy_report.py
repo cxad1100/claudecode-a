@@ -223,6 +223,13 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
             cost_model="real fills",
             verdict="money-weighted real book over its own window — head-to-head below",
             color="#ffffff"))
+    recs.append(sreg.make_record(
+        "megacap", "Mega-cap PIT screen — size / growth / momentum", "mega-cap",
+        "research", href="megacap.html",
+        gate="awaiting cap data — run the EODHD fundamentals fetch",
+        verdict="PIT market-cap screen → size / YoY-revenue-growth / 12-1 momentum arms; "
+                "no live data yet (0/400 coverage).",
+        flags=("awaiting_data",)))
     recs.extend(sreg.STATIC_RECORDS)
     sreg.assign_colors(recs)
     return recs
