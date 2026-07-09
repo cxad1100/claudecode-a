@@ -5,8 +5,15 @@ rebalance; three arms then rank inside that pool by cap, YoY revenue growth, or
 12-1 momentum. All panels are strictly point-in-time — every value at date `d`
 uses only information available on or before `d`.
 """
+import json
+import pathlib
+import time
+
 import numpy as np
 import pandas as pd
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CACHE = ROOT / "data" / "megacap_fundamentals.json"
 
 
 def cap_panel(shares_hist: dict, prices: pd.DataFrame, dates) -> pd.DataFrame:
@@ -118,3 +125,68 @@ def run_arms(prices: pd.DataFrame, slippage_bps: dict, cap: pd.DataFrame,
     return {arm: run_momentum(prices, slippage_bps, k=k,
                               elig_by_date=elig, score_by_date=scores[arm], **kw)
             for arm in ARMS}
+
+
+def candidate_pool(meta_df, prices_cols, *, max_names: int = 400,
+                   liq_max: int = 30) -> list:
+    """Liquid candidate names for the cap fetch: present in the price panel, slippage
+    <= `liq_max`, then the `max_names` tightest-spread (smallest slippage) — the
+    plausibly-large end. The obscure tail can never be top-N, so skipping it is free."""
+    df = meta_df[meta_df["ticker"].isin(set(prices_cols))].copy()
+    df = df[df["slippage_bps"] <= liq_max].sort_values("slippage_bps")
+    return list(df["ticker"].head(max_names))
+
+
+def fetch_pool(tickers, *, key=None, get_fn=None, sleep: float = 0.3,
+               lag_days: int = 75):
+    """Fetch EODHD fundamentals for each ticker (native symbol), parse PIT shares +
+    revenue. Returns (shares{t:Series}, rev{t:DataFrame}, cover{t:bool}). Paced by
+    `sleep` between live calls; `get_fn` injected in tests skips the sleep."""
+    from tools import eodhd
+    key = key or eodhd.api_key()
+    gf = get_fn or eodhd._http_get
+    shares, rev, cover = {}, {}, {}
+    for t in tickers:
+        fund = eodhd.fetch_fundamentals(t, key=key, get_fn=gf)
+        sh = eodhd.parse_shares_history(fund, lag_days=lag_days) if fund else pd.Series(dtype=float)
+        rv = (eodhd.parse_revenue_history(fund, lag_days=lag_days)
+              if fund else pd.DataFrame(columns=["revenue", "avail"]))
+        cover[t] = bool(len(sh))
+        if len(sh):
+            shares[t] = sh
+        if len(rv):
+            rev[t] = rv
+        if get_fn is None:
+            time.sleep(sleep)
+    return shares, rev, cover
+
+
+def coverage_report(cover: dict) -> dict:
+    n, hit = len(cover), sum(bool(v) for v in cover.values())
+    return {"candidates": n, "covered": hit,
+            "pct": round(100 * hit / n, 1) if n else 0.0}
+
+
+def save_cache(shares: dict, rev: dict, path=CACHE) -> None:
+    """Persist parsed panels so the report never re-hits the API. Series/DataFrames
+    are round-tripped via ISO-dated JSON."""
+    blob = {
+        "shares": {t: {d.isoformat(): float(v) for d, v in s.items()}
+                   for t, s in shares.items()},
+        "rev": {t: {"period": [i.isoformat() for i in df.index],
+                    "revenue": [float(x) for x in df["revenue"]],
+                    "avail": [a.isoformat() for a in df["avail"]]}
+                for t, df in rev.items()},
+    }
+    pathlib.Path(path).write_text(json.dumps(blob))
+
+
+def load_cache(path=CACHE):
+    blob = json.loads(pathlib.Path(path).read_text())
+    shares = {t: pd.Series({pd.Timestamp(d): v for d, v in s.items()}).sort_index()
+              for t, s in blob["shares"].items()}
+    rev = {t: pd.DataFrame({"revenue": d["revenue"],
+                            "avail": [pd.Timestamp(a) for a in d["avail"]]},
+                           index=[pd.Timestamp(p) for p in d["period"]])
+           for t, d in blob["rev"].items()}
+    return shares, rev
