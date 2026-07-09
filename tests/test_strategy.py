@@ -207,16 +207,16 @@ def test_registry_metrics_are_uniform_across_surfaces():
     assert live.name.split(" — ")[0] in ui.sec_headline(d)
 
 
-def test_family_frames_and_scoped_momentum_data():
+def test_family_panes_and_scoped_momentum_data():
     d = _fake_d()
     html = bs.build(d, public=False)
-    # one framed block per family, variants nested inside
-    assert html.count("class='family'") == 2          # momentum + vol-managed core
+    # one family pane per family (the old nested frames are gone)
+    assert "id='pane-fam-momentum'" in html and "id='pane-fam-vol-managed-core'" in html
     assert "Momentum family</h2>" in html and "Vol-managed core</h2>" in html
     assert "★ contains the live tracked book" in html
     # live tracking sits INSIDE the live momentum dossier, not in Operations
     assert html.index("Live tracking — pre-registered kill criteria") \
-        < html.index("Operations — stack-level")
+        < html.index("Operations — north star")
     # the lab is explicitly momentum-scoped
     assert "Research lab — momentum family" in html
     # data-first: explainer paragraphs fold behind the tables, legends stay one-line
@@ -288,9 +288,9 @@ def test_headline_leads_with_real_results():
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
     assert "Deflated Sharpe" in h or "P(true" in h
     assert "live tracked book" in h                               # names what the tracker runs
-    # it leads the page: overview band (registry, chart), then the dossiers
+    # it leads the page: cockpit (home) first, then the compare surfaces, then dossiers
     assert (html.index("The result") < html.index("Strategy registry")
-            < html.index("Walk-forward equity") < html.index("Strategy dossiers"))
+            < html.index("Walk-forward equity") < html.index("id='pane-rec-mom_ens'"))
 
 
 def test_headline_no_euro_amounts():
@@ -299,7 +299,7 @@ def test_headline_no_euro_amounts():
 
 def test_raw_vanity_is_off_the_main_page():
     html = bs.build(_fake_d(), public=False)
-    main = html.split("Research lab")[0]                          # everything above the lab
+    main = html.split("id='pane-lab'")[0]                         # everything outside the lab pane
     # the raw full-invested strategy appears above the lab ONLY as the flagged registry row
     assert "Raw Original" not in main
     assert "Original (raw, full-invested)" not in main           # no raw rocket trace up top
@@ -335,26 +335,34 @@ def test_parallel_chart_traces():
     assert "Your portfolio" not in h
 
 
-def test_dossiers_show_every_strategy_in_parallel():
-    """One dossier card per strategy — ensemble (sleeve order sheets), the single
-    book, the vol core's ETF action — each clearly bounded and tradeable."""
+def test_every_strategy_gets_its_own_pane_and_spine_entry():
+    """Master-detail: one dossier pane per strategy (ensemble, single book, vol core),
+    the shared evidence relocated to the family pane — every strategy reachable from the
+    spine, none forced to share an equal-width scroll."""
     d = _fake_d()
-    h = ui.sec_dossiers(d, public=False)
-    assert "Strategy dossiers" in h and "what each strategy holds now" in h
-    # ensemble · single book · family evidence · vol core — each its own card
+    h = ui.render(d, public=False)
+    # a hierarchy spine + a stage of panes, one per strategy, each reachable from the spine
+    assert "class='spine'" in h
+    for pid in ("pane-home", "pane-compare", "pane-fam-momentum",
+                "pane-rec-mom_ens", "pane-rec-mom_rc", "pane-rec-vol_core"):
+        assert f"id='{pid}'" in h
+        assert f"data-pane='{pid[len('pane-'):]}'" in h
+    # four dossier cards total: ensemble · single book · family evidence · vol core
     assert h.count("class='dossier'") == 4
-    # the shared evidence is explicitly family-scoped, and closes the momentum family
+    # the shared evidence is family-scoped and lives on the FAMILY pane, not the book card
     assert "Momentum family — evidence" in h and "family-scoped, not page-global" in h
-    assert (h.index("Momentum single book") < h.index("Momentum family — evidence")
-            < h.index("GARCH vol-managed IWDA core"))
+    panes = h.split("<section class='pane'")
+    rc_pane = next(p for p in panes if "id='pane-rec-mom_rc'" in p[:70])
+    fam_pane = next(p for p in panes if "id='pane-fam-momentum'" in p[:70])
+    assert "Momentum single book" in rc_pane
+    assert "Momentum family — evidence" not in rc_pane      # evidence moved off the card
+    assert "Momentum family — evidence" in fam_pane
     # per-book history folds live inside the dossiers
     assert "Every rebalance — sleeve" in h and "Every rebalance — risk-conscious" in h
     # every ensemble sleeve gets its own order sheet (the live book here)
     for code in d["ensemble"]["codes"]:
         assert code in h
     assert "Sleeve 1/3" in h and "★ live book" in h
-    # the single risk-conscious book is its own dossier, not the page's only focus
-    assert "Momentum single book" in h
     # the vol core is actionable too: the ETF row + today's target exposure
     assert "IWDA" in h and "IE00B4L5Y983" in h and "today's order" in h
     # tradeable rows for the momentum picks
@@ -409,7 +417,7 @@ def test_yearly_matrix_has_one_column_per_strategy():
 
 def test_history_folds_live_inside_dossiers():
     d = _fake_d()
-    h = ui.sec_dossiers(d, public=False)
+    h = ui.render(d, public=False)
     # one history fold per momentum book: 3 sleeves + the single rc book
     assert h.count("Every rebalance — sleeve") == 3
     assert h.count("Every rebalance — risk-conscious") == 1
@@ -443,8 +451,8 @@ def test_phantom_trials_block_shows_decay_and_harvey():
 
 def test_no_info_dropped_from_page():
     html = bs.build(_fake_d(), public=False)
-    for phrase in ["Strategy registry", "Registry ledger", "Strategy dossiers",
-                   "what each strategy holds now",
+    for phrase in ["Strategy registry", "Registry ledger",
+                   "Momentum single book", "GARCH vol-managed IWDA core",
                    "Walk-forward equity", "Performance — all strategies",
                    "Quant scorecard", "Deflated Sharpe",
                    "Yearly P&amp;L", "Every rebalance", "survivorship is NOT corrected",

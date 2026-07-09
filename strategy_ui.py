@@ -2,19 +2,33 @@
 
 Data comes in as gather()'s dict (including d["registry"]); a full HTML page comes
 out. No metric computation happens here — engines and stats live in tools/, data
-assembly in build_strategy_report.gather(). The page reads top-down as:
+assembly in build_strategy_report.gather().
 
-  COCKPIT     command strip (live readings) + the result verdict + KPI tiles
-  COMPARE     leaderboard · parallel equity chart · windows matrix · yearly matrix
-  DOSSIERS    one self-contained card per strategy (book · verdict · method ·
-              history), families contiguous, shared evidence scoped per family
-  OPERATIONS  live tracking · venture north star · ritual · you vs the strategies
-  LAB         (private) raw reference · 64-config grid · supporting data
+The page is a MASTER-DETAIL app: a hierarchy spine (the strategy map) on the left,
+a stage of detail panes on the right, one pane visible at a time (client-side router,
+no fetch — every pane is server-rendered into the document, JS toggles visibility):
+
+  spine   ★ Today · Compare · one group per FAMILY (its records indented, variants
+          nested via variant_of) · Ledger (killed/research) · Operations · Lab
+  panes   home     cockpit — command strip + the result verdict + KPI tiles
+          compare  leaderboard · parallel equity · windows / yearly matrices
+          fam-*    a family node: its members + the family-scoped shared evidence
+          rec-*    one strategy's dossier (book · verdict · method · history)
+          ops      live tracking · venture north star · ritual · you vs strategies
+          lab      (private) raw reference · 64-config grid · supporting data
+
+Why panes, not one scroll: the data is a tree (family → record → variant_of → pick)
+with importance already encoded (status rank, ★ live, variant_of). The spine makes
+that hierarchy visible; each pane is sized to its own content, so a deep family and a
+one-line sleeve no longer fight for the same equal-width column.
 
 Framework contract: a future strategy = one make_record() in
-build_strategy_report.build_registry — it renders a generic dossier automatically;
-bespoke detail = one DOSSIER_BUILDERS entry here. Nothing else to touch.
+build_strategy_report.build_registry — it earns a spine item and a generic dossier
+pane automatically; bespoke detail = one DOSSIER_BUILDERS entry here. Family-scoped
+evidence attaches to the family pane, not the strategy card.
 """
+import re
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -44,9 +58,6 @@ PRE_TEST = f"≤{pd.Timestamp(VAL_END).year}"           # e.g. "≤2023"
 PAGE_CSS = f"""<style>
 .eyebrow {{ font-family: {theme.MONO}; font-size: 0.66rem; text-transform: uppercase;
             letter-spacing: 0.14em; color: {theme.FG_DIM}; display: block; margin-bottom: 2px; }}
-.band {{ margin-top: 64px; }}
-.band > .eyebrow {{ border-bottom: 1px solid {theme.GRID}; padding-bottom: 6px;
-                    margin-bottom: 14px; font-size: 0.72rem; }}
 .badge {{ display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 0.68rem;
           font-family: {theme.MONO}; text-transform: uppercase; letter-spacing: 0.05em;
           border: 1px solid {theme.GRID}; white-space: nowrap; }}
@@ -75,15 +86,46 @@ details.ev > summary {{ color: {theme.FG}; font-size: 0.88rem; }}
 details.ev > summary .eyebrow {{ display: inline; margin-right: 10px; }}
 details.ev[open] {{ padding-bottom: 14px; }}
 details.ev h2 {{ margin-top: 18px; font-size: 1.0rem; }}
-/* one FAMILY = one framed block; its variants are the nested dossier cards */
-.family {{ border: 1px solid {theme.GRID}; border-top: 3px solid {theme.ACCENT};
-           border-radius: 10px; padding: 6px 18px 12px; margin: 28px 0;
-           background: {theme.BG}; }}
-.family > .famhead {{ display: flex; flex-wrap: wrap; gap: 4px 14px;
-                      align-items: baseline; margin: 8px 0 2px; }}
-.family > .famhead h2 {{ margin: 0; border: 0; padding: 0; font-size: 1.2rem; }}
-.family > .famhead .dim {{ font-size: 0.82rem; }}
 .legend {{ color: {theme.FG_DIM}; font-size: 0.82rem; margin: 4px 0 8px; }}
+/* ── App shell: hierarchy spine (left) + detail stage (right) ──────────────── */
+main {{ max-width: 1360px; }}
+.pagehead {{ margin-bottom: 10px; }}
+.app {{ display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 30px;
+        align-items: start; }}
+.stage {{ min-width: 0; }}
+.spine {{ position: sticky; top: 14px; align-self: start; max-height: calc(100vh - 28px);
+          overflow: auto; font-size: 0.9rem; border: 1px solid {theme.GRID};
+          border-radius: 10px; padding: 10px; background: {theme.BG_PANEL}; }}
+.spine [data-pane] {{ display: flex; align-items: center; gap: 8px; width: 100%;
+          text-align: left; background: none; border: 0; color: {theme.FG}; font: inherit;
+          padding: 5px 8px; border-radius: 6px; cursor: pointer; line-height: 1.35; }}
+.spine [data-pane]:hover {{ background: {theme.BG}; }}
+.spine [data-pane].active {{ background: {theme.GRID}; color: #fff; font-weight: 600; }}
+.spine .s-rec {{ padding-left: 22px; font-size: 0.85rem; color: {theme.FG_DIM}; }}
+.spine .s-rec.active {{ color: #fff; }}
+.spine .s-var {{ padding-left: 34px; }}
+.spine .s-fam {{ margin-top: 12px; }}
+.spine .s-fam [data-pane] {{ font-weight: 600; color: {theme.FG}; }}
+.spine .dot {{ width: 9px; height: 9px; border-radius: 50%; flex: none;
+          box-shadow: 0 0 0 1px rgba(255,255,255,0.14); }}
+.spine .s-sep {{ border: 0; border-top: 1px solid {theme.GRID}; margin: 12px 2px; }}
+.spine details.s-ledger {{ margin: 8px 0 2px; }}
+.spine details.s-ledger > summary {{ padding: 5px 8px; color: {theme.FG_DIM};
+          font-size: 0.82rem; }}
+.spine details.s-ledger a {{ display: block; padding: 3px 8px 3px 22px; font-size: 0.82rem; }}
+.pane[hidden] {{ display: none; }}
+.pane > .crumb {{ margin: 0 0 10px; font-size: 0.78rem; color: {theme.FG_DIM}; }}
+.pane > .crumb [data-pane] {{ background: none; border: 0; color: {theme.ACCENT};
+          cursor: pointer; font: inherit; padding: 0; }}
+.pane > .crumb [data-pane]:hover {{ text-decoration: underline; }}
+.pane > h2:first-child, .pane > .crumb + h2 {{ margin-top: 0; }}
+.famtbl button[data-pane] {{ background: none; border: 0; font: inherit; cursor: pointer;
+          padding: 0; text-align: left; }}
+.famtbl button[data-pane]:hover {{ text-decoration: underline; }}
+@media (max-width: 900px) {{
+  .app {{ grid-template-columns: 1fr; gap: 16px; }}
+  .spine {{ position: static; max-height: none; }}
+}}
 </style>"""
 
 
@@ -107,13 +149,6 @@ def _rc_target(d: dict) -> float:
 
 
 # ── Layout primitives ────────────────────────────────────────────────────────────
-
-def _band(eyebrow: str, *parts: str) -> str:
-    inner = "".join(p for p in parts if p)
-    if not inner:
-        return ""
-    return f"<div class='band'><span class='eyebrow'>{eyebrow}</span>{inner}</div>"
-
 
 def _fold(eyebrow: str, summary: str, body: str) -> str:
     """Collapsed drill-down: the verdict stays visible, the workings fold away.
@@ -792,36 +827,158 @@ _FAMILY_TITLE = {"momentum": "Momentum family",
                  "vol-managed core": "Vol-managed core"}
 
 
-def sec_dossiers(d: dict, public: bool) -> str:
-    """One FRAMED block per strategy family (the drawn line), its variants as nested
-    dossier cards inside, the family's shared evidence closing the block. Registry-
-    driven: any future record gets a card automatically (generic fallback)."""
-    recs = [r for r in sreg.family_ordered(d.get("registry") or [])
+def _slug(s: str) -> str:
+    """A pane-id / URL-hash-safe token from a family name ('vol-managed core' → 'vol-managed-core')."""
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+# Short spine labels — the registry names are full sentences; the map wants a word.
+_SPINE_NAME = {"mom_ens": "Ensemble",
+               "mom_rc": "Single · risk-conscious",
+               "vol_core": "GARCH IWDA core"}
+
+
+def _spine_name(r) -> str:
+    return _SPINE_NAME.get(r.id, r.name)
+
+
+def _dossier_records(d: dict) -> list:
+    """The curve-bearing strategies that earn a detail pane — same filter the old
+    single-scroll dossier block used, in family-contiguous order."""
+    return [r for r in sreg.family_ordered(d.get("registry") or [])
             if r.status in ("adopted", "candidate", "variant")]
-    if not recs:
-        return ""
-    fam_order = list(dict.fromkeys(r.family for r in recs))
-    blocks = []
-    for fam in fam_order:
+
+
+def _fam_color(members: list) -> str:
+    return next((r.color for r in members if r.live), members[0].color or theme.ACCENT)
+
+
+def sec_spine(d: dict, public: bool, has_ops: bool, has_lab: bool) -> str:
+    """The hierarchy map: ★ Today · Compare · one group per family (records indented,
+    variants nested via variant_of) · the killed/research ledger · Operations · Lab.
+    Every entry is a <button data-pane=…>; the router swaps the matching stage pane."""
+    recs = _dossier_records(d)
+    member_ids = {r.id for r in recs}
+    items = ["<button data-pane='home' class='s-home'>★ Today</button>",
+             "<button data-pane='compare'>Compare — all strategies</button>"]
+    for fam in list(dict.fromkeys(r.family for r in recs)):
         members = [r for r in recs if r.family == fam]
-        color = next((r.color for r in members if r.live),
-                     members[0].color or theme.ACCENT)
-        cards = [DOSSIER_BUILDERS.get(r.id, _dossier_generic)(d, r, public)
-                 for r in members]
-        if fam == "momentum":              # family evidence closes the momentum block
-            cards.append(_momentum_evidence(d, public))
-        live_note = ("★ contains the live tracked book"
-                     if any(r.live for r in members) else
-                     f"{len(members)} variant{'s' if len(members) != 1 else ''}")
         title = _FAMILY_TITLE.get(fam, fam.capitalize())
-        blocks.append(
-            f"<section class='family' style='border-top-color:{color}'>"
-            f"<div class='famhead'><span class='eyebrow'>strategy family</span>"
-            f"<h2>{title}</h2><span class='dim'>{live_note}</span></div>"
-            + "".join(cards) + "</section>")
-    return ("<div class='band'><span class='eyebrow'>Strategy dossiers — "
-            "what each strategy holds now, its verdict, its method, its history</span>"
-            + "".join(blocks) + "</div>")
+        live = " ★" if any(r.live for r in members) else ""
+        items.append(
+            f"<div class='s-fam'><button data-pane='fam-{_slug(fam)}'>"
+            f"<span class='dot' style='background:{_fam_color(members)}'></span>"
+            f"{title}{live}</button></div>")
+        for r in members:
+            star = "★ " if r.live else ""
+            var = " s-var" if r.variant_of in member_ids else ""
+            items.append(
+                f"<button data-pane='rec-{r.id}' class='s-rec{var}'>"
+                f"<span class='dot' style='background:{r.color or theme.FG_DIM}'></span>"
+                f"{star}{_spine_name(r)}</button>")
+    ledger = [r for r in sreg.family_ordered(d.get("registry") or [])
+              if r.status in ("killed", "cut", "research")]
+    if ledger:
+        by_fam: dict = {}
+        for r in ledger:
+            by_fam.setdefault(r.family, []).append(r)
+        links = []
+        for fam, rs in by_fam.items():
+            href = next((x.href for x in rs if x.href), None)
+            label = f"{_FAMILY_TITLE.get(fam, fam.capitalize())} ({len(rs)})"
+            links.append(f"<a href='{href}'>{label} ↗</a>" if href
+                         else f"<span class='dim' style='display:block;padding:3px 8px 3px 22px'>{label}</span>")
+        items.append("<details class='s-ledger'><summary>Ledger — killed &amp; research "
+                     f"({len(ledger)})</summary>{''.join(links)}</details>")
+    items.append("<hr class='s-sep'>")
+    if has_ops:
+        items.append("<button data-pane='ops'>Operations</button>")
+    if has_lab:
+        items.append("<button data-pane='lab'>Research lab</button>")
+    return f"<nav class='spine'>{''.join(items)}</nav>"
+
+
+def _crumb(d: dict, fam: str, leaf: str = "") -> str:
+    tail = f" ▸ {leaf}" if leaf else ""
+    return (f"<p class='crumb'><button data-pane='home'>★ Today</button> ▸ "
+            f"<button data-pane='fam-{_slug(fam)}'>"
+            f"{_FAMILY_TITLE.get(fam, fam.capitalize())}</button>{tail}</p>")
+
+
+def _rec_pane(d: dict, r, public: bool) -> str:
+    """One strategy's dossier as a stage pane — the bespoke or generic card, no
+    family evidence (that lives on the family pane), with a breadcrumb back up."""
+    card = DOSSIER_BUILDERS.get(r.id, _dossier_generic)(d, r, public)
+    return (f"<section class='pane' id='pane-rec-{r.id}' hidden>"
+            f"{_crumb(d, r.family, _spine_name(r))}{card}</section>")
+
+
+def _family_pane(d: dict, fam: str, members: list, public: bool) -> str:
+    """A family node: its members (each a link into its dossier) and, for momentum,
+    the family-scoped shared evidence that grades the selection both books inherit."""
+    color = _fam_color(members)
+    live_note = ("★ contains the live tracked book" if any(r.live for r in members)
+                 else f"{len(members)} variant{'s' if len(members) != 1 else ''}")
+    rows = []
+    for r in members:
+        w = r.windows.get("test", {})
+        star = "★ " if r.live else ""
+        rows.append(
+            f"<tr><td><button data-pane='rec-{r.id}' style='color:{r.color or theme.FG}'>"
+            f"{star}{_spine_name(r)} →</button></td><td>{_badge(r.status)}</td>"
+            + _wm_cell(w, "sharpe") + _wm_cell(w, "net_return", "pct")
+            + f"<td class='dim' style='font-size:0.8rem'>{r.gate or r.verdict or ''}</td></tr>")
+    members_tbl = ("<table class='famtbl'><tr><th>Strategy</th><th>Status</th>"
+                   f"<th class='num'>{WIN_LABELS['test']} Sharpe</th>"
+                   "<th class='num'>Test ret</th><th>Adoption rule / verdict</th></tr>"
+                   + "".join(rows) + "</table>")
+    evidence = _momentum_evidence(d, public) if fam == "momentum" else ""
+    tail = ("" if evidence else
+            "<p class='dim'>This family's full workings live on its own lab page — open a "
+            "strategy's <b>method</b> fold for the link.</p>")
+    return (f"<section class='pane' id='pane-fam-{_slug(fam)}' hidden>"
+            f"{_crumb(d, fam)}"
+            f"<h2 style='color:{color}'>{_FAMILY_TITLE.get(fam, fam.capitalize())}</h2>"
+            f"<p class='legend'>{live_note} — pick a strategy to open its dossier</p>"
+            f"{members_tbl}{evidence}{tail}</section>")
+
+
+# Client-side pane router: no fetch — every pane is in the document, this toggles which
+# one shows, keeps the spine in sync, deep-links via location.hash, and re-fires the
+# Plotly resize on reveal (charts drawn inside a hidden pane paint at zero width).
+ROUTER_JS = """<script>
+(function(){
+  function panes(){ return document.querySelectorAll('.pane'); }
+  function resize(pane){
+    if(!window.Plotly||!pane) return;
+    pane.querySelectorAll('.js-plotly-plot').forEach(function(g){
+      try{ Plotly.Plots.resize(g); }catch(e){}
+    });
+  }
+  function show(id){
+    if(!document.getElementById('pane-'+id)) id='home';
+    panes().forEach(function(p){ p.hidden=(p.id!=='pane-'+id); });
+    document.querySelectorAll('.spine [data-pane]').forEach(function(b){
+      b.classList.toggle('active', b.dataset.pane===id);
+    });
+    var active=document.querySelector('.spine [data-pane="'+id+'"]');
+    if(active){ var dd=active.closest('details'); if(dd) dd.open=true; }
+    resize(document.getElementById('pane-'+id));
+  }
+  document.addEventListener('click', function(e){
+    var el=e.target.closest('[data-pane]'); if(!el) return;
+    e.preventDefault(); var id=el.dataset.pane;
+    if(history.replaceState) history.replaceState(null,'','#'+id); else location.hash=id;
+    show(id); window.scrollTo(0,0);
+  });
+  function boot(){ show((location.hash||'#home').replace('#','')); }
+  if(document.readyState!=='loading') boot();
+  else document.addEventListener('DOMContentLoaded', boot);
+  window.addEventListener('load', function(){
+    setTimeout(function(){ resize(document.querySelector('.pane:not([hidden])')); }, 120);
+  });
+})();
+</script>"""
 
 
 # ── Per-family method / evidence sections (rendered inside dossiers) ─────────────
@@ -1644,37 +1801,56 @@ def sec_raw_reference(d: dict) -> str:
 # ── Page assembly ────────────────────────────────────────────────────────────────
 
 def render(d: dict, public: bool = False) -> str:
-    """The whole page: COCKPIT → COMPARE → DOSSIERS → OPERATIONS → LAB (private)."""
+    """The whole page as a master-detail app: a hierarchy spine + a stage of panes
+    (home · compare · one per family · one per strategy · ops · lab), one visible at a
+    time via the client-side router. Registry-driven — panes and spine both loop
+    _dossier_records(), so a new make_record() earns a spine item and a pane for free."""
     from datetime import datetime
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     cfg = d["strategy"]
+    recs = _dossier_records(d)
+    fam_order = list(dict.fromkeys(r.family for r in recs))
+
+    home = ("<section class='pane' id='pane-home'>"
+            + sec_command(d, public) + sec_headline(d) + sec_intro(d) + "</section>")
+    compare = ("<section class='pane' id='pane-compare' hidden>"
+               "<h2>Compare — every strategy, one canonical basis</h2>"
+               "<p class='dim'>The cross-strategy surfaces — leaderboard, parallel equity, "
+               "and the windows / yearly matrices — gathered here so their wide tables never "
+               "crowd the per-strategy reads.</p>"
+               + sec_registry(d, public) + sec_parallel_curves(d, public)
+               + sec_perf_compare(d, public) + sec_yearly_compare(d, public) + "</section>")
+
+    fam_panes, rec_panes = [], []
+    for fam in fam_order:
+        members = [r for r in recs if r.family == fam]
+        fam_panes.append(_family_pane(d, fam, members, public))
+        rec_panes += [_rec_pane(d, r, public) for r in members]
+
+    ops_body = sec_venture(d, public) + sec_ritual(d, public) + sec_vs_portfolio(d, public)
+    has_ops = bool(ops_body.strip())
+    ops = (("<section class='pane' id='pane-ops' hidden>"
+            "<h2>Operations — north star, ritual, your real book</h2>"
+            + ops_body + "</section>") if has_ops else "")
+
+    has_lab = not public
+    lab = (("<section class='pane' id='pane-lab' hidden>"
+            "<h2>Research lab — momentum family (private)</h2>"
+            "<p class='dim'>The momentum family's workings: how its config was chosen (the "
+            "whole 64-config grid), the raw full-invested reference, and the supporting data. "
+            "Other families keep their workings on their own lab pages.</p>"
+            + sec_raw_reference(d) + sec_survivorship(d) + sec_grid(d) + sec_feasibility(d)
+            + sec_timelines(d) + sec_method() + "</section>") if has_lab else "")
+
+    stage = ("<div class='stage'>" + home + compare + "".join(fam_panes)
+             + "".join(rec_panes) + ops + lab + "</div>")
     body = "".join([
         PAGE_CSS,
-        "<h1>Strategy — adopted stack &amp; registry</h1>",
+        "<div class='pagehead'>"
+        "<h1>Strategy — adopted stack &amp; registry</h1>"
         f"<p class='dim'>generated {now} · config {cfg.code} · "
-        f"<a href='report.html'>← portfolio</a></p>",
-        sec_command(d, public),
-        sec_headline(d),
-        sec_intro(d),
-        _band("Overview — every strategy, one canonical basis",
-              sec_registry(d, public),
-              sec_parallel_curves(d, public),
-              sec_perf_compare(d, public),
-              sec_yearly_compare(d, public)),
-        sec_dossiers(d, public),
-        _band("Operations — stack-level: north star, ritual, your real book",
-              sec_venture(d, public),
-              sec_ritual(d, public),
-              sec_vs_portfolio(d, public)),
-        ("".join([
-            "<hr style='margin:3rem 0;border:0;border-top:2px solid #333'>",
-            "<h1>Research lab — momentum family (private)</h1>"
-            "<p class='dim'>The momentum family's workings only: how its config was chosen "
-            "(the whole 64-config grid), the raw full-invested reference, and the supporting "
-            "data. Other families keep their workings on their own lab pages (vol lab, edge, "
-            "econo). Skip unless you want the details.</p>",
-            sec_raw_reference(d), sec_survivorship(d), sec_grid(d), sec_feasibility(d),
-            sec_timelines(d), sec_method(),
-        ]) if not public else ""),
+        f"<a href='report.html'>← portfolio</a></p></div>",
+        f"<div class='app'>{sec_spine(d, public, has_ops, has_lab)}{stage}</div>",
+        ROUTER_JS,
     ])
     return page(f"Strategy — {cfg.code}", body)
