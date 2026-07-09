@@ -119,6 +119,8 @@ def _inject(html: str, page: str, as_of: str | None = None,
     # break out of the loader iframe.
     html = (html.replace("href='pairs.html'", "href='/pairs' target='_top'")
                 .replace("href='momentum.html'", "href='/momentum' target='_top'")
+                .replace("href='econo.html'", "href='/econo' target='_top'")
+                .replace("href='edge.html'", "href='/edge' target='_top'")
                 .replace("href='report.html'", "href='/' target='_top'")
                 .replace("href='index.html'", "href='/' target='_top'"))
     return html.replace("<main>", "<main>" + _bar(page, as_of, stale, stale_msg, note), 1)
