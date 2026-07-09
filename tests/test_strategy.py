@@ -210,8 +210,8 @@ def test_registry_metrics_are_uniform_across_surfaces():
 def test_family_panes_and_scoped_momentum_data():
     d = _fake_d()
     html = bs.build(d, public=False)
-    # one family pane per family (the old nested frames are gone)
-    assert "id='pane-fam-momentum'" in html and "id='pane-fam-vol-managed-core'" in html
+    # one family band per family (linear cards — the panes are gone)
+    assert "data-pane" not in html
     assert "Momentum family</h2>" in html and "Vol-managed core</h2>" in html
     assert "★ contains the live tracked book" in html
     # live tracking sits INSIDE the live momentum dossier, not in Operations
@@ -290,7 +290,7 @@ def test_headline_leads_with_real_results():
     assert "live tracked book" in h                               # names what the tracker runs
     # it leads the page: cockpit (home) first, then the compare surfaces, then dossiers
     assert (html.index("The result") < html.index("Strategy registry")
-            < html.index("Walk-forward equity") < html.index("id='pane-rec-mom_ens'"))
+            < html.index("Walk-forward equity") < html.index("class='dossier'"))
 
 
 def test_headline_no_euro_amounts():
@@ -299,7 +299,7 @@ def test_headline_no_euro_amounts():
 
 def test_raw_vanity_is_off_the_main_page():
     html = bs.build(_fake_d(), public=False)
-    main = html.split("id='pane-lab'")[0]                         # everything outside the lab pane
+    main = html.split("Research lab — momentum family")[0]        # everything above the lab
     # the raw full-invested strategy appears above the lab ONLY as the flagged registry row
     assert "Raw Original" not in main
     assert "Original (raw, full-invested)" not in main           # no raw rocket trace up top
@@ -335,28 +335,19 @@ def test_parallel_chart_traces():
     assert "Your portfolio" not in h
 
 
-def test_every_strategy_gets_its_own_pane_and_spine_entry():
-    """Master-detail: one dossier pane per strategy (ensemble, single book, vol core),
-    the shared evidence relocated to the family pane — every strategy reachable from the
-    spine, none forced to share an equal-width scroll."""
+def test_dossier_cards_render_all_strategies():
+    """Linear dossier document: one self-contained card per strategy (ensemble, single
+    book, vol core) plus the megacap incubating card; the shared evidence lives in the
+    momentum family band. No spine, no panes, no router."""
     d = _fake_d()
     h = ui.render(d, public=False)
-    # a hierarchy spine + a stage of panes, one per strategy, each reachable from the spine
-    assert "class='spine'" in h
-    for pid in ("pane-home", "pane-compare", "pane-fam-momentum",
-                "pane-rec-mom_ens", "pane-rec-mom_rc", "pane-rec-vol_core"):
-        assert f"id='{pid}'" in h
-        assert f"data-pane='{pid[len('pane-'):]}'" in h
-    # four dossier cards total: ensemble · single book · family evidence · vol core
-    assert h.count("class='dossier'") == 4
-    # the shared evidence is family-scoped and lives on the FAMILY pane, not the book card
+    # linear document — the master-detail shell is gone
+    assert "class='spine'" not in h and "data-pane" not in h
+    assert "<div class='doc'>" in h
+    # a card per curve-bearing strategy + family evidence + the megacap incubating card
+    assert h.count("class='dossier'") >= 4
+    # family-scoped evidence lives in the family band, page-global framing intact
     assert "Momentum family — evidence" in h and "family-scoped, not page-global" in h
-    panes = h.split("<section class='pane'")
-    rc_pane = next(p for p in panes if "id='pane-rec-mom_rc'" in p[:70])
-    fam_pane = next(p for p in panes if "id='pane-fam-momentum'" in p[:70])
-    assert "Momentum single book" in rc_pane
-    assert "Momentum family — evidence" not in rc_pane      # evidence moved off the card
-    assert "Momentum family — evidence" in fam_pane
     # per-book history folds live inside the dossiers
     assert "Every rebalance — sleeve" in h and "Every rebalance — risk-conscious" in h
     # every ensemble sleeve gets its own order sheet (the live book here)
@@ -372,6 +363,8 @@ def test_every_strategy_gets_its_own_pane_and_spine_entry():
         assert f">{disp}<" in h
     # method folded inside each dossier, parallel panel layout inside
     assert "class='par'" in h and h.count("details class='ev'") >= 3
+    # the mega-cap screen appears as a pending incubating card
+    assert "megacap.html" in h and "awaiting" in h.lower()
 
 
 def test_command_strip_reads_the_stack_state():
@@ -819,3 +812,15 @@ def test_survivorship_banner_and_lab_header():
     lab = ui.sec_raw_reference(d)
     assert "not achievable" in lab.lower()
     assert "membership" in lab.lower()
+
+
+def test_dossier_layout_linear_no_router():
+    d = _fake_d()
+    html = bs.build(d, public=False)
+    assert "data-pane" not in html                 # master-detail shell gone
+    assert "class='spine'" not in html
+    assert "<div class='doc'>" in html             # linear document wrapper
+    assert "internal comparison" in html.lower()   # survivorship banner rides the page
+    assert "megacap.html" in html                  # megacap incubating card present
+    assert "awaiting" in html.lower()
+    assert "class='dossier'" in html               # a real family dossier still renders
