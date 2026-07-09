@@ -800,3 +800,12 @@ def test_megacap_record_present_and_pending():
     assert rec.family == "mega-cap"
     assert rec.href == "megacap.html"
     assert "awaiting_data" in rec.flags
+
+
+def test_megacap_dossier_pending_card():
+    d = _fake_d()
+    rec = next(r for r in d["registry"] if r.id == "megacap")
+    html = ui.DOSSIER_BUILDERS["megacap"](d, rec, public=False)
+    assert "awaiting" in html.lower()
+    assert "megacap.html" in html
+    assert all(w in html.lower() for w in ("size", "growth", "momentum"))

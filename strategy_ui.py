@@ -761,6 +761,24 @@ def _dossier_generic(d: dict, r, public: bool) -> str:
         r.name, r.gate or r.verdict or "—", body)
 
 
+def _dossier_megacap(d: dict, r, public: bool) -> str:
+    """Pending dossier for the mega-cap PIT screen — no live data yet, so it states the
+    design + the awaiting-data condition and links to the standalone page."""
+    body = (
+        "<p>Screen the universe to the largest names by <b>point-in-time market cap</b>, "
+        "then rank inside the top-N by three arms:</p>"
+        "<ul><li><b>size</b> — hold the biggest</li>"
+        "<li><b>growth</b> — fastest trailing YoY revenue growth</li>"
+        "<li><b>momentum</b> — 12-1 price momentum</li></ul>"
+        "<p>Fully point-in-time: shares &amp; revenue lagged 75d, membership re-ranked "
+        "every rebalance. N sweep {1,5,10,25,50}, equal-weight, net of slippage.</p>"
+        "<div class='note warn'><b>Awaiting cap data</b> — no market-cap history fetched yet "
+        "(0/400 coverage). Run the EODHD fundamentals fetch to populate, then this fills with "
+        "real numbers. <a href='megacap.html'>Open the mega-cap page ↗</a></div>")
+    return _dossier(r.color or theme.ACCENT, "research · awaiting data",
+                    r.name, r.verdict or "", body)
+
+
 # Bespoke dossier builders by registry id; anything else falls back to the generic
 # card. Adding a future strategy = one make_record() (renders immediately) and,
 # when it earns one, a builder entry here.
@@ -768,6 +786,7 @@ DOSSIER_BUILDERS = {
     "mom_ens": _dossier_mom_ens,
     "mom_rc": _dossier_mom_rc,
     "vol_core": _dossier_vol_core,
+    "megacap": _dossier_megacap,
 }
 
 
