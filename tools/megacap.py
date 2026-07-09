@@ -89,3 +89,32 @@ def cap_scores_by_date(cap: pd.DataFrame, dates) -> dict:
 
 def growth_scores_by_date(yoy: pd.DataFrame, dates) -> dict:
     return _scores_by_date(yoy, dates)
+
+
+from tools.momentum import run_momentum, rebalance_dates, precompute_scores
+
+ARMS = ("size", "growth", "momentum")
+
+
+def build_screen_and_scores(prices: pd.DataFrame, cap: pd.DataFrame,
+                            yoy: pd.DataFrame, *, n: int):
+    """Shared top-n cap eligibility + a `score_by_date` dict per arm. Panels must be
+    indexed on `rebalance_dates(prices.index)` so the keys line up with the engine's
+    internal rebalance loop."""
+    dates = rebalance_dates(prices.index)
+    elig = megacap_screen(cap, dates, n)
+    scores = {"size": cap_scores_by_date(cap, dates),
+              "growth": growth_scores_by_date(yoy, dates),
+              "momentum": precompute_scores(prices, dates)}
+    return elig, scores
+
+
+def run_arms(prices: pd.DataFrame, slippage_bps: dict, cap: pd.DataFrame,
+             yoy: pd.DataFrame, *, n: int, k: int = 10, **kw) -> dict:
+    """Run size/growth/momentum on the shared top-n cap screen. Each arm injects the
+    same `elig_by_date` (top-n cap) and its own `score_by_date`; the engine is not
+    forked. Extra kwargs (lookback, skip, start, cost_mults, ...) pass through."""
+    elig, scores = build_screen_and_scores(prices, cap, yoy, n=n)
+    return {arm: run_momentum(prices, slippage_bps, k=k,
+                              elig_by_date=elig, score_by_date=scores[arm], **kw)
+            for arm in ARMS}

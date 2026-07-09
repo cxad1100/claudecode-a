@@ -60,3 +60,38 @@ def test_scores_by_date_shape():
     assert set(sc[dates[0]]) == {"raw", "voladj"}
     assert sc[dates[0]]["raw"].equals(sc[dates[0]]["voladj"])
     assert sc[dates[0]]["raw"]["BIG"] == 100.0
+
+
+from tools.megacap import run_arms, ARMS
+from tools.momentum import rebalance_dates
+
+
+def _synth_market():
+    # ~14 months daily so >=1 monthly rebalance clears lookback; two names.
+    idx = pd.bdate_range("2021-01-01", periods=300)
+    # BIG rises fastest (best momentum); SMALL flat.
+    prices = pd.DataFrame({"BIG": np.linspace(10, 40, 300),
+                           "SMALL": np.linspace(10, 11, 300)}, index=idx)
+    dates = rebalance_dates(prices.index)
+    cap = pd.DataFrame({"BIG": 5.0, "SMALL": 100.0}, index=dates)   # SMALL bigger cap
+    yoy = pd.DataFrame({"BIG": 0.9, "SMALL": 0.1}, index=dates)     # BIG grows faster
+    slip = {"BIG": 10, "SMALL": 10}
+    return prices, cap, yoy, slip
+
+
+def test_run_arms_returns_three_runs():
+    prices, cap, yoy, slip = _synth_market()
+    res = run_arms(prices, slip, cap, yoy, n=2, k=1, lookback=200, skip=21)
+    assert set(res) == set(ARMS)
+    assert all("runs" in res[a] for a in ARMS)
+
+
+def test_arms_pick_by_their_own_score():
+    prices, cap, yoy, slip = _synth_market()
+    res = run_arms(prices, slip, cap, yoy, n=2, k=1, lookback=200, skip=21)
+    size_picks = [p for h in res["size"]["holdings_log"] for p in h["picks"]]
+    grow_picks = [p for h in res["growth"]["holdings_log"] for p in h["picks"]]
+    mom_picks = [p for h in res["momentum"]["holdings_log"] for p in h["picks"]]
+    assert set(size_picks) == {"SMALL"}      # SMALL has the larger cap
+    assert set(grow_picks) == {"BIG"}        # BIG has the faster revenue growth
+    assert set(mom_picks) == {"BIG"}         # BIG has the stronger 12-1 momentum
