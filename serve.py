@@ -212,6 +212,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(_loader("/edge-report" + ("?force=1" if force else "")))
         elif path == "/econo":
             self._send(_loader("/econo-report" + ("?force=1" if force else "")))
+        elif path == "/megacap":
+            self._send(_loader("/megacap-report" + ("?force=1" if force else "")))
         elif path == "/report":
             self._serve_report("main", force)
         elif path == "/pairs-report":
@@ -226,6 +228,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_report("edge", force)
         elif path == "/econo-report":
             self._serve_report("econo", force)
+        elif path == "/megacap-report":
+            self._serve_report("megacap", force)
         else:
             self.send_error(404)
 
