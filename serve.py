@@ -26,6 +26,7 @@ import build_strategy_report as ST   # the Strategy page folds the momentum lab 
 import build_vol_report as V         # vol lab — forecast-based volatility targeting
 import build_edge_report as E        # edge stack — structural edges (capacity/flows/horizon/costs)
 import build_econo_report as EC      # econophysics lab — signals vs the production gate
+import build_megacap_report as MC    # mega-cap PIT screen — size/growth/momentum arms
 
 PORT = 8000
 
@@ -38,6 +39,7 @@ PAGES = {
     "vol":      dict(loader="/vol",      build="/vol-report",       snap=V.ROOT / "local/vol.html"),
     "edge":     dict(loader="/edge",     build="/edge-report",      snap=E.ROOT / "local/edge.html"),
     "econo":    dict(loader="/econo",    build="/econo-report",     snap=EC.OUT),
+    "megacap":  dict(loader="/megacap",  build="/megacap-report",   snap=MC.ROOT / "local/megacap.html"),
 }
 
 # cross-page nav links shown in the top bar, in display order.
@@ -120,6 +122,7 @@ def _inject(html: str, page: str, as_of: str | None = None,
     html = (html.replace("href='pairs.html'", "href='/pairs' target='_top'")
                 .replace("href='momentum.html'", "href='/momentum' target='_top'")
                 .replace("href='econo.html'", "href='/econo' target='_top'")
+                .replace("href='megacap.html'", "href='/megacap' target='_top'")
                 .replace("href='edge.html'", "href='/edge' target='_top'")
                 .replace("href='report.html'", "href='/' target='_top'")
                 .replace("href='index.html'", "href='/' target='_top'"))
