@@ -809,3 +809,13 @@ def test_megacap_dossier_pending_card():
     assert "awaiting" in html.lower()
     assert "megacap.html" in html
     assert all(w in html.lower() for w in ("size", "growth", "momentum"))
+
+
+def test_survivorship_banner_and_lab_header():
+    d = _fake_d()
+    b = ui.sec_survivorship_banner(d)
+    assert "internal comparison" in b.lower()
+    assert "vol-core" in b.lower()
+    lab = ui.sec_raw_reference(d)
+    assert "not achievable" in lab.lower()
+    assert "membership" in lab.lower()

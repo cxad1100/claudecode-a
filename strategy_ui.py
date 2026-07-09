@@ -285,6 +285,20 @@ def sec_headline(d: dict) -> str:
         f"<div class='cards'>{cards}</div>")
 
 
+def sec_survivorship_banner(d: dict) -> str:
+    """Standing banner: the whole momentum family trades a survivor-biased universe, so
+    its returns are internal-comparison-only; the survivorship-robust anchor is the GARCH
+    vol-core on a clean world index."""
+    vc = (d.get("vol_core") or {}).get("etf", "a clean world-index ETF")
+    return (
+        "<div class='note warn' style='border-left-width:6px'>"
+        "<b>Read the momentum numbers as internal comparisons, not achievable returns.</b> "
+        "The momentum family trades a <b>survivor-biased universe</b> (today's liquid Frankfurt "
+        "cross-listings), so its gains are inflated by an <b>absent-winners / membership tilt</b> "
+        "— an equal-weight hold of those same members is already large on its own. The one "
+        f"<b>survivorship-robust</b> result is the adopted <b>GARCH vol-core</b> on {vc}.</div>")
+
+
 def sec_intro(d: dict) -> str:
     cfg = d["strategy"]
     nc = d["n_countries"]
@@ -1805,8 +1819,11 @@ def sec_raw_reference(d: dict) -> str:
     fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
     fig.update_layout(height=380, yaxis_title="Index (start = 100)",
                       hovermode="x unified", margin=dict(t=20))
-    return ("<h2>Raw Original — reference only</h2>"
-            "<div class='note warn'>This is the <b>raw, full-invested</b> version of the same "
+    return ("<h2>Survivorship-inflated — not achievable</h2>"
+            "<div class='note warn'>This raw, full-invested book carries <b>two survivorship "
+            "leaks</b> — holding-dead names (measured immaterial) and, the dominant one, an "
+            "<b>absent-winners / membership tilt</b> from ranking only today's survivors. It is "
+            "the <b>raw, full-invested</b> version of the same "
             f"selection. Its full-window total (<b>{_pct(raw['full']['net_return'] * 100)}</b>) and "
             f"test-window return (<b>{_pct(raw['test']['net_return'] * 100)}</b>) are <b>inflated by "
             f"survivorship and by holding a ~{raw['perf']['ann_vol'] * 100:.0f}%-vol book at full "
