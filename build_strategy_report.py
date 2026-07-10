@@ -694,12 +694,17 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     portfolio_roi, vs_scale = None, None
     pf_csv = ROOT / "input" / "portfolio.csv"
     if pf_csv.exists():
+        txns = None
         try:
             txns = parse_portfolio(pf_csv)["transactions"]
             pr, _ = build_roi_timeseries(txns)
             if pr is not None and not pr.empty:
                 portfolio_roi = pr
-            invested = sum(float(t["price"]) for t in txns if t["action"] == "buy")
+        except Exception:
+            portfolio_roi = None
+        try:                                    # vs_scale is separable — a failure here
+            invested = sum(float(t["price"])    # must NOT wipe portfolio_roi parsed above
+                           for t in (txns or []) if t["action"] == "buy")
             if invested > 0:
                 vsr = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=invested,
                                    cost_mults=(1.0,), start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
@@ -711,7 +716,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                                 rc_equity=qg.vol_target(vse, target_vol=RISK_TARGET_VOL,
                                                         turn_cost_bps=RC_TURN_BPS).get("equity"))
         except Exception:
-            portfolio_roi = None
+            vs_scale = None
 
     n_countries = len({m.get("country") for m in meta.values()} - {"—", None})
     registry = build_registry(variants, ensemble=ensemble, vol_core=vol_core,
