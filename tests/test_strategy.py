@@ -207,20 +207,15 @@ def test_registry_metrics_are_uniform_across_surfaces():
     assert live.name.split(" — ")[0] in ui.sec_headline(d)
 
 
-def test_family_panes_and_scoped_momentum_data():
+def test_menu_and_uniform_strategy_panes():
     d = _fake_d()
     html = bs.build(d, public=False)
-    # one family band per family (linear cards — the panes are gone)
-    assert "data-pane" not in html
-    assert "Momentum family</h2>" in html and "Vol-managed core</h2>" in html
-    assert "★ contains the live tracked book" in html
-    # live tracking sits INSIDE the live momentum dossier, not in Operations
-    assert html.index("Live tracking — pre-registered kill criteria") \
-        < html.index("Operations — north star")
-    # the lab is explicitly momentum-scoped
-    assert "Research lab — momentum family" in html
-    # data-first: explainer paragraphs fold behind the tables, legends stay one-line
-    assert "how to read this table" in html and "class='legend'" in html
+    # left menu (spine) with a button + pane per strategy
+    assert "class='spine'" in html and "class='app'" in html
+    assert "data-pane='rec-mom_ens'" in html and "id='pane-rec-vol_core'" in html
+    # the research + lab panes exist; the lab is momentum-scoped
+    assert "id='pane-research'" in html and "Research lab — momentum family" in html
+    assert "class='legend'" in html
 
 
 def test_family_ordering_is_contiguous():
@@ -288,9 +283,9 @@ def test_headline_leads_with_real_results():
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
     assert "Deflated Sharpe" in h or "P(true" in h
     assert "live tracked book" in h                               # names what the tracker runs
-    # it leads the page: cockpit (home) first, then the compare surfaces, then dossiers
-    assert (html.index("The result") < html.index("Strategy registry")
-            < html.index("Walk-forward equity") < html.index("class='dossier'"))
+    # the Overview pane leads: the result verdict, then the all-strategies chart, then the registry
+    assert (html.index("The result") < html.index("Walk-forward equity — all strategies")
+            < html.index("Strategy registry"))
 
 
 def test_headline_no_euro_amounts():
@@ -335,35 +330,22 @@ def test_parallel_chart_traces():
     assert "Your portfolio" not in h
 
 
-def test_dossier_cards_render_all_strategies():
-    """Linear dossier document: one self-contained card per strategy (ensemble, single
-    book, vol core) plus the megacap incubating card; the shared evidence lives in the
-    momentum family band. No spine, no panes, no router."""
+def test_master_detail_menu_and_uniform_panes():
+    """Master-detail: a left menu + one pane per strategy (ensemble, single book, vol
+    core, mega-cap), each using the SAME uniform template. The default Overview pane
+    plots every strategy vs benchmarks + the real portfolio."""
     d = _fake_d()
     h = ui.render(d, public=False)
-    # linear document — the master-detail shell is gone
-    assert "class='spine'" not in h and "data-pane" not in h
-    assert "<div class='doc'>" in h
-    # a card per curve-bearing strategy + family evidence + the megacap incubating card
-    assert h.count("class='dossier'") >= 4
-    # family-scoped evidence lives in the family band, page-global framing intact
-    assert "Momentum family — evidence" in h and "family-scoped, not page-global" in h
-    # per-book history folds live inside the dossiers
-    assert "Every rebalance — sleeve" in h and "Every rebalance — risk-conscious" in h
-    # every ensemble sleeve gets its own order sheet (the live book here)
-    for code in d["ensemble"]["codes"]:
-        assert code in h
-    assert "Sleeve 1/3" in h and "★ live book" in h
-    # the vol core is actionable too: the ETF row + today's target exposure
-    assert "IWDA" in h and "IE00B4L5Y983" in h and "today's order" in h
-    # tradeable rows for the momentum picks
-    picks = next(hh["picks"] for hh in reversed(d["res"]["holdings_log"]) if hh["picks"])
-    for t in picks:
-        disp = str(d["meta"][t].get("home") or t).split(".")[0]
-        assert f">{disp}<" in h
-    # method folded inside each dossier, parallel panel layout inside
-    assert "class='par'" in h and h.count("details class='ev'") >= 3
-    # the mega-cap screen appears as a pending incubating card
+    # the app shell: menu + router, one pane + one menu button per strategy
+    assert "class='spine'" in h and "class='app'" in h
+    for rid in ("mom_ens", "mom_rc", "vol_core", "megacap"):
+        assert f"id='pane-rec-{rid}'" in h and f"data-pane='rec-{rid}'" in h
+    # default Overview pane: the all-strategies chart including the real portfolio
+    assert "id='pane-home'" in h and "Your portfolio (real" in h
+    # uniform template: every curve-bearing strategy pane carries the windows table +
+    # a method fold (same template for each)
+    assert h.count("<th>Window</th>") >= 3 and h.count("method / verdict") >= 3
+    # the mega-cap screen appears as a pending pane linking to its page
     assert "megacap.html" in h and "awaiting" in h.lower()
 
 
@@ -408,12 +390,11 @@ def test_yearly_matrix_has_one_column_per_strategy():
     assert "€" not in ui.sec_yearly_compare(d, public=True)
 
 
-def test_history_folds_live_inside_dossiers():
-    d = _fake_d()
-    h = ui.render(d, public=False)
-    # one history fold per momentum book: 3 sleeves + the single rc book
-    assert h.count("Every rebalance — sleeve") == 3
-    assert h.count("Every rebalance — risk-conscious") == 1
+def test_strategy_panes_share_one_template():
+    h = ui.render(_fake_d(), public=False)
+    # every curve-bearing strategy pane shows the same stat tiles + an equity chart
+    assert h.count("Test Sharpe") >= 3 and h.count("Max drawdown") >= 3
+    assert h.count("class='chart'") >= 4   # 3 strategy curves + the overview chart
 
 
 def test_grade_section_has_no_scare_box():
@@ -445,10 +426,10 @@ def test_phantom_trials_block_shows_decay_and_harvey():
 def test_no_info_dropped_from_page():
     html = bs.build(_fake_d(), public=False)
     for phrase in ["Strategy registry", "Registry ledger",
-                   "Momentum single book", "GARCH vol-managed IWDA core",
+                   "Risk-conscious", "GARCH vol-managed IWDA core",
                    "Walk-forward equity", "Performance — all strategies",
                    "Quant scorecard", "Deflated Sharpe",
-                   "Yearly P&amp;L", "Every rebalance", "survivorship is NOT corrected",
+                   "Yearly P&amp;L", "survivorship is NOT corrected",
                    "Regime", "Concentration", "Capacity", "Research lab"]:
         assert phrase in html, f"dropped: {phrase!r}"
 
@@ -814,13 +795,10 @@ def test_survivorship_banner_and_lab_header():
     assert "membership" in lab.lower()
 
 
-def test_dossier_layout_linear_no_router():
+def test_master_detail_shell_and_reframe():
     d = _fake_d()
     html = bs.build(d, public=False)
-    assert "data-pane" not in html                 # master-detail shell gone
-    assert "class='spine'" not in html
-    assert "<div class='doc'>" in html             # linear document wrapper
-    assert "internal comparison" in html.lower()   # survivorship banner rides the page
-    assert "megacap.html" in html                  # megacap incubating card present
-    assert "awaiting" in html.lower()
-    assert "class='dossier'" in html               # a real family dossier still renders
+    assert "data-pane" in html and "class='spine'" in html   # master-detail shell
+    assert "class='app'" in html
+    assert "internal comparison" in html.lower()             # survivorship banner
+    assert "megacap.html" in html and "awaiting" in html.lower()
