@@ -691,15 +691,16 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             scenarios = None
 
     # ── Your real portfolio's ROI + a same-scale strategy run, for the head-to-head ──
-    portfolio_roi, vs_scale = None, None
+    portfolio_roi, vs_scale, portfolio_bench = None, None, {}
     pf_csv = ROOT / "input" / "portfolio.csv"
     if pf_csv.exists():
         txns = None
         try:
             txns = parse_portfolio(pf_csv)["transactions"]
-            pr, _ = build_roi_timeseries(txns)
+            pr, pf_bench = build_roi_timeseries(txns)   # keep the cash-flow-matched benchmarks
             if pr is not None and not pr.empty:
                 portfolio_roi = pr
+                portfolio_bench = pf_bench or {}        # the /portfolio report's own market view
         except Exception:
             portfolio_roi = None
         try:                                    # vs_scale is separable — a failure here
@@ -723,7 +724,8 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
                               vol_core_eq=vol_core_eq, bench=bench, ew_eq=ew_eq,
                               portfolio_roi=portfolio_roi)
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
-                portfolio_roi=portfolio_roi, vs_scale=vs_scale, variants=variants,
+                portfolio_roi=portfolio_roi, portfolio_bench=portfolio_bench,
+                vs_scale=vs_scale, variants=variants,
                 registry=registry, ew_eq=ew_eq,
                 strategy=cfg, raw_windows=dict(train=train, val=val, test=test),
                 graveyard_hits=hits,

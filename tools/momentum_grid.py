@@ -150,3 +150,44 @@ def pick_ultimate(grid: dict, *, capital: float = 10_000.0, fee_eur: float = 1.0
     if not cands:
         return None
     return max(cands, key=lambda x: (x[0], x[1]))[2]
+
+
+def _window_values(grid: dict, window: str, metric: str) -> list:
+    """Every config's `window` `metric` across the grid, skipping cells that lack the
+    window or carry NaN — the raw sample the distribution/percentile helpers share."""
+    out = []
+    for c in grid.get("cells", []):
+        w = c.get(window)
+        if not w:
+            continue
+        v = w.get(metric)
+        if v is not None and v == v:                       # not None, not NaN
+            out.append(float(v))
+    return out
+
+
+def grid_distribution(grid: dict, *, window: str = "test") -> dict:
+    """Distribution of every config's `window` sharpe and net_return across the WHOLE
+    grid — the honest 'complete data across all configs' summary that refuses the
+    single-best cherry-pick. Returns {"n", "sharpe", "ret"}, each metric a
+    {"n","median","lo","hi","min","max"} (lo/hi = 10th/90th pctile) or None if empty."""
+    def _summ(xs):
+        if not xs:
+            return None
+        s = pd.Series(xs, dtype=float)
+        return dict(n=len(xs), median=float(s.median()),
+                    lo=float(s.quantile(0.10)), hi=float(s.quantile(0.90)),
+                    min=float(s.min()), max=float(s.max()))
+    sh = _window_values(grid, window, "sharpe")
+    rt = _window_values(grid, window, "net_return")
+    return dict(n=max(len(sh), len(rt)), sharpe=_summ(sh), ret=_summ(rt))
+
+
+def grid_percentile(grid: dict, value: float, *, window: str = "test",
+                    metric: str = "sharpe") -> float:
+    """Percentile (0..100) of `value` among all configs' `window` `metric` — where the
+    live book sits inside the full grid. NaN if no cell qualifies."""
+    xs = _window_values(grid, window, metric)
+    if not xs:
+        return float("nan")
+    return 100.0 * sum(x <= value for x in xs) / len(xs)

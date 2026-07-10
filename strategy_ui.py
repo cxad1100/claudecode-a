@@ -35,6 +35,7 @@ from tools.report_html import pct as _pct, card as _card, page, fig_html
 from tools import theme, quant_grade as qg
 from tools import strategy_registry as sreg
 from tools.momentum import benchmark_curves
+from tools.momentum_grid import grid_distribution, grid_percentile
 from build_momentum_report import (
     START, TRAIN_END, VAL_END, MIN_TURNOVER,
     _disp, _name, _pnl_color, _equity_window,
@@ -230,9 +231,10 @@ def _live_record(d: dict):
 
 
 def sec_headline(d: dict) -> str:
-    """The real result, up top — the ★ LIVE book's own numbers (never a different
-    variant's under the same label), two sentences, stat tiles. The inflated raw
-    full-invested number lives in the research lab."""
+    """The honest headline: the WHOLE config grid's own distribution up top — median
+    and 10–90% range across every config, and where the ★ live tracked book sits inside
+    it — never the single best-picked config dressed up as 'the result'. Falls back to
+    the live book's own numbers if no grid is present. Raw full-invested lives in the lab."""
     rc = d["variants"][1]
     live = _live_record(d)
     lw = (live.windows if live is not None else None) or {}
@@ -248,6 +250,48 @@ def sec_headline(d: dict) -> str:
     ph = s.get("dsr_phantom") or []
     worst = ph[-1]["dsr"] if ph else dsr["dsr"]
     dsr_ok = dsr["dsr"] == dsr["dsr"]                       # not NaN
+
+    grid = d.get("grid")
+    dist = grid_distribution(grid, window="test") if grid else None
+    if dist and dist["sharpe"]:
+        ds, dr, n = dist["sharpe"], dist["ret"], dist["n"]
+        pct = grid_percentile(grid, t["sharpe"], window="test", metric="sharpe")
+        pct_ok = pct == pct                                # not NaN
+        pos = f"<b>{pct:.0f}th percentile</b>" if pct_ok else "<b>its slot</b>"
+        med_ret = f", median return <b>{_pct(dr['median'] * 100)}</b>" if dr else ""
+        dsr_txt = (f" · <b>Deflated Sharpe</b> pays for the {n}-config search: "
+                   f"P(true&gt;0) <b>{dsr['dsr']:.0%}</b> (phantom-worst {worst:.0%})"
+                   if dsr_ok else "")
+        cards = "".join([
+            _card("Configs searched", f"{n}"),
+            _card("Median test Sharpe (all)", f"{ds['median']:.2f}"),
+            _card("Test Sharpe 10–90%", f"{ds['lo']:.2f}–{ds['hi']:.2f}"),
+            _card("★ Live book Sharpe",
+                  f"{t['sharpe']:.2f}" + (f" · {pct:.0f}th pctile" if pct_ok else "")),
+            _card("★ Live test return", _pct(t["net_return"] * 100)),
+            _card("Deflated Sharpe (P real&gt;0)", f"{dsr['dsr']:.0%}" if dsr_ok else "—"),
+        ])
+        return (
+            "<h2>The whole grid — not one lucky config</h2>"
+            f"<div class='note' style='border-left-color:{C_RC};border-left-width:6px'>"
+            f"Across <b>all {n} configs</b> in the search the <b>median</b> held-out test "
+            f"Sharpe ({TEST_FROM}) is <b>{ds['median']:.2f}</b> "
+            f"(10–90% <b>{ds['lo']:.2f}–{ds['hi']:.2f}</b>, "
+            f"full range {ds['min']:.2f}–{ds['max']:.2f}){med_ret} — that spread "
+            "<em>is</em> the result, not the single best-picked cell. The ★ <b>live "
+            f"tracked book</b> — <b>{live_name}</b> — sits at {pos} of that grid: "
+            f"test Sharpe <b>{t['sharpe']:.2f}</b>, return <b>{_pct(t['net_return'] * 100)}</b>, "
+            f"<b>{ann_vol * 100:.0f}% vol</b>, max drawdown <b>{_pct(max_dd * 100)}</b> "
+            "(canonical basis; full-history risk). <b>Monte Carlo</b>, selection-level: it beats "
+            f"<b>{beat:.1f}%</b> of {mc['n_trials']:,} random books "
+            f"(p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}){dsr_txt} · bootstrap {ci['conf']}% Sharpe CI "
+            f"<b>{ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}</b>. The honest grade "
+            f"<b style='color:{_GRADE_COLOR[g]}'>{g}</b> scores the single-config risk-conscious "
+            "variant. Every strategy has its own dossier below; the full evidence sits in the "
+            "momentum family card.</div>"
+            f"<div class='cards'>{cards}</div>")
+
+    # ── fallback (no grid): prior single-book framing ──
     cards = "".join([
         _card("★ Live test Sharpe", f"{t['sharpe']:.2f}"),
         _card("★ Live test return", _pct(t["net_return"] * 100)),
@@ -909,9 +953,10 @@ def _spine(d: dict, public: bool, has_ops: bool, has_lab: bool) -> str:
 
 
 def _chart_all(d: dict, public: bool) -> str:
-    """The Overview chart: every curve-bearing strategy vs the benchmarks, the
-    equal-weight baseline, and (private) the real portfolio — rebased to 100 at the
-    common start."""
+    """The Overview chart: every curve-bearing strategy vs the benchmarks and the
+    equal-weight baseline, rebased to 100 at the common start. The real book is NOT on
+    this axis — over the strategies' multi-year window it rebases to a late stub that
+    reads as a loser; it gets its own faithful cash-flow-matched panel (sec_portfolio_roi)."""
     window = _equity_window(d["res"])
     recs = [r for r in sreg.family_ordered(d.get("registry") or [])
             if r.equity is not None and "inflated" not in r.flags
@@ -934,24 +979,48 @@ def _chart_all(d: dict, public: bool) -> str:
     for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():
         fig.add_trace(go.Scatter(x=curve.index, y=curve / d["capital"] * 100.0, name=name,
                                  line=dict(width=1.2)))
-    pr = d.get("portfolio_roi")
-    if pr is not None and not public:
-        srs = pr.dropna()
-        if len(srs) >= 2:
-            base = 1.0 + float(srs.iloc[0])
-            fig.add_trace(go.Scatter(x=srs.index, y=100.0 * (1.0 + srs) / base,
-                                     name="Your portfolio (real, cash-flow-timed)",
-                                     line=dict(color="#ffffff", width=1.6, dash="dash")))
     fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
     fig.update_layout(height=520, yaxis_title="Index (start = 100)",
                       hovermode="x unified", margin=dict(t=20))
     return f"<div class='chart'>{fig_html(fig)}</div>"
 
 
+def sec_portfolio_roi(d: dict, public: bool) -> str:
+    """Your real book vs its cash-flow-matched market benchmarks over its OWN window, in
+    cumulative ROI % — the same data and view as the /portfolio report's ROI chart (same
+    euros, same dates, into each benchmark). Private: never on the public Pages build."""
+    pr = d.get("portfolio_roi")
+    if public or pr is None or getattr(pr, "empty", True):
+        return ""
+    srs = pr.dropna()
+    if len(srs) < 2:
+        return ""
+    bench = d.get("portfolio_bench") or {}
+    fig = go.Figure()
+    for name, b in bench.items():                       # benchmarks thin, in the back
+        bs_ = b.dropna()
+        if len(bs_) >= 2:
+            fig.add_trace(go.Scatter(x=bs_.index, y=bs_.values, name=name,
+                                     line=dict(width=1.3)))
+    fig.add_trace(go.Scatter(x=srs.index, y=srs.values,           # your book: thick white, on top
+                             name="Your portfolio (real, cash-flow-timed)",
+                             line=dict(color="#ffffff", width=2.6)))
+    fig.add_hline(y=0, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
+    fig.update_layout(height=380, yaxis_title="Cumulative ROI (%)",
+                      hovermode="x unified", margin=dict(t=20))
+    start = srs.index[0].strftime("%Y-%m-%d")
+    return (f"<h2>Your real book vs the market — cash-flow-matched (from {start})</h2>"
+            "<p class='legend'>the same euros on the same dates into each benchmark; your "
+            "book in white. Same data &amp; method as the Portfolio page — over your own "
+            "window, not rebased onto the strategies' multi-year axis.</p>"
+            f"<div class='chart'>{fig_html(fig)}</div>")
+
+
 def _pane_compare_all(d: dict, public: bool) -> str:
     """The default (Overview) pane shown when no strategy is selected: command strip,
-    the result verdict, the survivorship banner, the all-strategies comparison chart
-    (vs benchmarks + the real portfolio), and the registry leaderboard."""
+    the full-grid result verdict, the survivorship banner, the all-strategies comparison
+    chart (strategies vs benchmarks), the real book's own cash-flow-matched ROI panel,
+    and the registry leaderboard."""
     return ("<section class='pane' id='pane-home'>"
             + sec_command(d, public) + sec_headline(d)
             + sec_survivorship_banner(d)
@@ -959,6 +1028,7 @@ def _pane_compare_all(d: dict, public: bool) -> str:
             "<p class='legend'>index = 100 at common start; click legend entries to "
             "toggle lines; pick a strategy in the menu for its detail</p>"
             + _chart_all(d, public)
+            + sec_portfolio_roi(d, public)
             + sec_registry(d, public)
             + sec_perf_compare(d, public)
             + sec_yearly_compare(d, public)

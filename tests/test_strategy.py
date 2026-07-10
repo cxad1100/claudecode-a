@@ -57,6 +57,10 @@ def _fake_d():
         fc_now=0.11, w_now=1.0, asof="2026-07-04")
     ew_eq = eq * 0.98
     portfolio_roi = pd.Series(np.linspace(0.0, 20.0, 300), index=idx[200:])
+    # the cash-flow-matched benchmark ROI the /portfolio report also returns (kept, not
+    # discarded) so the real book shows vs its own market benchmarks over its own window
+    portfolio_bench = {"S&P 500": pd.Series(np.linspace(0.0, 12.0, 300), index=idx[200:]),
+                       "MSCI World": pd.Series(np.linspace(0.0, 10.0, 300), index=idx[200:])}
     registry = bs.build_registry(variants, ensemble=ens_full, vol_core=vol_core,
                                  vol_core_eq=vol_core_eq, bench=benchmarks, ew_eq=ew_eq,
                                  portfolio_roi=portfolio_roi,
@@ -70,10 +74,20 @@ def _fake_d():
                      n_eff_weight=5.0, k=5)
                 for i, h in enumerate(res["holdings_log"]) if h["picks"]]
     track = dict(n=12, needed=63, kill=False, reasons=[], path="local/strategy_track.csv")
+    # the 64-config grid, synthetic: test-window sharpe/return fanned across configs so
+    # the headline's full-grid distribution has a real spread to summarize
+    grid = dict(train_end=TE, val_end=VE, cells=[
+        dict(code=f"C{i:02d}", config=None, trades_per_year=20.0,
+             train=dict(sharpe=0.8, net_return=1.0), val=dict(sharpe=0.9, net_return=0.5),
+             test=dict(sharpe=0.2 + 0.12 * i, net_return=0.05 * i),
+             full=dict(sharpe=0.2 + 0.12 * i, net_return=0.05 * i), timeline=[])
+        for i in range(8)])
     return dict(prices=px, res=res, benchmarks=benchmarks, capital=10_000.0, track=track,
+                grid=grid,
                 meta={t: dict(name=t, local_id="000", country="X", sector="Y") for t in px.columns},
                 strategy=bs.STRATEGY, quant=quant, variants=variants,
-                registry=registry, ew_eq=ew_eq, portfolio_roi=portfolio_roi, vs_scale=None,
+                registry=registry, ew_eq=ew_eq, portfolio_roi=portfolio_roi,
+                portfolio_bench=portfolio_bench, vs_scale=None,
                 vol_core=vol_core,
                 ensemble={k: v for k, v in ens_full.items() if k != "equity"},
                 raw_windows=dict(train=train, val=val, test=test), graveyard_hits=0,
@@ -207,6 +221,22 @@ def test_registry_metrics_are_uniform_across_surfaces():
     assert live.name.split(" — ")[0] in ui.sec_headline(d)
 
 
+def test_headline_leads_with_full_grid_distribution_not_the_best_pick():
+    """The Overview headline must show the honest distribution ACROSS ALL configs
+    (median + range over the grid, where the live book sits) — not present the single
+    pick_ultimate winner as 'the result'. Live book Sharpe + name stay (uniformity)."""
+    from tools.momentum_grid import grid_distribution
+    d = _fake_d()
+    h = ui.sec_headline(d)
+    assert "median" in h.lower()                            # a distribution, not one number
+    assert "config" in h.lower()                            # across the config grid
+    med = grid_distribution(d["grid"], window="test")["sharpe"]["median"]
+    assert f"{med:.2f}" in h                                # the grid median is actually shown
+    live = next(r for r in d["registry"] if r.live)         # still carries the live book
+    assert f"{live.windows['test']['sharpe']:.2f}" in h
+    assert live.name.split(" — ")[0] in h
+
+
 def test_menu_and_uniform_strategy_panes():
     d = _fake_d()
     html = bs.build(d, public=False)
@@ -278,18 +308,39 @@ def test_headline_leads_with_real_results():
     # the old alarmist "the headline is inflated" banner is gone
     assert "Read this first" not in html
     h = ui.sec_headline(d)
-    assert "The result" in h                                      # confident, real-results lead
+    assert "whole grid" in h and "not one lucky config" in h      # honest full-grid lead, not a cherry-pick
     assert "Monte Carlo" in h                                     # the validation up front
     assert "held-out" in h.lower() or "out-of-sample" in h.lower()
     assert "Deflated Sharpe" in h or "P(true" in h
     assert "live tracked book" in h                               # names what the tracker runs
     # the Overview pane leads: the result verdict, then the all-strategies chart, then the registry
-    assert (html.index("The result") < html.index("Walk-forward equity — all strategies")
+    assert (html.index("The whole grid") < html.index("Walk-forward equity — all strategies")
             < html.index("Strategy registry"))
 
 
 def test_headline_no_euro_amounts():
     assert "€" not in ui.sec_headline(_fake_d())                  # percentages / Sharpe only
+
+
+def test_portfolio_roi_matches_the_portfolio_report_view():
+    """The Overview shows the real book the way the /portfolio report does: cumulative
+    ROI% vs its OWN cash-flow-matched benchmarks over its own window — not a rebased
+    stub on the 2019 all-strategies chart. Private only."""
+    d = _fake_d()
+    h = ui.sec_portfolio_roi(d, public=False)
+    assert "Your portfolio" in h
+    assert "S&amp;P 500" in h or "S&P 500" in h                   # a cash-flow-matched benchmark
+    assert "ROI" in h                                             # ROI% axis, matching /portfolio
+    assert ui.sec_portfolio_roi(d, public=True) == ""            # private-only, never on Pages
+
+
+def test_overview_portfolio_is_not_a_rebased_stub():
+    """The misleading 2019-rebased portfolio line is gone from the all-strategies chart;
+    the real book still appears on the Overview, via the faithful ROI panel."""
+    d = _fake_d()
+    home = ui._pane_compare_all(d, public=False)
+    assert "Your portfolio (real" in home                        # still present on the Overview
+    assert "cash-flow-matched" in home.lower() or "vs the market" in home.lower()
 
 
 def test_raw_vanity_is_off_the_main_page():
@@ -409,8 +460,8 @@ def test_significance_section_rendered_once():
     html = bs.build(_fake_d(), public=False)
     assert html.count("Significance &amp; robustness") == 1
     assert "Monte" in html or "random books" in html            # the validation is present
-    # the beat/DSR stat cards live in the headline ONLY — no duplicated card row
-    assert html.count("Beats random books") == 1
+    # the grid/DSR stat cards live in the headline ONLY — no duplicated card row
+    assert html.count("Median test Sharpe (all)") == 1
 
 
 def test_phantom_trials_block_shows_decay_and_harvey():
