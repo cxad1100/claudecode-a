@@ -111,3 +111,32 @@ def test_vol_target_reduces_drawdown():
     assert len(vt["exposure"]) == len(vt["equity"])
     assert 0 < vt["exposure_latest"] <= 1.0
     assert (vt["exposure"].dropna() <= 1.0 + 1e-9).all()
+
+
+def test_blend_equity_starts_at_capital_and_bounded():
+    idx = pd.bdate_range("2020-01-01", periods=100)
+    a = pd.Series(100.0 * np.linspace(1, 2.0, 100), index=idx)   # +100%
+    b = pd.Series(100.0 * np.linspace(1, 1.2, 100), index=idx)   # +20%
+    eq = Q.blend_equity({"A": a, "B": b}, {"A": 0.5, "B": 0.5}, 100.0)
+    assert abs(eq.iloc[0] - 100.0) < 1e-9
+    assert a.iloc[-1] > eq.iloc[-1] > b.iloc[-1]                 # blend sits between constituents
+
+
+def test_blend_equity_single_curve_is_identity():
+    idx = pd.bdate_range("2020-01-01", periods=50)
+    a = pd.Series(np.linspace(100.0, 150.0, 50), index=idx)      # starts at capital
+    eq = Q.blend_equity({"A": a}, {"A": 1.0}, 100.0)
+    pd.testing.assert_series_equal(eq, a, check_names=False, check_freq=False)
+
+
+def test_blend_equity_renormalizes_weights():
+    idx = pd.bdate_range("2020-01-01", periods=60)
+    a = pd.Series(100.0 * np.linspace(1, 1.5, 60), index=idx)
+    b = pd.Series(100.0 * np.linspace(1, 1.1, 60), index=idx)
+    e1 = Q.blend_equity({"A": a, "B": b}, {"A": 0.5, "B": 0.5}, 100.0)
+    e2 = Q.blend_equity({"A": a, "B": b}, {"A": 2.0, "B": 2.0}, 100.0)  # same ratio, unnormalized
+    pd.testing.assert_series_equal(e1, e2)
+
+
+def test_blend_equity_empty_when_no_curves():
+    assert Q.blend_equity({}, {"A": 1.0}, 100.0).empty

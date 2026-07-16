@@ -145,9 +145,118 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
     return [raw, rc]
 
 
+MEGACAP_INDEX = "Nasdaq 100"          # per-interval yardstick for the holdings table
+DIP_WINDOW = 21                       # buy-the-dip lookback: 1-month reversal horizon (~21 sessions)
+
+
+def _arm_holdings_table(hl_log, prices, index_series, name_map, giants) -> tuple:
+    """Per rebalance period: each held name's % return over the hold, the equal-weight
+    basket total, and the index's return over the SAME interval — so every interval is
+    scored against the yardstick. Returns a tuple of period dicts (newest last)."""
+    from build_megacap_report import _period_returns
+    idx = index_series.dropna() if index_series is not None else None
+    out = []
+    for h in hl_log:
+        if not h.get("picks"):
+            continue
+        d0, d1 = pd.Timestamp(h["date"]), pd.Timestamp(h["next"])
+        rets = _period_returns(prices, h["picks"], d0, d1)
+        if not rets:
+            continue
+        names = [dict(t=t, name=name_map.get(t, t), ret=float(rets[t]),
+                      giant=t in giants)
+                 for t in sorted(h["picks"], key=lambda x: -rets.get(x, -9))
+                 if t in rets]
+        basket = sum(rets.values()) / len(rets)
+        iret = float("nan")
+        if idx is not None:
+            p0, p1 = idx.loc[:d0], idx.loc[:d1]
+            if len(p0) and len(p1) and float(p0.iloc[-1]) > 0:
+                iret = float(p1.iloc[-1]) / float(p0.iloc[-1]) - 1.0
+        out.append(dict(start=str(d0.date()), end=str(d1.date()), names=names,
+                        basket=basket, index=iret))
+    return tuple(out)
+
+
+def _megacap_arms():
+    """Run the mega-cap headline-N arms (size / growth / momentum) on the live EDGAR
+    fundamentals cache → ({arm: equity}, covered-name count, {arm: holdings table}).
+    (None, 0, {}) when no cache / empty coverage. Cheap (~seconds); the cap/revenue
+    panels are strictly point-in-time (filing-dated), so no look-ahead leaks."""
+    try:
+        import pandas as _pd
+        from build_megacap_report import (load_data, HEADLINE_N, K as MC_K,
+                                           GLOBAL_GIANTS, META_CSV)
+        from tools.megacap import run_arms, run_value_arms, ARMS
+        from tools.dipbuy import run_dipbuy
+        _IDXN = MEGACAP_INDEX
+        data = load_data()
+        if data["coverage"]["covered"] == 0:
+            return None, 0, {}
+        res = run_arms(data["prices"], data["slip"], data["cap"], data["yoy"],
+                       n=HEADLINE_N, k=MC_K, capital=CAPITAL)
+        dip_res = run_dipbuy(data["prices"], data["slip"], data["cap"],
+                             n=HEADLINE_N, k=MC_K, window=DIP_WINDOW, capital=CAPITAL)
+        val_res = run_value_arms(data["prices"], data["slip"], data["cap"],
+                                 data["rev"], data["yoy"], n=HEADLINE_N, k=MC_K,
+                                 capital=CAPITAL)
+        arms = {arm: res[arm]["runs"][1.0].get("equity") for arm in ARMS}
+        arms["dip"] = dip_res["runs"][1.0].get("equity")
+        arms["value"] = val_res["value"]["runs"][1.0].get("equity")
+        arms["garp"] = val_res["garp"]["runs"][1.0].get("equity")
+        # Constructed books: 50/50 momentum+value blend (offense+defense) and vol-managed value.
+        arms["combo"] = qg.blend_equity({"momentum": arms["momentum"], "value": arms["value"]},
+                                        {"momentum": 0.5, "value": 0.5}, CAPITAL)
+        _vt = qg.vol_target(arms["value"], target_vol=RISK_TARGET_VOL,
+                            turn_cost_bps=RC_TURN_BPS) if arms["value"] is not None else {}
+        arms["value_vt"] = _vt.get("equity")
+        # holdings tables: name map (EDGAR universe + giants) + the Nasdaq interval index
+        try:
+            nm = dict(_pd.read_csv(META_CSV)[["ticker", "name"]].values)
+        except Exception:
+            nm = {}
+        nm.update({tk: disp for disp, tk in GLOBAL_GIANTS.items()})
+        giants = set(GLOBAL_GIANTS.values())
+        bench = data.get("benchmarks")
+        idx = (bench[_IDXN] if bench is not None and _IDXN in getattr(bench, "columns", [])
+               else None)
+        holdings = {arm: _arm_holdings_table(res[arm]["holdings_log"], data["prices"],
+                                             idx, nm, giants) for arm in ARMS}
+        holdings["dip"] = _arm_holdings_table(dip_res["holdings_log"], data["prices"],
+                                              idx, nm, giants)
+        for kind in ("value", "garp"):
+            holdings[kind] = _arm_holdings_table(val_res[kind]["holdings_log"],
+                                                 data["prices"], idx, nm, giants)
+        return arms, int(data["coverage"]["covered"]), holdings
+    except Exception:
+        return None, 0, {}
+
+
+# Mega-cap arm → (record id, display name). Names put the DISTINCTIVE word first so
+# the left-menu label (r.name pre-em-dash head) is unique under the shared "Mega-cap"
+# family header; the em-dash tail carries the method.
+_MEGACAP_ARM_META = {
+    "size": ("megacap_size", "Largest-cap — top-25 PIT market-cap"),
+    "growth": ("megacap_growth", "Revenue growth — fastest trailing YoY"),
+    "momentum": ("megacap_momentum", "12-1 momentum — within the mega-caps"),
+}
+
+# Value arms systematize the user's own thesis — "value at a fair price". Only revenue +
+# shares are available (no earnings), so valuation = price-to-sales, US filers only (one
+# revenue currency; see megacap.ps_panel). id, menu name, verdict phrase.
+_VALUE_ARM_META = {
+    "value": ("megacap_value", "Value — cheapest price-to-sales (US mega-caps)",
+              "buying the cheapest-on-sales names"),
+    "garp": ("megacap_garp", "GARP — growth at a reasonable price (US mega-caps)",
+             "buying cheap-relative-to-growth names"),
+}
+
+
 def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=None,
                    bench=None, ew_eq=None, portfolio_roi=None,
-                   train_end=TRAIN_END, val_end=VAL_END) -> list:
+                   train_end=TRAIN_END, val_end=VAL_END,
+                   megacap_names: int = 0, megacap_arms=None,
+                   megacap_holdings=None) -> list:
     """Normalize everything gather() computed into StrategyRecords — the ONE list every
     comparison surface (leaderboard, parallel chart, dossiers) renders. Adding a future
     strategy = one make_record() call here (curve-bearing) or one STATIC_RECORDS entry
@@ -223,13 +332,158 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
             cost_model="real fills",
             verdict="money-weighted real book over its own window — head-to-head below",
             color="#ffffff"))
-    recs.append(sreg.make_record(
-        "megacap", "Mega-cap PIT screen — size / growth / momentum", "mega-cap",
-        "research", href="megacap.html",
-        gate="awaiting cap data — run the EODHD fundamentals fetch",
-        verdict="PIT market-cap screen → size / YoY-revenue-growth / 12-1 momentum arms; "
-                "no live data yet (0/400 coverage).",
-        flags=("awaiting_data",)))
+    if megacap_arms:
+        # Live results: one curve-bearing record per arm (uniform pane, registry row,
+        # chart trace). Survivor-biased universe like the momentum family, so the
+        # verdict leads with the internal-comparison caveat — real numbers, honestly
+        # framed, no adoption gate yet.
+        n_txt = f"{megacap_names} EDGAR names" if megacap_names else "live EDGAR cache"
+        # The Largest-cap arm is the control every other arm is scored against: does a tilt
+        # (reversal, value, GARP) beat simply owning the biggest names? Verdicts state it.
+        def _full_ret(e):
+            s = e.dropna() if e is not None and not getattr(e, "empty", True) else pd.Series(dtype=float)
+            return float(s.iloc[-1] / s.iloc[0] - 1.0) if len(s) > 1 else float("nan")
+        size_r = _full_ret(megacap_arms.get("size"))
+        def _win_ret(e, key):
+            s = e.dropna() if e is not None and not getattr(e, "empty", True) else pd.Series(dtype=float)
+            if len(s) < 2:
+                return float("nan")
+            lo, hi = sreg.window_bounds(s, train_end, val_end)[key]
+            return qg.window_metrics(s, lo, hi)["net_return"]
+        size_val = _win_ret(megacap_arms.get("size"), "val")
+        for arm, (rid, nm) in _MEGACAP_ARM_META.items():
+            eq = megacap_arms.get(arm)
+            if eq is None or getattr(eq, "empty", True):
+                continue
+            recs.append(sreg.make_record(
+                rid, nm, "mega-cap", "candidate",
+                equity=eq, train_end=train_end, val_end=val_end,
+                href="megacap.html", cost_model="slippage (half-spread)",
+                holdings=(megacap_holdings or {}).get(arm, ()),
+                gate=f"incubating — top-25 PIT cap screen ({n_txt}); no pre-registered "
+                     "adoption gate yet",
+                verdict="survivor-biased universe → internal comparison only, not an "
+                        "achievable return; full N-sweep on megacap.html"))
+        # Buy-the-dip reversal book — a 4th mega-cap arm, but a distinct thesis (short-term
+        # reversal, not size/growth/trend), so it gets its OWN verdict rather than the shared
+        # internal-comparison line. The verdict is DATA-DRIVEN: it compares the reversal book
+        # to the Largest-cap arm (its control — same universe, no dip tilt) and states plainly
+        # whether the overreaction premium survives, so it can't silently rot into a false
+        # win. Registered only when its curve is present.
+        dip_eq = megacap_arms.get("dip")
+        if dip_eq is not None and not getattr(dip_eq, "empty", True):
+            dip_r = _full_ret(dip_eq)
+            have_cmp = size_r == size_r and dip_r == dip_r
+            beats = have_cmp and dip_r > size_r
+            if have_cmp:
+                finding = (
+                    f"The overreaction premium does NOT survive on mega-caps: reversal "
+                    f"returned {dip_r*100:+.0f}% full-window vs the Largest-cap arm's "
+                    f"{size_r*100:+.0f}% — buying the biggest 1-month losers underperforms "
+                    f"simply holding the biggest names. "
+                    if not beats else
+                    f"Reversal returned {dip_r*100:+.0f}% full-window vs the Largest-cap "
+                    f"arm's {size_r*100:+.0f}%, edging its control — but on a survivor-biased "
+                    f"universe, so treat it as internal comparison, not achievable alpha. ")
+            else:
+                finding = ("Hold the k biggest 1-month losers among the top-25 mega-caps — "
+                           "read against the Largest-cap arm below. ")
+            recs.append(sreg.make_record(
+                "megacap_dip",
+                "Dip-buy — 1-month reversal on the top-25 mega-caps", "mega-cap",
+                "candidate", equity=dip_eq, train_end=train_end, val_end=val_end,
+                href="megacap.html", cost_model="slippage (half-spread), t+1 fill",
+                holdings=(megacap_holdings or {}).get("dip", ()),
+                gate=f"incubating — hold the k biggest 1-month losers among the top-25 PIT "
+                     f"mega-caps ({n_txt}); {'LAGS' if not beats else 'vs'} the Largest-cap "
+                     "arm. No adoption gate pre-registered.",
+                verdict="Short-term reversal on the most-efficient names — the hardest case "
+                        "for the effect. " + finding + "Survivor-biased universe → an "
+                        "internal comparison against the arms below, not an absolute return."))
+        # Value + GARP — the user's own "value at a fair price" thesis, systematized on
+        # price-to-sales (US filers only). Each carries the same data-driven verdict vs the
+        # Largest-cap control.
+        for kind, (rid, nm, phrase) in _VALUE_ARM_META.items():
+            eq = megacap_arms.get(kind)
+            if eq is None or getattr(eq, "empty", True):
+                continue
+            r = _full_ret(eq)
+            beats = r == r and size_r == size_r and r > size_r
+            if r == r and size_r == size_r:
+                vfind = (f"Returned {r*100:+.0f}% full-window vs the Largest-cap arm's "
+                         f"{size_r*100:+.0f}% — {phrase} "
+                         f"{'beats' if beats else 'LAGS on total return'} simply holding the "
+                         "biggest names. ")
+            else:
+                vfind = phrase.capitalize() + ". "
+            # The real edge of a value tilt is downside, not upside: if it held up through
+            # the validation drawdown while the Largest-cap arm bled, say so — that is where
+            # 'value at a fair price, no huge bets' actually pays.
+            arm_val = _win_ret(eq, "val")
+            if arm_val == arm_val and size_val == size_val and arm_val > 0 > size_val:
+                vfind += (f"But defensive where it counts: {arm_val*100:+.0f}% through the "
+                          f"validation drawdown while the Largest-cap arm lost "
+                          f"{abs(size_val)*100:.0f}% — the trade-off is upside in the bull run "
+                          "for resilience in the fall. ")
+            recs.append(sreg.make_record(
+                rid, nm, "mega-cap", "candidate",
+                equity=eq, train_end=train_end, val_end=val_end,
+                href="megacap.html", cost_model="slippage (half-spread)",
+                holdings=(megacap_holdings or {}).get(kind, ()),
+                gate=f"incubating — top-25 PIT cap screen, US filers only (P/S needs one "
+                     f"revenue currency); {n_txt}. No adoption gate pre-registered.",
+                verdict="Systematizing 'value at a fair price' on mega-caps. " + vfind +
+                        "US filers only (P/S currency-safety); survivor-biased universe → an "
+                        "internal comparison against the arms below, not an absolute return."))
+        # Constructed books from the arms above — the "can a blend beat just owning the
+        # biggest?" test. combo = 50/50 momentum(offense)+value(defense); value_vt =
+        # vol-managed value. Derived curves (no own holdings). The honest win condition is
+        # RISK-ADJUSTED (Sharpe) + drawdown, not raw return — data-driven verdict says which.
+        size_eq = megacap_arms.get("size")
+        size_m = (qg.perf_metrics(size_eq.dropna())
+                  if size_eq is not None and not getattr(size_eq, "empty", True) else {})
+        for kind, rid, nm, desc in (
+            ("combo", "megacap_combo", "Combo — 50/50 momentum + value (offense + defense)",
+             "a 50/50 daily-rebalanced blend of the momentum (offense) and value (defense) arms"),
+            ("value_vt", "megacap_value_vt", "Value, vol-managed — value arm at 15% target vol",
+             "the value arm scaled to a 15% volatility target (de-risk only, rest in cash)")):
+            eq = megacap_arms.get(kind)
+            if eq is None or getattr(eq, "empty", True):
+                continue
+            m = qg.perf_metrics(eq.dropna())
+            wc = ""
+            if size_m:
+                better = (m["sharpe"] > size_m["sharpe"]) or (abs(m["max_dd"]) < abs(size_m["max_dd"]))
+                wc = (f"Sharpe {m['sharpe']:.2f} vs the Largest-cap arm's {size_m['sharpe']:.2f}, "
+                      f"max drawdown {m['max_dd']*100:.0f}% vs {size_m['max_dd']*100:.0f}% — "
+                      f"{'improves' if better else 'does not improve'} the risk-adjusted profile. ")
+            recs.append(sreg.make_record(
+                rid, nm, "mega-cap", "candidate",
+                equity=eq, train_end=train_end, val_end=val_end,
+                cost_model="slippage (half-spread)"
+                           + (f" + {RC_TURN_BPS:.0f}bp resize" if kind == "value_vt" else ""),
+                gate=f"incubating — constructed from the mega-cap arms ({n_txt}); the win "
+                     "condition is risk-adjusted, not raw return. No adoption gate pre-registered.",
+                verdict=f"Built from your own arms: {desc}. " + wc +
+                        "Survivor-biased universe → an internal comparison against the arms "
+                        "below, not an absolute return."))
+    else:
+        if megacap_names:
+            mc_gate = (f"incubating — EDGAR PIT fundamentals live for {megacap_names} names; "
+                       "adoption gate not yet pre-registered")
+            mc_verdict = ("PIT market-cap screen → size / YoY-revenue-growth / 12-1 momentum "
+                          f"arms, running on SEC-EDGAR filing-dated shares+revenue "
+                          f"({megacap_names} names) — full N-sweep on megacap.html.")
+            mc_flags = ()
+        else:
+            mc_gate = "awaiting cap data — run the EDGAR fundamentals fetch"
+            mc_verdict = ("PIT market-cap screen → size / YoY-revenue-growth / 12-1 momentum "
+                          "arms; no fundamentals data yet.")
+            mc_flags = ("awaiting_data",)
+        recs.append(sreg.make_record(
+            "megacap", "Mega-cap PIT screen — size / growth / momentum", "mega-cap",
+            "research", href="megacap.html",
+            gate=mc_gate, verdict=mc_verdict, flags=mc_flags))
     recs.extend(sreg.STATIC_RECORDS)
     sreg.assign_colors(recs)
     return recs
@@ -720,9 +974,11 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
             vs_scale = None
 
     n_countries = len({m.get("country") for m in meta.values()} - {"—", None})
+    mc_arms, mc_names, mc_holdings = _megacap_arms()   # live screen → curves + holdings tables
     registry = build_registry(variants, ensemble=ensemble, vol_core=vol_core,
                               vol_core_eq=vol_core_eq, bench=bench, ew_eq=ew_eq,
-                              portfolio_roi=portfolio_roi)
+                              portfolio_roi=portfolio_roi, megacap_names=mc_names,
+                              megacap_arms=mc_arms, megacap_holdings=mc_holdings)
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
                 portfolio_roi=portfolio_roi, portfolio_bench=portfolio_bench,
                 vs_scale=vs_scale, variants=variants,
@@ -759,7 +1015,7 @@ def main():
     local.parent.mkdir(exist_ok=True)
     local.write_text(build(d))                          # live/local only — no docs/ export
     print(f"wrote {local}  (strategy {d['strategy'].code}: registry of "
-          f"{len(d.get('registry') or [])} records + lab)")
+          f"{len(d.get('registry') or [])} records)")
     if args.open:
         webbrowser.open(local.as_uri())
 

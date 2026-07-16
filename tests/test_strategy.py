@@ -13,7 +13,7 @@ from tools.momentum_grid import _stats_slice, MomentumConfig
 TE, VE = "2019-06-30", "2019-09-30"          # fixture window boundaries
 
 
-def _fake_d():
+def _fake_d(megacap_arms=None):
     idx = pd.bdate_range("2018-01-01", periods=500)
     rng = np.random.default_rng(0)
     px = pd.DataFrame({f"T{i}": 100 * np.exp(np.cumsum(rng.normal(0.0005, 0.01, 500)))
@@ -64,7 +64,9 @@ def _fake_d():
     registry = bs.build_registry(variants, ensemble=ens_full, vol_core=vol_core,
                                  vol_core_eq=vol_core_eq, bench=benchmarks, ew_eq=ew_eq,
                                  portfolio_roi=portfolio_roi,
-                                 train_end=TE, val_end=VE)
+                                 train_end=TE, val_end=VE,
+                                 megacap_arms=megacap_arms,
+                                 megacap_names=(364 if megacap_arms else 0))
     # observational diagnostics (synthetic, small) — read-only HMM regime + PCA effective bets
     ridx = idx[200:]
     ramp = np.linspace(0.2, 0.8, len(ridx))
@@ -243,8 +245,9 @@ def test_menu_and_uniform_strategy_panes():
     # left menu (spine) with a button + pane per strategy
     assert "class='spine'" in html and "class='app'" in html
     assert "data-pane='rec-mom_ens'" in html and "id='pane-rec-vol_core'" in html
-    # the research + lab panes exist; the lab is momentum-scoped
-    assert "id='pane-research'" in html and "Research lab — momentum family" in html
+    # menu = strategies only: no research / ops / lab entries or panes
+    for pane in ("research", "ops", "lab"):
+        assert f"data-pane='{pane}'" not in html and f"id='pane-{pane}'" not in html
     assert "class='legend'" in html
 
 
@@ -345,25 +348,22 @@ def test_overview_portfolio_is_not_a_rebased_stub():
 
 def test_raw_vanity_is_off_the_main_page():
     html = bs.build(_fake_d(), public=False)
-    main = html.split("Research lab — momentum family")[0]        # everything above the lab
-    # the raw full-invested strategy appears above the lab ONLY as the flagged registry row
-    assert "Raw Original" not in main
-    assert "Original (raw, full-invested)" not in main           # no raw rocket trace up top
-    assert "Two ways to run it" not in main                       # the side-by-side framing is gone
-    assert "Risk-conscious" in main                               # the risk-conscious book is the focus
-    assert "reference, inflated" in main                          # the registry row is honest about it
+    # the raw full-invested strategy appears on the page ONLY as the flagged registry row
+    assert "Raw Original" not in html
+    assert "Original (raw, full-invested)" not in html           # no raw rocket trace
+    assert "Two ways to run it" not in html                       # the side-by-side framing is gone
+    assert "Risk-conscious" in html                               # the risk-conscious book is the focus
+    assert "reference, inflated" in html                          # the registry row is honest about it
 
 
-def test_raw_reference_lives_only_in_the_lab():
+def test_raw_reference_is_registry_row_only():
     d = _fake_d()
-    html = bs.build(d, public=False)
-    # raw isn't deleted — it's demoted to the lab as an inflation reference
-    marker = "Survivorship-inflated — not achievable"
-    assert marker in html and html.index(marker) > html.index("Research lab")
-    h = ui.sec_raw_reference(d)
-    assert "inflated" in h.lower() and "not achievable" in h.lower()  # framed as inflated, not a headline
-    # public build drops the whole lab (and the raw with it)
+    # the lab pane is gone (menu = strategies only) — private and public alike
+    assert "Research lab" not in bs.build(d, public=False)
     assert "Research lab" not in bs.build(d, public=True)
+    # the unwired lab section stays honest for any future surface
+    h = ui.sec_raw_reference(d)
+    assert "inflated" in h.lower() and "not achievable" in h.lower()
 
 
 def test_parallel_chart_traces():
@@ -411,7 +411,9 @@ def test_command_strip_reads_the_stack_state():
 
 
 def test_evidence_band_folds_with_visible_verdicts():
-    html = bs.build(_fake_d(), public=False)
+    """The evidence band is unwired from the page (menu = strategies only) but kept
+    as a tested section for any future research surface."""
+    html = ui._momentum_evidence(_fake_d(), public=False)
     assert "evidence &amp; risk" in html
     # verdict summaries visible, workings folded
     assert "selection beats" in html and "random books (p" in html
@@ -456,11 +458,12 @@ def test_grade_section_has_no_scare_box():
     assert "Verdict" in h
 
 
-def test_significance_section_rendered_once():
+def test_significance_lives_in_the_headline_only():
     html = bs.build(_fake_d(), public=False)
-    assert html.count("Significance &amp; robustness") == 1
-    assert "Monte" in html or "random books" in html            # the validation is present
-    # the grid/DSR stat cards live in the headline ONLY — no duplicated card row
+    # the research pane is gone; the validation numbers ride the headline line
+    assert "Significance &amp; robustness" not in html
+    assert "Monte Carlo" in html and "Deflated Sharpe" in html
+    # the grid/DSR stat cards render exactly once — no duplicated card row
     assert html.count("Median test Sharpe (all)") == 1
 
 
@@ -474,15 +477,20 @@ def test_phantom_trials_block_shows_decay_and_harvey():
     assert "subjective estimate" in html                      # honesty: it's a range, not precise
 
 
-def test_no_info_dropped_from_page():
+def test_overview_keeps_the_essential_data():
+    """Compact page = strategies + the data that matters. Research/ops/lab prose is
+    gone BY DESIGN (menu = strategies only); the ops state lives on as the command
+    strip, the survivorship honesty as one headline line."""
     html = bs.build(_fake_d(), public=False)
     for phrase in ["Strategy registry", "Registry ledger",
                    "Risk-conscious", "GARCH vol-managed IWDA core",
-                   "Walk-forward equity", "Performance — all strategies",
-                   "Quant scorecard", "Deflated Sharpe",
-                   "Yearly P&amp;L", "survivorship is NOT corrected",
-                   "Regime", "Concentration", "Capacity", "Research lab"]:
+                   "Walk-forward equity", "Deflated Sharpe",
+                   "Yearly P&amp;L", "internal comparisons",
+                   "Your portfolio (real", "live book", "kill signal"]:
         assert phrase in html, f"dropped: {phrase!r}"
+    for phrase in ["Performance — all strategies", "Quant scorecard",
+                   "Research lab", "Operations — north star"]:
+        assert phrase not in html, f"cut pane content leaked back: {phrase!r}"
 
 
 def test_strategy_public_no_euro_amounts():
@@ -496,12 +504,6 @@ def test_diagnostics_section_renders_both_lenses():
     assert "HMM" in html and "Effective bets" in html
     assert "not traded" in html                                   # observational framing, explicit
     assert "agreement" in html.lower() and "sector-neutral" in html  # the candid takeaways
-
-
-def test_diagnostics_sits_before_caveats_in_page():
-    html = bs.build(_fake_d(), public=False)
-    assert "Observational diagnostics" in html
-    assert html.index("Observational diagnostics") < html.index("survivorship is NOT corrected")
 
 
 def test_caveat_shows_onpopulation_survivorship_result():
@@ -552,12 +554,6 @@ def test_regime_attribution_renders_three_lenses():
     assert "pre-overlay" in html and "Selection" in html
 
 
-def test_regime_attribution_in_full_page_before_caveat():
-    html = bs.build(_fake_d(), public=False)
-    assert "Regime attribution" in html
-    assert html.index("Regime attribution") < html.index("survivorship is NOT corrected")
-
-
 def test_regime_attribution_absent_renders_nothing():
     d = _fake_d()
     d.pop("regime_attr")
@@ -588,13 +584,6 @@ def test_scenario_absent_renders_nothing():
 
 def test_scenario_public_no_euro():
     assert "€" not in ui.sec_scenarios(_fake_d(), public=True)  # multiples / percentages only
-
-
-def test_scenario_sits_after_regime_before_caveat():
-    html = bs.build(_fake_d(), public=False)
-    assert "Scenario fan" in html
-    assert (html.index("Regime attribution") < html.index("Scenario fan")
-            < html.index("survivorship is NOT corrected"))
 
 
 # ── Delisting-stress (Task 3) ───────────────────────────────────────────────────
@@ -727,8 +716,6 @@ def test_factor_section_renders_models_and_verdict():
     assert "0.60" in html or "0.6" in html                          # WML loading shown
     assert "not statistically separable" in html                    # t=1.4 verdict branch
     assert "€" not in html                                          # public-safe by content
-    full = bs.build(d, public=True)
-    assert "Factor spanning" in full                                # rendered on public build
 
 
 def test_factor_section_residual_alpha_verdict():
@@ -825,6 +812,168 @@ def test_megacap_record_present_and_pending():
     assert rec.family == "mega-cap"
     assert rec.href == "megacap.html"
     assert "awaiting_data" in rec.flags
+
+
+def test_megacap_record_flips_to_incubating_with_edgar_data():
+    d = _fake_d()
+    recs = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                             vol_core_eq=None, bench=None, ew_eq=None,
+                             portfolio_roi=None, megacap_names=364)
+    rec = next(r for r in recs if r.id == "megacap")
+    assert rec.status == "research"                      # still research: no adoption gate yet
+    assert "awaiting_data" not in rec.flags
+    assert "364" in rec.gate and "EDGAR" in rec.gate
+    assert "incubating" in rec.gate
+
+
+def test_megacap_arms_become_curve_bearing_records():
+    """A live EDGAR cache replaces the single pending stub with three curve-bearing
+    candidate records (size / growth / momentum) — real curves, windows and registry
+    rows — each framed survivor-biased / internal-comparison, no adoption gate."""
+    d = _fake_d()
+    eq = d["variants"][1]["equity"]
+    arms = {"size": eq * 1.10, "growth": eq * 0.90, "momentum": eq * 1.05}
+    recs = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                             vol_core_eq=None, bench=None, ew_eq=None, portfolio_roi=None,
+                             train_end=TE, val_end=VE,
+                             megacap_arms=arms, megacap_names=364)
+    ids = {r.id for r in recs}
+    assert {"megacap_size", "megacap_growth", "megacap_momentum"} <= ids
+    assert "megacap" not in ids                          # stub replaced by real arms
+    size = next(r for r in recs if r.id == "megacap_size")
+    assert size.status == "candidate" and size.family == "mega-cap"
+    assert size.equity is not None
+    assert set(size.windows) == {"train", "val", "test", "full"}
+    assert "internal comparison" in (size.verdict or "").lower()
+    assert "364" in (size.gate or "")
+    # distinct left-menu labels under the shared "Mega-cap" family header
+    labels = {ui._menu_name(r) for r in recs if r.id.startswith("megacap_")}
+    assert len(labels) == 3
+
+
+def test_dipbuy_record_is_curve_bearing_candidate():
+    """The buy-the-dip reversal book registers as one curve-bearing mega-cap candidate
+    with its own honest reversal verdict — alongside, not folded into, the size/growth/
+    momentum arms. Absent a dip curve, no such record appears."""
+    d = _fake_d()
+    eq = d["variants"][1]["equity"]
+    recs = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                             vol_core_eq=None, bench=None, ew_eq=None, portfolio_roi=None,
+                             train_end=TE, val_end=VE,
+                             megacap_arms={"size": eq * 1.10, "growth": eq * 0.90,
+                                           "momentum": eq * 1.05, "dip": eq * 0.98},
+                             megacap_names=364)
+    rec = next((r for r in recs if r.id == "megacap_dip"), None)
+    assert rec is not None
+    assert rec.status == "candidate" and rec.family == "mega-cap"
+    assert rec.equity is not None
+    assert set(rec.windows) == {"train", "val", "test", "full"}
+    assert "reversal" in (rec.verdict or "").lower()
+    # verdict is data-driven: dip (eq*0.98) LAGS the Largest-cap arm (eq*1.10) here,
+    # so it must say so plainly rather than imply a win
+    v = (rec.verdict or "").lower()
+    assert "underperform" in v or "does not survive" in v or "lags" in v
+    # no dip curve passed → no dip record (the other arms still register)
+    recs2 = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                              vol_core_eq=None, bench=None, ew_eq=None, portfolio_roi=None,
+                              train_end=TE, val_end=VE,
+                              megacap_arms={"size": eq * 1.10}, megacap_names=364)
+    assert not any(r.id == "megacap_dip" for r in recs2)
+
+
+def test_value_and_garp_records_are_curve_bearing_candidates():
+    """The value + GARP arms (user's 'value at a fair price', on price-to-sales, US filers
+    only) register as two curve-bearing mega-cap candidates with data-driven verdicts vs
+    the Largest-cap control."""
+    d = _fake_d()
+    eq = d["variants"][1]["equity"]
+    ramp = pd.Series(range(len(eq)), index=eq.index) / (len(eq) - 1) * 0.6 + 1.0  # rising → higher total return
+    recs = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                             vol_core_eq=None, bench=None, ew_eq=None, portfolio_roi=None,
+                             train_end=TE, val_end=VE,
+                             megacap_arms={"size": eq, "value": eq * ramp, "garp": eq},
+                             megacap_names=362)
+    ids = {r.id for r in recs}
+    assert {"megacap_value", "megacap_garp"} <= ids
+    val = next(r for r in recs if r.id == "megacap_value")
+    assert val.status == "candidate" and val.family == "mega-cap"
+    assert set(val.windows) == {"train", "val", "test", "full"}
+    assert "us filers only" in val.verdict.lower()          # currency-safety caveat surfaced
+    assert "largest-cap arm" in val.verdict.lower()         # data-driven comparison present
+    assert "beats" in val.verdict.lower()                   # value ramps above size → beats
+    garp = next(r for r in recs if r.id == "megacap_garp")
+    assert "lags" in garp.verdict.lower()                   # garp == size total return → not > → lags
+    # distinct left-menu labels vs the other mega-cap arms
+    assert ui._menu_name(val) != ui._menu_name(garp)
+
+
+def test_combo_and_vol_managed_value_register_from_arms():
+    """Constructed books — 50/50 momentum+value combo and vol-managed value — register as
+    mega-cap candidates with a risk-adjusted (Sharpe / drawdown) verdict vs the size control."""
+    d = _fake_d()
+    eq = d["variants"][1]["equity"]
+    ramp = pd.Series(range(len(eq)), index=eq.index) / (len(eq) - 1) * 0.3 + 1.0
+    recs = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                             vol_core_eq=None, bench=None, ew_eq=None, portfolio_roi=None,
+                             train_end=TE, val_end=VE,
+                             megacap_arms={"size": eq, "momentum": eq * 1.05, "value": eq * 0.98,
+                                           "combo": eq * ramp, "value_vt": eq},
+                             megacap_names=362)
+    ids = {r.id for r in recs}
+    assert {"megacap_combo", "megacap_value_vt"} <= ids
+    combo = next(r for r in recs if r.id == "megacap_combo")
+    assert combo.status == "candidate" and combo.family == "mega-cap"
+    assert set(combo.windows) == {"train", "val", "test", "full"}
+    assert "sharpe" in combo.verdict.lower() and "risk-adjusted" in combo.verdict.lower()
+    assert "offense" in combo.verdict.lower() or "defense" in combo.verdict.lower()
+
+
+def test_megacap_arms_render_as_menu_panes_with_results():
+    d = _fake_d(megacap_arms=None)
+    eq = d["variants"][1]["equity"]
+    d2 = _fake_d(megacap_arms={"size": eq * 1.10, "growth": eq * 0.90,
+                               "momentum": eq * 1.05})
+    h = ui.render(d2, public=False)
+    for rid in ("megacap_size", "megacap_growth", "megacap_momentum"):
+        assert f"id='pane-rec-{rid}'" in h and f"data-pane='rec-{rid}'" in h
+    # the pending stub is gone; the arms carry real window tables
+    assert "awaiting" not in h.lower()
+    assert h.count("<th>Window</th>") >= 6               # momentum/vol + 3 mega-cap arms
+    for lbl in ("Largest-cap", "Revenue growth", "12-1 momentum"):
+        assert lbl in h
+
+
+def test_megacap_pane_shows_historical_holdings_vs_index():
+    """Each mega-cap arm pane carries a historical-holdings section: per-name % return
+    per interval and the basket total scored against the index, non-US names tagged."""
+    d = _fake_d()
+    eq = d["variants"][1]["equity"]
+    holdings = {"size": (
+        dict(start="2024-01-01", end="2024-02-01",
+             names=[dict(t="TSM", name="TSMC", ret=0.10, giant=True),
+                    dict(t="AAPL", name="Apple", ret=0.05, giant=False)],
+             basket=0.075, index=0.04),
+        dict(start="2024-02-01", end="2024-03-01",
+             names=[dict(t="TSM", name="TSMC", ret=-0.02, giant=True)],
+             basket=-0.02, index=0.01),
+    )}
+    recs = bs.build_registry(d["variants"], ensemble=d["ensemble"], vol_core=None,
+                             vol_core_eq=None, bench=None, ew_eq=None, portfolio_roi=None,
+                             train_end=TE, val_end=VE,
+                             megacap_arms={"size": eq * 1.1, "growth": eq * 0.9,
+                                           "momentum": eq * 1.05},
+                             megacap_holdings=holdings)
+    size = next(r for r in recs if r.id == "megacap_size")
+    assert len(size.holdings) == 2
+    h = ui._holdings_section(size)
+    assert "Historical holdings" in h
+    assert "TSMC" in h and "non-US" in h                  # giant tagged
+    assert "Nasdaq 100" in h                              # per-interval index yardstick
+    assert "rebalance intervals" in h and "All 2" in h
+    assert "TSM +10%" in h                                # per-name return in the interval chip
+    assert "-2.0%" in h                                   # latest book (period 2) TSM return
+    # an arm with no holdings passed renders nothing
+    assert ui._holdings_section(next(r for r in recs if r.id == "megacap_growth")) == ""
 
 
 def test_megacap_dossier_pending_card():

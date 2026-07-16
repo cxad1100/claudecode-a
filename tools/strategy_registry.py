@@ -52,6 +52,7 @@ class StrategyRecord:
     color: str | None = None
     href: str | None = None           # lab page for ledger rows
     flags: tuple = ()                 # ("inflated",) marks the raw reference
+    holdings: tuple = ()              # per-rebalance held names + returns vs index (mega-cap arms)
 
 
 def window_bounds(equity: pd.Series, train_end, val_end) -> dict:

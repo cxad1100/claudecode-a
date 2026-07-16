@@ -4,28 +4,24 @@ Data comes in as gather()'s dict (including d["registry"]); a full HTML page com
 out. No metric computation happens here — engines and stats live in tools/, data
 assembly in build_strategy_report.gather().
 
-The page is a MASTER-DETAIL app: a hierarchy spine (the strategy map) on the left,
-a stage of detail panes on the right, one pane visible at a time (client-side router,
-no fetch — every pane is server-rendered into the document, JS toggles visibility):
+The page is a MASTER-DETAIL app: a strategy menu on the left, a stage of detail
+panes on the right, one pane visible at a time (client-side router, no fetch —
+every pane is server-rendered into the document, JS toggles visibility):
 
-  spine   ★ Today · Compare · one group per FAMILY (its records indented, variants
-          nested via variant_of) · Ledger (killed/research) · Operations · Lab
-  panes   home     cockpit — command strip + the result verdict + KPI tiles
-          compare  leaderboard · parallel equity · windows / yearly matrices
-          fam-*    a family node: its members + the family-scoped shared evidence
-          rec-*    one strategy's dossier (book · verdict · method · history)
-          ops      live tracking · venture north star · ritual · you vs strategies
-          lab      (private) raw reference · 64-config grid · supporting data
+  spine   Overview + one entry per strategy, grouped by family — STRATEGIES ONLY
+  panes   home     compact cockpit — command strip · full-grid headline cards ·
+                   all-strategies chart · real-book ROI panel · registry ·
+                   yearly matrix
+          rec-*    one strategy's detail (curve · stats · windows · method)
 
-Why panes, not one scroll: the data is a tree (family → record → variant_of → pick)
-with importance already encoded (status rank, ★ live, variant_of). The spine makes
-that hierarchy visible; each pane is sized to its own content, so a deep family and a
-one-line sleeve no longer fight for the same equal-width column.
+The research / operations / lab panes were cut from the page (2026-07: menu =
+strategies only). Their section functions below stay defined and tested — the live
+ops readings surface compactly in the command strip, the survivorship honesty in
+the headline line — and git history holds the old pane wiring.
 
 Framework contract: a future strategy = one make_record() in
-build_strategy_report.build_registry — it earns a spine item and a generic dossier
-pane automatically; bespoke detail = one DOSSIER_BUILDERS entry here. Family-scoped
-evidence attaches to the family pane, not the strategy card.
+build_strategy_report.build_registry — it earns a spine item and a generic detail
+pane automatically; bespoke detail = one DOSSIER_BUILDERS entry here.
 """
 import pandas as pd
 import numpy as np
@@ -39,7 +35,6 @@ from tools.momentum_grid import grid_distribution, grid_percentile
 from build_momentum_report import (
     START, TRAIN_END, VAL_END, MIN_TURNOVER,
     _disp, _name, _pnl_color, _equity_window,
-    sec_grid, sec_feasibility, sec_timelines, sec_survivorship, sec_method,
 )
 
 # ── Display constants (single source; build_strategy_report imports the colors) ──
@@ -48,6 +43,7 @@ C_RC = "#4ec9b0"           # risk-conscious momentum book
 _GRADE_COLOR = {"A": "#46c84e", "B": "#9acd32", "C": "#d7ba7d", "D": "#e8a04e", "F": "#ef4444"}
 HARVEY_T = 3.0             # Harvey (2016) multiple-testing t-stat hurdle
 MODELED_SLIP_BPS = 25      # nominal modeled one-way slippage, quoted in prose
+MEGACAP_INDEX = "Nasdaq 100"   # per-interval yardstick in the mega-cap holdings table
 
 WIN_LABELS = sreg.window_labels(START, TRAIN_END, VAL_END)
 TEST_FROM = f"{pd.Timestamp(VAL_END).year + 1}→"      # e.g. "2024→"
@@ -86,6 +82,10 @@ details.ev > summary .eyebrow {{ display: inline; margin-right: 10px; }}
 details.ev[open] {{ padding-bottom: 14px; }}
 details.ev h2 {{ margin-top: 18px; font-size: 1.0rem; }}
 .legend {{ color: {theme.FG_DIM}; font-size: 0.82rem; margin: 4px 0 8px; }}
+.mchip {{ display: inline-block; padding: 0 6px; border-radius: 5px; font-family: {theme.MONO};
+          font-size: 0.74rem; margin: 1px 2px 1px 0; }}
+.mchip.gia {{ background: #134e4a; color: #5eead4; }}
+.mchip.usx {{ background: {theme.BG_PANEL}; color: {theme.FG_DIM}; }}
 /* ── App shell: strategy menu (left) + detail stage (right) ────────────────── */
 main {{ max-width: 1360px; }}
 .pagehead {{ margin-bottom: 10px; }}
@@ -231,10 +231,11 @@ def _live_record(d: dict):
 
 
 def sec_headline(d: dict) -> str:
-    """The honest headline: the WHOLE config grid's own distribution up top — median
-    and 10–90% range across every config, and where the ★ live tracked book sits inside
-    it — never the single best-picked config dressed up as 'the result'. Falls back to
-    the live book's own numbers if no grid is present. Raw full-invested lives in the lab."""
+    """The honest headline, compact: the stat cards lead — the WHOLE config grid's
+    distribution and where the ★ live tracked book sits inside it — followed by ONE
+    legend line carrying the validation (Monte Carlo, deflated Sharpe, bootstrap CI)
+    and the survivorship caveat. Never the single best-picked config dressed up as
+    'the result'. Falls back to the live book's own numbers if no grid is present."""
     rc = d["variants"][1]
     live = _live_record(d)
     lw = (live.windows if live is not None else None) or {}
@@ -258,8 +259,8 @@ def sec_headline(d: dict) -> str:
         pct = grid_percentile(grid, t["sharpe"], window="test", metric="sharpe")
         pct_ok = pct == pct                                # not NaN
         pos = f"<b>{pct:.0f}th percentile</b>" if pct_ok else "<b>its slot</b>"
-        med_ret = f", median return <b>{_pct(dr['median'] * 100)}</b>" if dr else ""
-        dsr_txt = (f" · <b>Deflated Sharpe</b> pays for the {n}-config search: "
+        med_ret = f", median return {_pct(dr['median'] * 100)}" if dr else ""
+        dsr_txt = (f" · Deflated Sharpe pays for the {n}-config search: "
                    f"P(true&gt;0) <b>{dsr['dsr']:.0%}</b> (phantom-worst {worst:.0%})"
                    if dsr_ok else "")
         cards = "".join([
@@ -273,23 +274,17 @@ def sec_headline(d: dict) -> str:
         ])
         return (
             "<h2>The whole grid — not one lucky config</h2>"
-            f"<div class='note' style='border-left-color:{C_RC};border-left-width:6px'>"
-            f"Across <b>all {n} configs</b> in the search the <b>median</b> held-out test "
-            f"Sharpe ({TEST_FROM}) is <b>{ds['median']:.2f}</b> "
-            f"(10–90% <b>{ds['lo']:.2f}–{ds['hi']:.2f}</b>, "
-            f"full range {ds['min']:.2f}–{ds['max']:.2f}){med_ret} — that spread "
-            "<em>is</em> the result, not the single best-picked cell. The ★ <b>live "
-            f"tracked book</b> — <b>{live_name}</b> — sits at {pos} of that grid: "
-            f"test Sharpe <b>{t['sharpe']:.2f}</b>, return <b>{_pct(t['net_return'] * 100)}</b>, "
-            f"<b>{ann_vol * 100:.0f}% vol</b>, max drawdown <b>{_pct(max_dd * 100)}</b> "
-            "(canonical basis; full-history risk). <b>Monte Carlo</b>, selection-level: it beats "
-            f"<b>{beat:.1f}%</b> of {mc['n_trials']:,} random books "
-            f"(p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}){dsr_txt} · bootstrap {ci['conf']}% Sharpe CI "
-            f"<b>{ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}</b>. The honest grade "
-            f"<b style='color:{_GRADE_COLOR[g]}'>{g}</b> scores the single-config risk-conscious "
-            "variant. Every strategy has its own dossier below; the full evidence sits in the "
-            "momentum family card.</div>"
-            f"<div class='cards'>{cards}</div>")
+            f"<div class='cards'>{cards}</div>"
+            f"<p class='legend'>Across all <b>{n} configs</b> the median held-out test Sharpe "
+            f"({TEST_FROM}) is <b>{ds['median']:.2f}</b> (10–90% {ds['lo']:.2f}–{ds['hi']:.2f}"
+            f"{med_ret}) — the spread is the result, not the best cell. The ★ <b>live tracked "
+            f"book</b> — <b>{live_name}</b> — sits at {pos}: test Sharpe <b>{t['sharpe']:.2f}</b>, "
+            f"return <b>{_pct(t['net_return'] * 100)}</b>, {ann_vol * 100:.0f}% vol, max drawdown "
+            f"{_pct(max_dd * 100)}. Monte Carlo, selection-level: beats <b>{beat:.1f}%</b> of "
+            f"{mc['n_trials']:,} random books (p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}){dsr_txt} · "
+            f"bootstrap {ci['conf']}% Sharpe CI {ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}. "
+            "Survivor-biased universe — momentum figures are internal comparisons, not "
+            "achievable returns; the survivorship-robust anchor is the GARCH vol-core.</p>")
 
     # ── fallback (no grid): prior single-book framing ──
     cards = "".join([
@@ -304,22 +299,22 @@ def sec_headline(d: dict) -> str:
                f" (phantom-worst {worst:.0%})" if dsr_ok else "")
     return (
         "<h2>The result</h2>"
-        f"<div class='note' style='border-left-color:{C_RC};border-left-width:6px'>"
-        f"On the <b>held-out test window ({TEST_FROM})</b> the ★ <b>live tracked book</b> — "
-        f"<b>{live_name}</b> — made <b>{_pct(t['net_return'] * 100)}</b> at "
-        f"<b>{ann_vol * 100:.0f}% vol</b>, <b>Sharpe {t['sharpe']:.2f}</b>, max drawdown "
-        f"<b>{_pct(max_dd * 100)}</b> (canonical basis; full-history risk). "
-        f"<b>Monte Carlo</b>, selection-level: it beats <b>{beat:.1f}%</b> of "
+        f"<div class='cards'>{cards}</div>"
+        f"<p class='legend'>On the held-out test window ({TEST_FROM}) the ★ <b>live tracked "
+        f"book</b> — <b>{live_name}</b> — made <b>{_pct(t['net_return'] * 100)}</b> at "
+        f"{ann_vol * 100:.0f}% vol, Sharpe <b>{t['sharpe']:.2f}</b>, max drawdown "
+        f"{_pct(max_dd * 100)}. Monte Carlo, selection-level: beats <b>{beat:.1f}%</b> of "
         f"{mc['n_trials']:,} random books (p&nbsp;=&nbsp;{mc['p_sharpe']:.3f}){dsr_txt} · "
-        f"bootstrap {ci['conf']}% Sharpe CI <b>{ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}</b>. "
-        f"The honest grade <b style='color:{_GRADE_COLOR[g]}'>{g}</b> scores the single-config "
-        "risk-conscious variant. Every strategy has its own dossier below; the full evidence "
-        "sits in the momentum family card.</div>"
-        f"<div class='cards'>{cards}</div>")
+        f"bootstrap {ci['conf']}% Sharpe CI {ci['sharpe_lo']:.2f}–{ci['sharpe_hi']:.2f}. The "
+        f"honest grade <b style='color:{_GRADE_COLOR[g]}'>{g}</b> scores the single-config "
+        "risk-conscious variant. Survivor-biased universe — momentum figures are internal "
+        "comparisons, not achievable returns.</p>")
 
 
 def sec_survivorship_banner(d: dict) -> str:
-    """Standing banner: the whole momentum family trades a survivor-biased universe, so
+    """Survivor-bias banner — no longer on the Overview (its one-sentence essence moved
+    into the sec_headline legend line when the pane went compact); kept defined for a
+    future research surface. The momentum family trades a survivor-biased universe, so
     its returns are internal-comparison-only; the survivorship-robust anchor is the GARCH
     vol-core on a clean world index."""
     vc = (d.get("vol_core") or {}).get("etf", "a clean world-index ETF")
@@ -927,10 +922,10 @@ def _crumb() -> str:
     return "<p class='crumb'><button data-pane='home'>\u2190 Overview</button></p>"
 
 
-def _spine(d: dict, public: bool, has_ops: bool, has_lab: bool) -> str:
-    """The left menu: Overview (all strategies) + one entry per strategy, grouped by
-    family, + Operations + Lab. Every entry is a <button data-pane=…>; the router
-    swaps the matching stage pane."""
+def _spine(d: dict) -> str:
+    """The left menu: Overview + one entry per strategy, grouped by family —
+    strategies ONLY, no research/ops/lab entries. Every entry is a
+    <button data-pane=…>; the router swaps the matching stage pane."""
     recs = _paned_records(d)
     items = ["<button data-pane='home' class='s-home'>\u25a6 Overview \u2014 all strategies</button>"]
     for fam in list(dict.fromkeys(r.family for r in recs)):
@@ -943,12 +938,6 @@ def _spine(d: dict, public: bool, has_ops: bool, has_lab: bool) -> str:
                 f"<button data-pane='rec-{r.id}' class='s-rec'>"
                 f"<span class='dot' style='background:{r.color or theme.FG_DIM}'></span>"
                 f"{star}{_menu_name(r)}</button>")
-    items.append("<hr class='s-sep'>")
-    items.append("<button data-pane='research'>Research &amp; robustness</button>")
-    if has_ops:
-        items.append("<button data-pane='ops'>Operations</button>")
-    if has_lab:
-        items.append("<button data-pane='lab'>Research lab</button>")
     return f"<nav class='spine'>{''.join(items)}</nav>"
 
 
@@ -1017,20 +1006,18 @@ def sec_portfolio_roi(d: dict, public: bool) -> str:
 
 
 def _pane_compare_all(d: dict, public: bool) -> str:
-    """The default (Overview) pane shown when no strategy is selected: command strip,
-    the full-grid result verdict, the survivorship banner, the all-strategies comparison
-    chart (strategies vs benchmarks), the real book's own cash-flow-matched ROI panel,
-    and the registry leaderboard."""
+    """The default (Overview) pane, compact: command strip, the full-grid headline
+    cards, the all-strategies comparison chart (strategies vs benchmarks), the real
+    book's own cash-flow-matched ROI panel, the registry leaderboard and the yearly
+    matrix. Prose walls and duplicate matrices deliberately absent."""
     return ("<section class='pane' id='pane-home'>"
             + sec_command(d, public) + sec_headline(d)
-            + sec_survivorship_banner(d)
             + "<h2>Walk-forward equity \u2014 all strategies vs benchmarks</h2>"
             "<p class='legend'>index = 100 at common start; click legend entries to "
             "toggle lines; pick a strategy in the menu for its detail</p>"
             + _chart_all(d, public)
             + sec_portfolio_roi(d, public)
             + sec_registry(d, public)
-            + sec_perf_compare(d, public)
             + sec_yearly_compare(d, public)
             + "</section>")
 
@@ -1070,6 +1057,60 @@ def _strat_windows(r) -> str:
             f"<th class='num'>Max DD</th></tr>{rows}</table>")
 
 
+def _holdings_section(r) -> str:
+    """Historical held stocks for a mega-cap arm: the latest book name-by-name (each
+    with its % return over the hold), then every rebalance interval's basket total
+    scored against the index. Renders only when the record carries a holdings table."""
+    h = getattr(r, "holdings", ()) or ()
+    if not h:
+        return ""
+
+    def chip(t, giant):
+        return f"<span class='mchip {'gia' if giant else 'usx'}'>{t}</span>"
+
+    latest = h[-1]
+    rows = "".join(
+        f"<tr><td>{chip(n['t'], n['giant'])} {n['name']}"
+        + (" <span class='mchip gia'>non-US</span>" if n["giant"] else "")
+        + f"</td><td class='num'>{_pct(n['ret'] * 100)}</td></tr>"
+        for n in latest["names"])
+    b, i = latest["basket"] * 100, latest["index"] * 100
+    beat = b - i if i == i else float("nan")
+    head = (f"<p class='legend'>Latest book "
+            f"<span class='mono'>{latest['start']} → {latest['end']}</span> · "
+            f"basket <b>{_pct(b)}</b> vs {MEGACAP_INDEX} "
+            f"<b>{_pct(i) if i == i else '—'}</b>"
+            + (f" · <b>{_pct(beat)}</b> vs index" if beat == beat else "") + "</p>")
+    latest_tbl = ("<table><tr><th>holding (this interval)</th>"
+                  "<th class='num'>return</th></tr>" + rows + "</table>")
+
+    def rchip(n):
+        cls = "gia" if n["giant"] else "usx"
+        sign = "+" if n["ret"] >= 0 else ""
+        return f"<span class='mchip {cls}'>{n['t']} {sign}{n['ret'] * 100:.0f}%</span>"
+
+    hist = ""
+    for p in reversed(h):
+        bb, ii = p["basket"] * 100, p["index"] * 100
+        dd = bb - ii if ii == ii else float("nan")
+        chips = " ".join(rchip(n) for n in p["names"])         # each name + its return
+        hist += (f"<tr><td class='mono'>{p['start']}</td><td>{chips}</td>"
+                 f"<td class='num'>{_pct(bb)}</td>"
+                 f"<td class='num'>{_pct(ii) if ii == ii else '—'}</td>"
+                 f"<td class='num'>{_pct(dd) if dd == dd else '—'}</td></tr>")
+    hist_tbl = (f"<details><summary>All {len(h)} rebalance intervals — each name's "
+                f"return + basket vs {MEGACAP_INDEX}</summary><div class='scroll'><table>"
+                "<tr><th>rebalance</th><th>held (10, equal-weight) — each with its return"
+                f"</th><th class='num'>basket</th><th class='num'>{MEGACAP_INDEX}</th>"
+                "<th class='num'>vs index</th></tr>" + hist + "</table></div></details>")
+    return ("<h3>Historical holdings — per interval, vs index</h3>"
+            "<p class='dim'><span class='mchip gia'>teal</span> = non-US giant · "
+            "<span class='mchip usx'>grey</span> = US/EDGAR. Per-name returns are "
+            "close-to-close over each hold; basket = equal-weight average; index = "
+            f"{MEGACAP_INDEX} over the same dates.</p>"
+            + head + latest_tbl + hist_tbl)
+
+
 def _pane_strategy(d: dict, r, public: bool) -> str:
     """One strategy's detail pane — the SAME uniform template for every strategy:
     equity curve vs benchmark, key-stat tiles, the train/val/test/full windows table,
@@ -1085,7 +1126,7 @@ def _pane_strategy(d: dict, r, public: bool) -> str:
     return (f"<section class='pane' id='pane-rec-{r.id}' hidden>"
             f"{_crumb()}"
             f"<h2 style='color:{r.color or theme.FG}'>{r.name} {_badge(r.status)}</h2>"
-            f"{core}{method}</section>")
+            f"{core}{_holdings_section(r)}{method}</section>")
 
 
 ROUTER_JS = """<script>
@@ -1942,10 +1983,11 @@ def sec_raw_reference(d: dict) -> str:
 # ── Page assembly ────────────────────────────────────────────────────────────────
 
 def render(d: dict, public: bool = False) -> str:
-    """The whole page as a master-detail app: a left menu (one entry per strategy) and
-    a stage of panes, one visible at a time via the client-side router. The default
-    (Overview) pane shows every strategy vs benchmarks + the real portfolio; each
-    strategy's own pane uses the SAME uniform template (curve · stats · windows ·
+    """The whole page as a master-detail app: a left menu — Overview + one entry per
+    strategy, nothing else — and a stage of panes, one visible at a time via the
+    client-side router. The Overview pane is the compact cockpit (command strip ·
+    headline cards · all-strategies chart · real-book ROI · registry · yearly matrix);
+    each strategy's own pane uses the SAME uniform template (curve · stats · windows ·
     method). Registry-driven — a new make_record() earns a menu entry + a pane."""
     from datetime import datetime
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1955,40 +1997,14 @@ def render(d: dict, public: bool = False) -> str:
     home = _pane_compare_all(d, public)
     strat_panes = "".join(_pane_strategy(d, r, public) for r in recs)
 
-    # Momentum-family research & robustness (public): grade, the evidence band (which
-    # itself folds significance + factor spanning), diagnostics, regimes, scenarios,
-    # the survivorship caveat. _momentum_evidence already embeds significance/factor —
-    # never render those standalone too, or they duplicate.
-    research = (f"<section class='pane' id='pane-research' hidden>{_crumb()}"
-                "<h2>Research &amp; robustness — momentum family</h2>"
-                + sec_grade_compare(d, public) + sec_ensemble(d, public)
-                + _momentum_evidence(d, public) + sec_diagnostics(d, public)
-                + sec_regime(d, public) + sec_scenarios(d, public) + sec_caveat(d)
-                + "</section>")
-
-    ops_body = (sec_track(d, public) + sec_venture(d, public)
-                + sec_ritual(d, public) + sec_vs_portfolio(d, public))
-    has_ops = bool(ops_body.strip())
-    ops = (f"<section class='pane' id='pane-ops' hidden>{_crumb()}"
-           "<h2>Operations — north star, ritual, your real book</h2>"
-           f"{ops_body}</section>") if has_ops else ""
-
-    has_lab = not public
-    lab = (f"<section class='pane' id='pane-lab' hidden>{_crumb()}"
-           "<h2>Research lab — momentum family (private)</h2>"
-           "<p class='dim'>The private workings: the raw full-invested reference, the "
-           "64-config grid, feasibility, and the supporting data.</p>"
-           + sec_raw_reference(d) + sec_survivorship(d) + sec_grid(d) + sec_feasibility(d)
-           + sec_timelines(d) + sec_method() + "</section>") if has_lab else ""
-
-    stage = f"<div class='stage'>{home}{strat_panes}{research}{ops}{lab}</div>"
+    stage = f"<div class='stage'>{home}{strat_panes}</div>"
     body = "".join([
         PAGE_CSS,
         "<div class='pagehead'>"
         "<h1>Strategy — adopted stack &amp; registry</h1>"
         f"<p class='dim'>generated {now} · config {cfg.code} · "
         f"<a href='report.html'>← portfolio</a></p></div>",
-        f"<div class='app'>{_spine(d, public, has_ops, has_lab)}{stage}</div>",
+        f"<div class='app'>{_spine(d)}{stage}</div>",
         ROUTER_JS,
     ])
     return page(f"Strategy — {cfg.code}", body)

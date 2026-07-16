@@ -146,6 +146,28 @@ def vol_target(equity: pd.Series, target_vol: float = 0.15, lookback: int = 63,
     return m
 
 
+def blend_equity(curves: dict, weights: dict, capital: float = 1.0) -> pd.Series:
+    """Daily-rebalanced weighted blend of equity curves — a portfolio OF strategies. Each
+    day the return is the weighted average of the constituents' daily returns, compounded
+    from `capital`; curves are aligned on their COMMON dates and weights renormalised to
+    sum to 1. Empty when fewer than two common dates. This is how offense (momentum) and
+    defense (value) combine: decorrelated sleeves cut drawdown without averaging away the
+    return — the diversification the two arms can't get alone."""
+    items = [(n, curves[n]) for n in weights
+             if curves.get(n) is not None and not getattr(curves[n], "empty", True)]
+    if not items:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame({n: c for n, c in items}).dropna()          # common dates only
+    if len(df) < 2:
+        return pd.Series(dtype=float)
+    tot = float(sum(weights[n] for n, _ in items))
+    w = pd.Series({n: weights[n] / tot for n, _ in items})
+    blend = (df.pct_change().iloc[1:] * w).sum(axis=1)
+    eq = capital * (1.0 + blend).cumprod()
+    eq.loc[df.index[0]] = float(capital)                          # seed the start point
+    return eq.sort_index()
+
+
 def effective_bets(returns: pd.DataFrame, weights) -> dict:
     """How many *independent* bets a weighted book really holds.
 

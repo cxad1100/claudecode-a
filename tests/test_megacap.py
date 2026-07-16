@@ -95,3 +95,97 @@ def test_arms_pick_by_their_own_score():
     assert set(size_picks) == {"SMALL"}      # SMALL has the larger cap
     assert set(grow_picks) == {"BIG"}        # BIG has the faster revenue growth
     assert set(mom_picks) == {"BIG"}         # BIG has the stronger 12-1 momentum
+
+
+# ── value / GARP arms (price-to-sales; US filers only for currency safety) ─────
+
+from tools.megacap import (ttm_revenue_panel, ps_panel, value_scores_by_date,
+                           garp_scores_by_date, run_value_arms)
+
+
+def _quarterly_rev(vals, start="2021-03-31", avail_lag_days=30):
+    idx = pd.date_range(start, periods=len(vals), freq="QE")
+    return pd.DataFrame({"revenue": [float(v) for v in vals],
+                         "avail": idx + pd.Timedelta(days=avail_lag_days)}, index=idx)
+
+
+def test_ttm_revenue_sums_last_four_quarters_pit():
+    rev = {"A": _quarterly_rev([100, 110, 120, 130, 140])}       # 5 quarters
+    d = rev["A"].index[-1] + pd.Timedelta(days=40)               # all 5 filed
+    ttm = ttm_revenue_panel(rev, [d])
+    assert abs(ttm.loc[d, "A"] - (110 + 120 + 130 + 140)) < 1e-9  # trailing 4, not 5
+
+
+def _no_ttm(ttm, d, t):
+    """No TTM = the name is absent (omit-when-empty, like cap_panel) or NaN."""
+    return t not in ttm.columns or np.isnan(ttm.loc[d, t])
+
+
+def test_ttm_revenue_incomplete_year_is_nan():
+    rev = {"A": _quarterly_rev([100, 110, 120])}                 # only 3 quarters
+    d = rev["A"].index[-1] + pd.Timedelta(days=40)
+    assert _no_ttm(ttm_revenue_panel(rev, [d]), d, "A")          # <4Q → no TTM
+
+
+def test_ttm_revenue_no_lookahead():
+    rev = {"A": _quarterly_rev([100, 110, 120, 130])}
+    before_last = rev["A"]["avail"].iloc[-1] - pd.Timedelta(days=1)  # 4th Q not yet filed
+    assert _no_ttm(ttm_revenue_panel(rev, [before_last]), before_last, "A")
+
+
+def test_ttm_revenue_annual_fallback():
+    idx = pd.date_range("2020-12-31", periods=3, freq="YE")      # annual cadence (20-F)
+    rev = {"A": pd.DataFrame({"revenue": [400.0, 450.0, 500.0],
+                              "avail": idx + pd.Timedelta(days=60)}, index=idx)}
+    d = idx[-1] + pd.Timedelta(days=70)
+    assert ttm_revenue_panel(rev, [d]).loc[d, "A"] == 500.0      # last annual = TTM
+
+
+def test_ps_panel_is_cap_over_ttm_and_drops_foreign():
+    dates = pd.DatetimeIndex(["2023-03-31", "2023-06-30"])
+    cap = pd.DataFrame({"AAPL": [3000., 3200.], "SAP.DE": [2000., 2100.]}, index=dates)
+    ttm = pd.DataFrame({"AAPL": [100., 100.], "SAP.DE": [50., 50.]}, index=dates)
+    ps = ps_panel(cap, ttm)
+    assert "SAP.DE" not in ps.columns                            # foreign filer → currency-unsafe
+    assert abs(ps.loc[dates[0], "AAPL"] - 30.0) < 1e-9
+
+
+def test_ps_panel_nan_when_rev_nonpositive():
+    dates = pd.DatetimeIndex(["2023-03-31"])
+    cap = pd.DataFrame({"AAPL": [3000.]}, index=dates)
+    ttm = pd.DataFrame({"AAPL": [0.0]}, index=dates)
+    ps = ps_panel(cap, ttm)
+    assert "AAPL" not in ps.columns or np.isnan(ps.loc[dates[0], "AAPL"])
+
+
+def test_value_scores_rank_cheapest_highest():
+    dates = pd.DatetimeIndex(["2023-03-31"])
+    ps = pd.DataFrame({"CHEAP": [5.0], "MID": [15.0], "RICH": [40.0]}, index=dates)
+    sc = value_scores_by_date(ps, dates)[dates[0]]["raw"].sort_values(ascending=False)
+    assert list(sc.index) == ["CHEAP", "MID", "RICH"]
+
+
+def test_garp_scores_prefer_cheap_and_growing():
+    dates = pd.DatetimeIndex(["2023-03-31"])
+    ps = pd.DataFrame({"CHEAPGROW": [10.], "RICHGROW": [40.], "CHEAPFLAT": [10.]}, index=dates)
+    yoy = pd.DataFrame({"CHEAPGROW": [0.5], "RICHGROW": [0.5], "CHEAPFLAT": [0.05]}, index=dates)
+    sc = garp_scores_by_date(ps, yoy, dates)[dates[0]]["raw"].sort_values(ascending=False)
+    assert sc.index[0] == "CHEAPGROW"                            # cheap AND growing = best
+    assert sc["CHEAPGROW"] > sc["RICHGROW"]                      # cheaper wins at equal growth
+    assert sc["CHEAPGROW"] > sc["CHEAPFLAT"]                     # faster growth wins at equal price
+
+
+def test_run_value_arms_pick_by_price_to_sales():
+    idx = pd.bdate_range("2021-01-01", periods=300)
+    prices = pd.DataFrame({"CHEAP": np.linspace(10, 12, 300),
+                           "RICH": np.linspace(10, 12, 300)}, index=idx)
+    dates = rebalance_dates(prices.index)
+    cap = pd.DataFrame({"CHEAP": 100.0, "RICH": 100.0}, index=dates)   # equal cap → both in screen
+    rev = {"CHEAP": _quarterly_rev([50] * 10, start="2019-03-31"),     # high rev → low P/S
+           "RICH":  _quarterly_rev([5] * 10, start="2019-03-31")}      # low rev  → high P/S
+    yoy = pd.DataFrame({"CHEAP": 0.1, "RICH": 0.1}, index=dates)
+    res = run_value_arms(prices, {"CHEAP": 10, "RICH": 10}, cap, rev, yoy,
+                         n=2, k=1, lookback=200)
+    assert set(res) == {"value", "garp"}
+    val_picks = {p for h in res["value"]["holdings_log"] for p in h["picks"]}
+    assert val_picks == {"CHEAP"}                               # value buys the cheaper P/S name
