@@ -147,6 +147,7 @@ def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
 
 MEGACAP_INDEX = "Nasdaq 100"          # per-interval yardstick for the holdings table
 DIP_WINDOW = 21                       # buy-the-dip lookback: 1-month reversal horizon (~21 sessions)
+VALUE_VT_ADOPTED = "2026-07-16"       # date the vol-managed value sleeve cleared its pre-registered gate
 
 
 def _arm_holdings_table(hl_log, prices, index_series, name_map, giants) -> tuple:
@@ -250,6 +251,29 @@ _VALUE_ARM_META = {
     "garp": ("megacap_garp", "GARP — growth at a reasonable price (US mega-caps)",
              "buying cheap-relative-to-growth names"),
 }
+
+
+def sleeve_gate(sleeve: dict, control: dict, *, sharpe_tol: float = 0.15) -> dict:
+    """Pre-registered adoption gate for a DEFENSIVE (vol-managed) sleeve vs its control, on
+    the train+val windows ONLY — test stays a confirmation, never fitted. `sleeve`/`control`
+    are {'train': (sharpe, max_dd), 'val': (sharpe, max_dd)}. A sleeve earns adoption when it:
+      (a) strictly improves the VALIDATION Sharpe — it must win the stress it exists for;
+      (b) stays within `sharpe_tol` of the control's TRAIN Sharpe — it can't collapse in the
+          calm bull tape (a defensive book gives up a little upside, not all of it); and
+      (c) cuts max drawdown in BOTH windows — it must genuinely de-risk, not just re-shape.
+    Generic (any vol-managed sleeve vs its control), not tuned to one book. Returns
+    {'passed': bool, 'reason': str}."""
+    s_tr, sdd_tr = sleeve["train"]; s_vl, sdd_vl = sleeve["val"]
+    c_tr, cdd_tr = control["train"]; c_vl, cdd_vl = control["val"]
+    wins_val = s_vl > c_vl
+    holds_train = s_tr >= c_tr - sharpe_tol
+    derisks = abs(sdd_tr) < abs(cdd_tr) and abs(sdd_vl) < abs(cdd_vl)
+    passed = bool(wins_val and holds_train and derisks)
+    ok = lambda b: "✓" if b else "✗"
+    reason = (f"val Sharpe {s_vl:+.2f} vs {c_vl:+.2f} ({ok(wins_val)}); train Sharpe "
+              f"{s_tr:+.2f} vs {c_tr:+.2f} within {sharpe_tol:.2f} ({ok(holds_train)}); "
+              f"drawdown cut both windows ({ok(derisks)})")
+    return {"passed": passed, "reason": reason}
 
 
 def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=None,
@@ -457,14 +481,35 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
                 wc = (f"Sharpe {m['sharpe']:.2f} vs the Largest-cap arm's {size_m['sharpe']:.2f}, "
                       f"max drawdown {m['max_dd']*100:.0f}% vs {size_m['max_dd']*100:.0f}% — "
                       f"{'improves' if better else 'does not improve'} the risk-adjusted profile. ")
+            # value_vt faces the pre-registered defensive-sleeve gate (train+val only); combo
+            # stays an incubating candidate.
+            status, adopted_date, note = "candidate", None, ""
+            gate_txt = (f"incubating — constructed from the mega-cap arms ({n_txt}); the win "
+                        "condition is risk-adjusted, not raw return. No adoption gate pre-registered.")
+            if kind == "value_vt" and size_eq is not None and not getattr(size_eq, "empty", True):
+                def _wm(e, key):
+                    s = e.dropna()
+                    lo, hi = sreg.window_bounds(s, train_end, val_end)[key]
+                    mm = qg.window_metrics(s, lo, hi)
+                    return (mm["sharpe"], mm["max_dd"])
+                g = sleeve_gate({"train": _wm(eq, "train"), "val": _wm(eq, "val")},
+                                {"train": _wm(size_eq, "train"), "val": _wm(size_eq, "val")})
+                if g["passed"]:
+                    status, adopted_date = "adopted", VALUE_VT_ADOPTED
+                    gate_txt = "PASS (pre-registered defensive-sleeve gate) — " + g["reason"]
+                    note = ("Adopted as a DEFENSIVE sleeve — not a size-beater: it trades "
+                            "bull-run upside for resilience, winning the validation drawdown and "
+                            "cutting risk throughout. Test is confirmation, not a blind holdout "
+                            "(it was observed in development). ")
+                else:
+                    gate_txt = "defensive-sleeve gate NOT cleared — " + g["reason"]
             recs.append(sreg.make_record(
-                rid, nm, "mega-cap", "candidate",
-                equity=eq, train_end=train_end, val_end=val_end,
+                rid, nm, "mega-cap", status,
+                equity=eq, train_end=train_end, val_end=val_end, adopted=adopted_date,
                 cost_model="slippage (half-spread)"
                            + (f" + {RC_TURN_BPS:.0f}bp resize" if kind == "value_vt" else ""),
-                gate=f"incubating — constructed from the mega-cap arms ({n_txt}); the win "
-                     "condition is risk-adjusted, not raw return. No adoption gate pre-registered.",
-                verdict=f"Built from your own arms: {desc}. " + wc +
+                gate=gate_txt,
+                verdict=f"Built from your own arms: {desc}. " + note + wc +
                         "Survivor-biased universe → an internal comparison against the arms "
                         "below, not an absolute return."))
     else:

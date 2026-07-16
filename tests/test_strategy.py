@@ -907,6 +907,32 @@ def test_value_and_garp_records_are_curve_bearing_candidates():
     assert ui._menu_name(val) != ui._menu_name(garp)
 
 
+def test_sleeve_gate_adopts_value_vt_profile():
+    """The real value_vt vs size train+val profile clears the defensive-sleeve gate:
+    wins the validation stress window, holds the bull train Sharpe, cuts drawdown in both."""
+    vt = {"train": (0.99, -0.24), "val": (0.36, -0.11)}
+    size = {"train": (1.06, -0.29), "val": (-0.18, -0.42)}
+    assert bs.sleeve_gate(vt, size)["passed"] is True
+
+
+def test_sleeve_gate_rejects_losing_validation():
+    vt = {"train": (0.99, -0.24), "val": (-0.30, -0.11)}          # loses the stress window
+    size = {"train": (1.06, -0.29), "val": (-0.18, -0.42)}
+    assert bs.sleeve_gate(vt, size)["passed"] is False
+
+
+def test_sleeve_gate_rejects_collapse_in_train():
+    vt = {"train": (0.50, -0.24), "val": (0.36, -0.11)}           # 0.50 < 1.06 - 0.15
+    size = {"train": (1.06, -0.29), "val": (-0.18, -0.42)}
+    assert bs.sleeve_gate(vt, size)["passed"] is False
+
+
+def test_sleeve_gate_rejects_when_not_derisking():
+    vt = {"train": (0.99, -0.35), "val": (0.36, -0.11)}           # train dd deeper than -0.29
+    size = {"train": (1.06, -0.29), "val": (-0.18, -0.42)}
+    assert bs.sleeve_gate(vt, size)["passed"] is False
+
+
 def test_combo_and_vol_managed_value_register_from_arms():
     """Constructed books — 50/50 momentum+value combo and vol-managed value — register as
     mega-cap candidates with a risk-adjusted (Sharpe / drawdown) verdict vs the size control."""
