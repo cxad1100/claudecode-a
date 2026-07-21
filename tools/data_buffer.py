@@ -53,35 +53,59 @@ def cached_price_history(tickers, period="5y", ttl_hours=12, force=False,
     return df
 
 
-def _fetch_ohlc_yf(ticker: str, period: str = "max") -> pd.DataFrame:
+def _fetch_ohlc_yf(ticker: str, period: str = "max", retries: int = 2) -> pd.DataFrame:
+    """OHLC download, robust to two live Yahoo quirks: it throttles rapid successive
+    calls (empty 'possibly delisted' frame), and for some index tickers (`^GSPC`) it
+    rejects `period=max`/`start=` while accepting a long fixed period. So try a ladder
+    of period specs, each with a couple of backed-off retries; an empty result is a
+    transient failure, never returned as if it were real data."""
     import yfinance as yf
-    raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    if raw.index.tz is not None:
-        raw.index = raw.index.tz_localize(None)
-    return raw[["Close", "High", "Low"]].dropna(how="all")
+    ladder = [period] + [p for p in ("30y", "15y", "10y") if p != period]
+    last = pd.DataFrame()
+    for spec in ladder:
+        for attempt in range(retries):
+            raw = yf.download(ticker, period=spec, auto_adjust=True, progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            if raw.index.tz is not None:
+                raw.index = raw.index.tz_localize(None)
+            cols = [c for c in ("Close", "High", "Low") if c in raw.columns]
+            last = raw[cols].dropna(how="all") if cols else pd.DataFrame()
+            if not last.empty:
+                return last
+            time.sleep(1.2 * (attempt + 1))               # back off, let the throttle clear
+    return last
 
 
 def cached_ohlc(ticker: str, period: str = "max", ttl_hours: float = 12, force=False,
                 buffer_dir: Path | None = None, _fetch=None) -> pd.DataFrame:
     """OHLC (Close/High/Low) with a TTL pickle cache — cached_price_history stores Close
-    only. A failed fetch degrades to the last-good pickle (stale beats dead) and only
-    raises when nothing was ever cached."""
+    only. A failed/empty fetch degrades to the last-good pickle (stale beats dead) and
+    only raises when nothing was ever cached. An empty result is NEVER cached (that would
+    poison the buffer and serve emptiness for the whole TTL)."""
     _fetch = _fetch or _fetch_ohlc_yf
     d = _dir(buffer_dir)
     path = d / f"ohlc_{ticker.replace('^', 'i').replace('.', '_')}.pkl"
     if not force and _fresh(path, ttl_hours):
         try:
-            return pd.read_pickle(path)
+            cached = pd.read_pickle(path)
+            if not cached.empty:
+                return cached
         except Exception:
             pass
     try:
         df = _fetch(ticker, period)
     except Exception:
+        df = pd.DataFrame()
+    if df.empty:                                          # transient failure
         if path.exists():
-            return pd.read_pickle(path)                   # last-good fallback
-        raise
+            try:
+                stale = pd.read_pickle(path)
+                if not stale.empty:
+                    return stale                          # last-good fallback
+            except Exception:
+                pass
+        raise RuntimeError(f"OHLC fetch for {ticker!r} returned no data and no cache exists")
     try:
         df.to_pickle(path)
     except Exception:
