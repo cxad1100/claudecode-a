@@ -150,8 +150,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 html = P.build(d, public=False)
                 stale, as_of = None, None
             elif page == "strategy":
-                d = ST.gather(force=force)
-                html = ST.build(d, public=False)
+                d = ST.gather_all(force=force)
+                html = ST.build_all(d, public=False)
                 stale, as_of = None, None
             elif page == "vol":
                 d = V.gather(force=force)

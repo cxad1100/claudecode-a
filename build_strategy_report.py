@@ -19,6 +19,9 @@ import plotly.graph_objects as go
 
 from tools.report_html import pct as _pct, card as _card, page, fig_html
 from tools import theme, significance as sig, quant_grade as qg
+import build_vol_report as V     # vol overlay strategy (its own gather + rich sections)
+import build_edge_report as E    # structural stack + tax-loss sleeve
+import build_pairs_report as P   # market-neutral pairs
 from tools.momentum import (run_momentum, winsorize_prices, to_xetra_calendar,
                             precompute_eligibility)
 from tools.universe_pit import PITUniverse
@@ -565,16 +568,279 @@ def build(d: dict, public: bool = False) -> str:
     return page(f"Strategy — {cfg.code}", body)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  STRATEGIES HUB — every strategy on one page, ordered by conviction, each at
+#  full depth by reusing that strategy's own section functions (no duplication).
+# ════════════════════════════════════════════════════════════════════════════
+
+_HUB_CSS = """
+.hubgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:18px 0 8px}
+.hubcard{display:block;text-decoration:none;color:inherit;background:#252526;border:1px solid #333;
+ border-radius:10px;padding:16px 18px;position:relative;overflow:hidden;transition:border-color .15s}
+.hubcard:hover{border-color:#569cd6}
+.hubcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--bar,#569cd6)}
+.hubcard .hn{font-size:15px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px;color:#e8e8e8}
+.hubcard .ht{font-size:12.5px;color:#9a9a9a;line-height:1.45;margin:4px 0 12px;min-height:2.6em}
+.hubcard .hs{display:flex;gap:16px;font-size:12px;color:#b5b5b5;flex-wrap:wrap}
+.hubcard .hs b{color:#e8e8e8;font-variant-numeric:tabular-nums}
+.hbadge{display:inline-block;font:600 10px ui-monospace,Menlo,monospace;letter-spacing:.06em;
+ padding:3px 8px;border-radius:20px;color:#0b0b0b;margin-bottom:8px}
+.stratband{margin:3rem 0 0;padding:14px 0 2px;border-top:2px solid #333}
+.stratband h1{margin:0;font-size:1.7rem}
+.stratband .role{font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.12em;text-transform:uppercase;color:#808080}
+.hubstub{background:#2a2a2b;border:1px solid #3a3a3a;border-radius:8px;padding:14px 16px;color:#b5b5b5;font-size:13.5px}
+"""
+
+_BADGE = dict(good="#46c84e", warn="#d7ba7d", crit="#ef4444", neutral="#569cd6", teal="#4ec9b0")
+
+
+def _badge(text, kind="neutral"):
+    return f'<span class="hbadge" style="background:{_BADGE[kind]}">{text}</span>'
+
+
+def _g(dct, *path, default=None):
+    """Defensive nested get: _g(d,'a','b') → d['a']['b'] or default."""
+    cur = dct
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+_PAIRS_PKL = ROOT / "local" / "buffer" / "hub_pairs.pkl"
+
+
+def _cached_pairs(populate: bool = False):
+    """Pairs runs thousands of Engle-Granger cointegration tests (10+ min) — far too slow
+    to ever run inside a page build. So the hub NEVER scans inline: it reads a pickle if
+    one exists (best-effort, any age), else returns None and the section shows a stub.
+    The cache is populated out-of-band by `python build_strategy_report.py --pairs`
+    (background it once); its result moves slowly, so a stale-ish cache is fine."""
+    import pickle
+    if not populate:
+        try:
+            with open(_PAIRS_PKL, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None                                  # no cache → stub, no scan
+    d = P.gather(force=True)                             # the slow scan, only on --pairs
+    try:
+        _PAIRS_PKL.parent.mkdir(parents=True, exist_ok=True)
+        with open(_PAIRS_PKL, "wb") as f:
+            pickle.dump(d, f)
+    except Exception:
+        pass
+    return d
+
+
+def gather_all(force: bool = False, refresh: bool | None = None) -> dict:
+    """Gather every strategy's data. Each is independent and guarded — one failing
+    (e.g. pairs needs a live fetch) never sinks the page; its card shows the reason.
+    Pairs is served from an 18h pickle cache (its scan is minutes)."""
+    refresh = force if refresh is None else refresh
+    out: dict = {}
+    for key, fn in (("mom", lambda: gather(force=force, refresh=refresh)),
+                    ("vol", lambda: V.gather(force=force, refresh=refresh)),
+                    ("edge", lambda: E.gather(force=force, refresh=refresh)),
+                    ("pairs", lambda: _cached_pairs())):    # cache-only, never scans inline
+        try:
+            out[key] = fn()
+        except Exception as exc:                       # noqa: BLE001 — report, don't crash
+            out[key] = None
+            out[f"{key}_err"] = f"{type(exc).__name__}: {exc}"
+            print(f"  [hub] {key} unavailable — {out[f'{key}_err']}")
+    if out.get("pairs") is None and "pairs_err" not in out:
+        out["pairs_err"] = ("cache empty — populate once with "
+                            "<span class='mono'>python build_strategy_report.py --pairs</span> "
+                            "(~10-min cointegration scan), or open the <a href='/pairs' "
+                            "target='_top'>dedicated /pairs page</a>")
+    return out
+
+
+def _hub_cards(d: dict) -> str:
+    mom, vol, edge, pairs = d.get("mom"), d.get("vol"), d.get("edge"), d.get("pairs")
+    cards = []
+
+    # 1 — momentum core (return engine)
+    if mom:
+        test = mom.get("test", {})
+        full = _g(mom, "res", "runs", 1.0, "stats", default={})
+        grade = _g(mom, "quant", "grade", "letter", default="—")
+        cards.append(_card_html("momentum", "Momentum core", "teal",
+            _badge("RETURN ENGINE", "teal"),
+            "12-1 cross-sectional on small/illiquid names funds can't crowd — the capacity edge.",
+            [("Test Sharpe", f"{test.get('sharpe', 0):.2f}"),
+             ("Full return", _pct(full.get("net_return", 0) * 100)),
+             ("Grade", grade)]))
+    else:
+        cards.append(_stub_card("momentum", "Momentum core", d.get("mom_err")))
+
+    # 2 — vol overlay (ADOPT)
+    if vol:
+        v = _g(vol, "verdicts", "etf", "verdict", default="—")
+        garch = _g(vol, "etf", "variants", "garch", default={})
+        bh = _g(vol, "etf", "bh", default={})
+        kind = "good" if str(v).startswith("ADOPT") else "warn"
+        cards.append(_card_html("vol", "Volatility overlay", kind, _badge(v.upper(), kind),
+            "Forecast tomorrow's risk (GARCH/learned), size exposure to it. De-risk only, no leverage.",
+            [("ETF Sharpe", f"{bh.get('sharpe', 0):.2f}→{garch.get('sharpe', 0):.2f}"),
+             ("Max DD", f"{bh.get('max_dd', 0) * 100:.0f}%→{garch.get('max_dd', 0) * 100:.0f}%"),
+             ("Avg exp", f"{garch.get('avg_exposure', 1) * 100:.0f}%")]))
+    else:
+        cards.append(_stub_card("vol", "Volatility overlay", d.get("vol_err")))
+
+    # 3 — structural stack (composite)
+    ov = _g(edge, "stack", "overlay", default={}) if edge else {}
+    if ov:
+        cards.append(_card_html("edge", "Structural stack", "neutral", _badge("COMPOSITE", "neutral"),
+            "Capacity + horizon: momentum core, vol-managed to target vol. The book you'd actually run.",
+            [("Ann. return", _pct(ov.get("ann_return", 0) * 100)),
+             ("Sharpe", f"{ov.get('sharpe', 0):.2f}"),
+             ("Max DD", f"{ov.get('max_dd', 0) * 100:.0f}%")]))
+    else:
+        cards.append(_stub_card("edge", "Structural stack", d.get("edge_err") or "needs momentum core"))
+
+    # 4 — pairs (market-neutral)
+    if pairs:
+        st = _g(pairs, "bt", "runs", 1.0, "stats", default={})
+        cards.append(_card_html("pairs", "Pairs trading", "neutral", _badge("MARKET-NEUTRAL", "neutral"),
+            "Cointegration spreads, walk-forward, α/β/μ/σ frozen on the formation window.",
+            [("Live pairs", str(len(pairs.get("live", [])))),
+             ("BT Sharpe", f"{st.get('sharpe', 0):.2f}"),
+             ("BT return", _pct(st.get("net_return", 0) * 100))]))
+    else:
+        cards.append(_stub_card("pairs", "Pairs trading", d.get("pairs_err")))
+
+    # 5 — tax-loss sleeve (verdict last, whatever it is)
+    if edge:
+        sv = _g(edge, "sleeve_verdict", "verdict", default="—")
+        mc = _g(edge, "mc", default={})
+        kind = "good" if sv == "KEEP" else "crit"
+        cards.append(_card_html("taxloss", "Tax-loss sleeve", kind, _badge(sv, kind),
+            "Forced-flow seasonal: buy December's crushed losers, sell in January. Judged by a random-selection null.",
+            [("Verdict", sv),
+             ("MC p-value", f"{mc.get('p_sharpe', float('nan')):.2f}"),
+             ("vs random", f"{mc.get('strat_total', 0) * 100:+.0f}% / {mc.get('null_total_median', 0) * 100:+.0f}%")]))
+    else:
+        cards.append(_stub_card("taxloss", "Tax-loss sleeve", d.get("edge_err")))
+
+    return ('<div class="note">Every strategy in the book, ordered by weight of evidence — '
+            'return engines first, the automatically-cut sleeve last. Each card jumps to its '
+            'full section.</div>'
+            f'<div class="hubgrid">{"".join(cards)}</div>')
+
+
+def _card_html(anchor, name, kind, badge, thesis, stats):
+    bar = _BADGE[kind]
+    sh = "".join(f'<div><span class="dim">{k}</span> <b>{v}</b></div>' for k, v in stats)
+    return (f'<a href="#{anchor}" class="hubcard" style="--bar:{bar}">{badge}'
+            f'<div class="hn">{name}</div><div class="ht">{thesis}</div>'
+            f'<div class="hs">{sh}</div></a>')
+
+
+def _stub_card(anchor, name, err):
+    return (f'<a href="#{anchor}" class="hubcard" style="--bar:#666">{_badge("UNAVAILABLE", "warn")}'
+            f'<div class="hn">{name}</div><div class="ht">Not built this run — {err or "no data"}.</div>'
+            f'<div class="hs dim">see section below</div></a>')
+
+
+def _band(anchor, title, role):
+    return f'<div class="stratband" id="{anchor}"><div class="role">{role}</div><h1>{title}</h1></div>'
+
+
+def _safe(fn, *args, label=""):
+    """Render a section, converting any failure into an inline note instead of a 500."""
+    try:
+        return fn(*args)
+    except Exception as exc:                            # noqa: BLE001
+        return f'<div class="hubstub">Section {label or fn.__name__} failed: {type(exc).__name__}: {exc}</div>'
+
+
+def build_all(d: dict, public: bool = False) -> str:
+    """The strategies hub: index cards, then every strategy full-depth in conviction order."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    mom, vol, edge, pairs = d.get("mom"), d.get("vol"), d.get("edge"), d.get("pairs")
+    parts = [f"<style>{_HUB_CSS}</style>",
+             "<h1>Strategies</h1>",
+             f"<p class='dim'>generated {now} · <a href='report.html'>← portfolio</a> · "
+             "all strategies, ordered by conviction · <b>not advice</b></p>",
+             _hub_cards(d)]
+
+    # 1 — Momentum core (flagship detail)
+    if mom:
+        parts += [_band("momentum", f"Momentum core — {mom['strategy'].code}", "1 · return engine · capacity edge"),
+                  _safe(sec_intro, mom), _safe(sec_holdings, mom), _safe(sec_curve, mom),
+                  _safe(sec_perf, mom, public), _safe(sec_risk_conscious, mom, public),
+                  _safe(sec_vs_portfolio, mom, public), _safe(sec_grade, mom, public),
+                  _safe(sec_significance, mom, public), _safe(sec_yearly, mom, public),
+                  _safe(sec_timeline, mom), _safe(sec_caveat, mom)]
+    else:
+        parts += [_band("momentum", "Momentum core", "1 · return engine"),
+                  f'<div class="hubstub">Unavailable — {d.get("mom_err")}</div>']
+
+    # 2 — Volatility overlay (full artifact depth, reusing the vol page's own sections)
+    if vol:
+        parts += [_band("vol", "Volatility overlay", "2 · risk control · forecast the variance, not the mean"),
+                  _safe(V.sec_thesis, vol), _safe(V.sec_verdict, vol), _safe(V.sec_today, vol),
+                  _safe(V.sec_forecast_eval, vol), _safe(V.sec_mean_null, vol), _safe(V.sec_etf, vol),
+                  _safe(V.sec_momentum, vol), _safe(V.sec_significance, vol), _safe(V.sec_costs, vol),
+                  _safe(V.sec_method, vol)]
+    else:
+        parts += [_band("vol", "Volatility overlay", "2 · risk control"),
+                  f'<div class="hubstub">Unavailable — {d.get("vol_err")}</div>']
+
+    # 3 — Structural stack (the composite you'd run)
+    if edge:
+        parts += [_band("edge", "Structural stack", "3 · composite · capacity + horizon, vol-managed"),
+                  _safe(E.sec_edges, edge), _safe(E.sec_stack, edge)]
+    else:
+        parts += [_band("edge", "Structural stack", "3 · composite"),
+                  f'<div class="hubstub">Unavailable — {d.get("edge_err")}</div>']
+
+    # 4 — Pairs (market-neutral)
+    if pairs:
+        parts += [_band("pairs", "Pairs trading", "4 · market-neutral · statistical arbitrage"),
+                  _safe(P.sec_intro), _safe(P.sec_snapshot, pairs), _safe(P.sec_pair_charts, pairs),
+                  _safe(P.sec_backtest, pairs, public), _safe(P.sec_costs, pairs), _safe(P.sec_method)]
+    else:
+        parts += [_band("pairs", "Pairs trading", "4 · market-neutral"),
+                  f'<div class="hubstub">Unavailable — {d.get("pairs_err")}</div>']
+
+    # 5 — Tax-loss sleeve (the verdict — last)
+    if edge:
+        parts += [_band("taxloss", "Tax-loss sleeve", "5 · forced-flow seasonal · pre-registered verdict"),
+                  _safe(E.sec_verdict, edge), _safe(E.sec_today, edge), _safe(E.sec_seasonal, edge),
+                  _safe(E.sec_method, edge)]
+    else:
+        parts += [_band("taxloss", "Tax-loss sleeve", "5 · forced-flow seasonal"),
+                  f'<div class="hubstub">Unavailable — {d.get("edge_err")}</div>']
+
+    return page("Strategies", "".join(parts))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--solo", action="store_true", help="momentum-only page (the old /strategy)")
+    ap.add_argument("--pairs", action="store_true",
+                    help="populate the pairs cache (the slow one-time cointegration scan)")
     args = ap.parse_args()
-    d = gather(refresh=args.refresh)
     local = ROOT / "local/strategy.html"
     local.parent.mkdir(exist_ok=True)
-    local.write_text(build(d))                          # live/local only — no docs/ export
-    print(f"wrote {local}  (strategy {STRATEGY.code} + lab)")
+    if args.pairs:
+        d = _cached_pairs(populate=True)
+        print(f"pairs cache written: {len(d['live'])} live pairs, {d['n_tested']} tested")
+        return
+    if args.solo:
+        local.write_text(build(gather(refresh=args.refresh)))
+        print(f"wrote {local}  (momentum solo {STRATEGY.code})")
+    else:
+        d = gather_all(refresh=args.refresh)
+        local.write_text(build_all(d))                  # live/local only — no docs/ export
+        built = [k for k in ("mom", "vol", "edge", "pairs") if d.get(k)]
+        print(f"wrote {local}  (strategies hub: {', '.join(built)})")
     if args.open:
         webbrowser.open(local.as_uri())
 
