@@ -961,17 +961,17 @@ def _spine(d: dict) -> str:
 def _thin(srs, max_points: int = 900):
     """Downsample a curve for the OVERVIEW charts only.
 
-    The Overview draws ~37 strategies plus benchmarks on two axes; at daily resolution
-    that is a 28 MB page the browser spends many seconds parsing. Sampling every nth
-    point (always keeping the last, so the final value is exact) is visually identical
-    over a multi-year window and cuts the payload several-fold.
+    The page carries ~37 strategies, each with its own chart plus the benchmark curves
+    redrawn alongside it. At daily resolution that measured 26 MB — and the per-strategy
+    panes, not the Overview, were 24 MB of it. Sampling every nth point (always keeping
+    the last, so the final value is exact) is visually identical over a multi-year window
+    and cuts the payload several-fold.
 
     This is presentation only: every number on the page — the stat tiles, the window
     tables, the registry — is computed from the FULL daily series by
-    quant_grade.window_metrics, never from this. Each strategy's own pane also charts the
-    full daily curve. The one thing a thinned line understates is the depth of a spike
-    between samples, which is why the drawdown you read is always the table's, not the
-    chart's."""
+    quant_grade.window_metrics, never from a thinned one. The one thing a thinned line
+    understates is the depth of a spike between samples, which is why the drawdown you
+    read is always the table's, not the chart's."""
     if srs is None or len(srs) <= max_points:
         return srs
     step = int(len(srs) // max_points) + 1
@@ -1155,11 +1155,12 @@ def _strat_curve(d: dict, r) -> str:
     fig = go.Figure()
     srs = r.equity.reindex(window).ffill().dropna()
     if len(srs) >= 2:
-        fig.add_trace(go.Scatter(x=srs.index, y=srs / srs.iloc[0] * 100.0, name=r.name,
+        y = _thin(srs / srs.iloc[0] * 100.0)
+        fig.add_trace(go.Scatter(x=y.index, y=y, name=r.name,
                                  line=dict(color=r.color, width=2.4)))
     for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():
-        fig.add_trace(go.Scatter(x=curve.index, y=curve / d["capital"] * 100.0, name=name,
-                                 line=dict(width=1.1)))
+        y = _thin(curve / d["capital"] * 100.0)
+        fig.add_trace(go.Scatter(x=y.index, y=y, name=name, line=dict(width=1.1)))
     fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
     fig.update_layout(height=360, yaxis_title="Index (start = 100)",
                       hovermode="x unified", margin=dict(t=20))
