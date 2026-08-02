@@ -1276,3 +1276,13 @@ def test_promoted_records_keep_their_lab_link(tmp_path, monkeypatch):
     pane = ui._pane_strategy(d, rec, public=False)
     assert "class='chart'" in pane                 # it has its curve
     assert "pairs.html" in pane                    # and still points at the lab
+
+
+def test_every_menu_entry_reads_distinctly():
+    """Two menu options a reader cannot tell apart are not two options. _menu_name
+    truncates at " (" and " — ", which silently collapsed the vol forecaster variants
+    ('Online ensemble (Hedge)' on two different underlyings) into identical labels."""
+    d = _fake_d()
+    labels = [ui._menu_name(r) for r in ui._paned_records(d)]
+    dupes = {l for l in labels if labels.count(l) > 1}
+    assert not dupes, f"indistinguishable menu entries: {dupes}"

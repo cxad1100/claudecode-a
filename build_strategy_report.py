@@ -1140,6 +1140,10 @@ def _lab_edge(force: bool) -> list:
     return saved
 
 
+# Short, distinct underlying labels for the vol variants' menu entries.
+_VOL_UNDERLYING = {"etf": "MSCI World", "mom": "the momentum book"}
+
+
 def _lab_vol(force: bool) -> list:
     """Every vol-forecaster variant on every tradeable underlying (build_vol_report).
 
@@ -1160,9 +1164,16 @@ def _lab_vol(force: bool) -> list:
                 continue
             sid = "vol_core" if (ukey == "etf" and method == adopted) else f"vol_{ukey}_{method}"
             is_adopted = sid == "vol_core"
+            # The menu label is the head of the name up to " (" or " \u2014 ", so a
+            # parenthetical like "Online ensemble (Hedge)" would truncate to a string
+            # identical to the same forecaster on the other underlying. Strip the
+            # parenthetical first and put the underlying where it survives, so every
+            # variant reads distinctly in the menu.
+            base = V.METHOD_LABEL.get(
+                method, method.replace("_", " ").capitalize()).split(" (")[0]
             scache.save(
                 sid, eq, source="build_vol_report",
-                name=f"{V.METHOD_LABEL.get(method, method)} overlay on {u['name']}",
+                name=f"{base} on {_VOL_UNDERLYING.get(ukey, u['name'])}",
                 family="vol-managed core",
                 status="adopted" if is_adopted else "variant",
                 variant_of=None if is_adopted else "vol_core",
