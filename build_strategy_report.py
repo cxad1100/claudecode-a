@@ -1189,30 +1189,16 @@ def _lab_pairs(force: bool) -> list:
     return ["pairs"]
 
 
-def _lab_econo(force: bool) -> list:
-    """The econophysics cells (build_econo_report) — the most expensive lab by far, and
-    the one most likely to be missing its scraped inputs. Opt-in only."""
-    import build_econo_report as EC
-    d = EC.gather(force=force)
-    saved = []
-    for sid, keys in (("econo_leadlag", ("leadlag",)), ("econo_cluster", ("corr",)),
-                      ("econo_arthrottle", ("phase",)), ("econo_nn", ("ml",))):
-        block = d.get(keys[0])
-        if not isinstance(block, dict):
-            continue
-        # Each module reports a list of trial cells; take the cell the module itself
-        # nominates as its headline, else the first with a usable curve.
-        cells = block.get("cells") or block.get("trials") or []
-        eq = None
-        for c in cells if isinstance(cells, list) else []:
-            if isinstance(c, dict) and c.get("equity") is not None:
-                eq = c["equity"]
-                break
-        if eq is None:
-            continue
-        scache.save(sid, eq, source="build_econo_report", href="econo.html")
-        saved.append(sid)
-    return saved
+# There is deliberately NO econo lab gatherer. build_econo_report.gather() returns each
+# module's per-cell STATS (train/val/test/full) but keeps the equity curves in a local
+# `runs` dict it never returns, so no curve is extractable without changing that builder.
+# Caching the stats instead would be worse than nothing: they are computed on the
+# pre-registered arithmetic basis (momentum_grid._stats_slice), while every number in the
+# registry is on the canonical geometric basis (quant_grade.window_metrics) — mixing them
+# in one table is precisely the drift the registry exists to prevent. So the econo
+# strategies keep their honest curve-less panes, which state the gap and link to
+# econo.html where the real workings live. Giving them curves is a build_econo_report
+# change (return the headline run's equity), not a change here.
 
 
 _LABS = (                      # cheapest first — a slow lab never blocks a fast one
@@ -1220,7 +1206,6 @@ _LABS = (                      # cheapest first — a slow lab never blocks a fa
     dict(key="vol", label="vol-forecaster variants", fn=_lab_vol, optin=False),
     dict(key="pairs", label="pairs cointegration book (~10 min)", fn=_lab_pairs,
          optin=False),
-    dict(key="econo", label="econophysics cells (very slow)", fn=_lab_econo, optin=True),
 )
 
 

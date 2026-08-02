@@ -1257,9 +1257,14 @@ def _pane_strategy(d: dict, r, public: bool) -> str:
     if r.equity is not None:
         core = _strat_curve(d, r) + _strat_stats(r) + _strat_windows(r)
     elif r.windows:
-        # Metrics exist but the curve is not rebasable onto the strategies' multi-year
-        # axis \u2014 your real book is cash-flow-timed, so it gets its own faithful panel.
-        core = _strat_stats(r) + _strat_windows(r) + sec_portfolio_roi(d, public)
+        # Real metrics, but no curve that can be rebased onto the strategies' multi-year
+        # axis. Your real book is the case that matters: it is cash-flow-timed, so it
+        # gets its own faithful cash-flow-matched panel. Any other such record shows its
+        # metrics and says plainly that no comparable curve exists for it.
+        own_chart = (sec_portfolio_roi(d, public) if r.status == "portfolio"
+                     else "<div class='note'>Metrics are real; no curve comparable to the "
+                          "other strategies exists for this record, so none is drawn.</div>")
+        core = _strat_stats(r) + _strat_windows(r) + own_chart
     else:
         core = _no_curve_panel(r)
     method = _fold("method / verdict", r.status,
