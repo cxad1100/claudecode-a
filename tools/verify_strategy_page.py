@@ -52,7 +52,7 @@ def verify(html: str) -> tuple[list[str], list[str], dict]:
     for sid in panes:
         if sid not in menu:
             problems.append(f"{sid}: pane with no menu entry — unreachable")
-    if "pane-home" not in bodies:
+    if "home" not in bodies:
         problems.append("no default Overview pane")
 
     charted, honest, empty = [], [], []
