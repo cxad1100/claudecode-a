@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 import webbrowser
 
 import numpy as np
@@ -1229,8 +1230,11 @@ def gather_labs(only=None, force: bool = False) -> dict:
                   f"({', '.join(ids) or 'nothing'}) in {time.time() - t0:.0f}s", flush=True)
         except Exception as exc:
             out[lab["key"]] = []
+            # Full traceback, not just the message: a lab can take 20 minutes to reach
+            # its failure, so a one-line summary costs another 20 minutes to diagnose.
             print(f"[labs] {lab['key']}: FAILED after {time.time() - t0:.0f}s "
                   f"— {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc()
     return out
 
 
