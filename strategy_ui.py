@@ -958,6 +958,29 @@ def _spine(d: dict) -> str:
     return f"<nav class='spine'>{''.join(items)}</nav>"
 
 
+def _thin(srs, max_points: int = 900):
+    """Downsample a curve for the OVERVIEW charts only.
+
+    The Overview draws ~37 strategies plus benchmarks on two axes; at daily resolution
+    that is a 28 MB page the browser spends many seconds parsing. Sampling every nth
+    point (always keeping the last, so the final value is exact) is visually identical
+    over a multi-year window and cuts the payload several-fold.
+
+    This is presentation only: every number on the page — the stat tiles, the window
+    tables, the registry — is computed from the FULL daily series by
+    quant_grade.window_metrics, never from this. Each strategy's own pane also charts the
+    full daily curve. The one thing a thinned line understates is the depth of a spike
+    between samples, which is why the drawdown you read is always the table's, not the
+    chart's."""
+    if srs is None or len(srs) <= max_points:
+        return srs
+    step = int(len(srs) // max_points) + 1
+    thinned = srs.iloc[::step]
+    if len(thinned) and thinned.index[-1] != srs.index[-1]:
+        thinned = pd.concat([thinned, srs.iloc[[-1]]])
+    return thinned
+
+
 def _chart_all(d: dict, public: bool) -> str:
     """The Overview chart: every curve-bearing strategy vs the benchmarks and the
     equal-weight baseline, rebased to 100 at the common start. The real book is NOT on
@@ -980,8 +1003,9 @@ def _chart_all(d: dict, public: bool) -> str:
         nm = f"\u2605 {r.name}" if r.live else r.name
         if infl:
             nm += " \u2014 reference, inflated"
+        y = _thin(srs / srs.iloc[0] * 100.0)
         fig.add_trace(go.Scatter(
-            x=srs.index, y=srs / srs.iloc[0] * 100.0, name=nm,
+            x=y.index, y=y, name=nm,
             visible="legendonly" if (infl or lab) else True,
             line=dict(color=r.color, width=2.6 if r.live else 1.8,
                       dash="dash" if infl else "solid")))
@@ -989,12 +1013,12 @@ def _chart_all(d: dict, public: bool) -> str:
     if ew is not None:
         srs = ew.reindex(window).ffill().dropna()
         if len(srs) >= 2:
-            fig.add_trace(go.Scatter(x=srs.index, y=srs / srs.iloc[0] * 100.0,
-                                     name="Equal-weight baseline",
+            y = _thin(srs / srs.iloc[0] * 100.0)
+            fig.add_trace(go.Scatter(x=y.index, y=y, name="Equal-weight baseline",
                                      line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
     for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():
-        fig.add_trace(go.Scatter(x=curve.index, y=curve / d["capital"] * 100.0, name=name,
-                                 line=dict(width=1.2)))
+        y = _thin(curve / d["capital"] * 100.0)
+        fig.add_trace(go.Scatter(x=y.index, y=y, name=name, line=dict(width=1.2)))
     fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
     fig.update_layout(height=520, yaxis_title="Index (start = 100)",
                       hovermode="x unified", margin=dict(t=20))
@@ -1024,7 +1048,7 @@ def _chart_since_book(d: dict, public: bool) -> str:
 
     def rebase(srs):
         srs = srs.reindex(window).ffill().dropna()
-        return srs / srs.iloc[0] * 100.0 if len(srs) >= 2 else None
+        return _thin(srs / srs.iloc[0] * 100.0) if len(srs) >= 2 else None
 
     fig = go.Figure()
     for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():

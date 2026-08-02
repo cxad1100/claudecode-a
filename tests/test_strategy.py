@@ -1234,3 +1234,26 @@ def test_lab_variants_are_on_the_chart_but_start_hidden(tmp_path, monkeypatch):
     # and each still earns its own menu entry + pane
     spine = ui._spine(d)
     assert all(f"data-pane='rec-{r.id}'" in spine for r in lab)
+
+
+def test_overview_curves_are_thinned_but_end_exactly_where_the_data_does():
+    """Thinning is presentation-only: it must never move the final value (that is what a
+    reader compares) and must never touch the metrics."""
+    idx = pd.bdate_range("2018-01-01", periods=5000)
+    srs = pd.Series(np.linspace(100.0, 300.0, 5000), index=idx)
+    thin = ui._thin(srs, max_points=900)
+    assert len(thin) < len(srs)
+    assert thin.index[-1] == srs.index[-1]
+    assert thin.iloc[-1] == srs.iloc[-1]
+    assert thin.index[0] == srs.index[0]
+    # short series pass through untouched
+    short = srs.iloc[:100]
+    assert ui._thin(short, max_points=900) is short
+
+
+def test_thinning_does_not_touch_window_metrics():
+    """The tables must still be computed from the full daily series."""
+    d = _fake_d()
+    rec = next(r for r in d["registry"] if r.equity is not None and r.windows)
+    full = qg.window_metrics(rec.equity.dropna(), rec.equity.index[0], rec.equity.index[-1])
+    assert abs(full["net_return"] - rec.windows["full"]["net_return"]) < 1e-9
