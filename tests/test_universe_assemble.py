@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from tools.universe_assemble import assemble_meta, assemble_prices, delisting_map
+from tools.universe_assemble import (assemble_meta, assemble_prices, death_map,
+                                     death_mask, delisting_map, exit_map)
 from tools.universe_pit import PITUniverse
 
 
@@ -30,6 +31,33 @@ def test_delisting_map_only_dead():
     ])
     dm = delisting_map(meta)
     assert dm == {"WDI.DE": pd.Timestamp("2020-08-21")}
+
+
+def _meta_exits():
+    return pd.DataFrame([
+        dict(ticker="LIVE", delisting_date=None, exit_reason=""),
+        dict(ticker="DEAD", delisting_date="2020-05-15", exit_reason="delisted"),
+        dict(ticker="LEGACY", delisting_date="2019-03-01", exit_reason=None),
+        dict(ticker="DEMO", delisting_date="2026-06-20", exit_reason="demoted"),
+        dict(ticker="GONE", delisting_date="2026-06-21", exit_reason="removed"),
+    ])
+
+
+def test_death_mask_counts_only_real_deaths():
+    m = _meta_exits()
+    assert list(m.loc[death_mask(m), "ticker"]) == ["DEAD", "LEGACY"]
+
+
+def test_death_mask_without_exit_reason_column_is_all_exits():
+    m = _meta_exits().drop(columns=["exit_reason"])
+    assert list(m.loc[death_mask(m), "ticker"]) == ["DEAD", "LEGACY", "DEMO", "GONE"]
+
+
+def test_exit_map_vs_death_map():
+    m = _meta_exits()
+    assert set(exit_map(m)) == {"DEAD", "LEGACY", "DEMO", "GONE"}
+    assert set(death_map(m)) == {"DEAD", "LEGACY"}
+    assert delisting_map(m) == exit_map(m)          # back-compat alias
 
 
 def test_assemble_prices_merges_and_pit_sees_death():

@@ -1,86 +1,628 @@
-"""The chosen production strategy — one config (the 'ultimate' extracted from the
-32-config grid), on the survivorship-corrected universe.
+"""Strategy page — DATA layer.
 
-  python build_strategy_report.py            # writes local/strategy.html + docs/strategy.html
+This module assembles everything the Strategy tab needs (engines → numbers →
+registry records) and delegates ALL rendering to strategy_ui.render(). The split is
+deliberate: pre-registered selection/adoption math and data assembly live here;
+presentation (bands, dossiers, folds, charts) lives in strategy_ui.py and can be
+reworked without touching a single number.
+
+  python build_strategy_report.py            # writes local/strategy.html
   python build_strategy_report.py --open
 
-Unlike the momentum *lab* (which renders the whole grid), this page commits to a
-single config and shows it cleanly: which strategy + why, current picks, equity vs
-benchmarks, train/validation/full performance, the PnL-colored monthly timeline,
-and the (now small) honest caveats.
+Framework contract: a new strategy enters the page as ONE make_record() call in
+build_registry() below (it renders a generic dossier + registry row + chart trace
+automatically); ledger-only entries go to tools/strategy_registry.STATIC_RECORDS.
 """
 import argparse
+import os
+import sys
 import webbrowser
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 
-from tools.report_html import pct as _pct, card as _card, page, fig_html
-from tools import theme, significance as sig, quant_grade as qg
-import build_vol_report as V     # vol overlay strategy (its own gather + rich sections)
-import build_edge_report as E    # structural stack + tax-loss sleeve
-import build_pairs_report as P   # market-neutral pairs
+from tools import theme, significance as sig, quant_grade as qg, regime, survivorship, regime_attr, scenario, factors
 from tools.momentum import (run_momentum, winsorize_prices, to_xetra_calendar,
-                            precompute_eligibility)
+                            precompute_eligibility, benchmark_curves, equal_weight_curve,
+                            rebalance_dates)
 from tools.universe_pit import PITUniverse
-from tools.universe_assemble import delisting_map
-from tools.momentum_grid import MomentumConfig, _stats_slice, run_grid, ALL_CONFIGS
+from tools.universe_assemble import delisting_map, death_map, death_mask
+from tools import universe_snapshot
+from tools.momentum_grid import (MomentumConfig, _stats_slice, run_grid,
+                                 ALL_CONFIGS, pick_ultimate, pick_top_n)
 from tools.portfolio_tools import BENCHMARKS, parse_portfolio
 from tools.portfolio_analytics import build_roi_timeseries
 from tools.data_buffer import cached_price_history
+from tools import strategy_registry as sreg
 from build_momentum_report import (
-    PRICES_CSV, META_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
-    FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG,
-    _slip, _broker, _disp, _pnl_color, sec_holdings, sec_curve,
-    sec_grid, sec_feasibility, sec_timelines, sec_survivorship, sec_method,
+    PRICES_CSV, META_CSV, TURN_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
+    FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG, K, MIN_TURNOVER,
+    _slip, _equity_window,
 )
+import strategy_ui as ui
+from strategy_ui import C_RAW, C_RC     # entity colors live with the UI design system
 
-# The chosen strategy — A···EF = vol-adjusted, equal-weight top-15, quarterly, lazy.
-# Picked from the 32-config grid (sector-neutral B is excluded — the global universe has no
-# sector data, so it would be a silent no-op), run on the XETRA / Lang & Schwarz trading
-# calendar (the only days you can actually fill), for the highest worst-case robustness
-# min(train, validation) Sharpe among configs that pay for their own costs and are positive in
-# both windows. A···EF is top-tier on robustness (train 0.71 / val 0.87) AND holds up out-of-sample
-# (test 1.27) — preferred over the marginally-higher-robust A····F, which overfits (test 0.65);
-# quarterly + lazy keep turnover (and the €1/order drag) low. Survivorship-clean by construction —
-# momentum buys winners, dying names rank last, so it holds ~0 into death.
-STRATEGY = MomentumConfig(vol_adjust=True, slots=15, freq="Q", lazy=True)
+# Production config is chosen DYNAMICALLY: gather() runs the 64-config grid and takes
+# pick_ultimate(grid) as the live strategy. This constant is the FALLBACK (used only
+# if nothing in the grid qualifies). The pick is sector-coverage sensitive — trust
+# full-coverage grids only; the lab grid shows the current cells (recomputed every
+# build, never quoted here).
+STRATEGY = MomentumConfig(sector_neutral=True, slots=10, freq="Q", lazy=True)
 
-# Risk-conscious overlay: volatility-target the book to this annualised vol (de-risk only,
-# park the rest in cash). Cuts the raw strategy's ~32% vol / −44% drawdown to a moderate
-# profile while lifting the Sharpe — the prudent way to actually run momentum.
+# Risk-conscious overlay: volatility-target the book to this annualised vol (de-risk
+# only, park the rest in cash).
 RISK_TARGET_VOL = 0.15
+# Charge the overlay's daily |Δexposure| resizing at this one-way slippage so the
+# risk-conscious curve pays for its own turnover. Flat €/order is extra.
+RC_TURN_BPS = 25.0
+
+# On-population survivorship test (the *holding* leak): inject synthetic delistings
+# into the LIVE names at this hazard + terminal-crash band, re-run SURV_SIMS×.
+# Observational — never feeds selection/sizing. Env SURV_SIMS=0 skips (fast iteration).
+SURV_SIMS = int(os.environ.get("SURV_SIMS", "8"))
+SURV_HAZARD = 0.05            # ~5%/yr delisting hazard (broad-equity plausible)
+SURV_LOSS = (0.40, 1.00)      # terminal crash drawn here
+
+# Delisting-stress intensities (bull/base/bear), grounded in the delisting literature
+# (Shumway 1997: -30% NYSE/AMEX; Shumway-Warther 1999: -55% NASDAQ; bankruptcies -100%).
+STRESS_PRESETS = {                       # name -> (hazard_annual, (loss_lo, loss_hi))
+    "bull": (0.02, (0.30, 0.60)),
+    "base": (SURV_HAZARD, SURV_LOSS),    # == the single-intensity default
+    "bear": (0.10, (0.60, 1.00)),
+}
+
+# Regime attribution: strip the two sectors carrying the 2024-25 tailwind and re-run
+# the SAME config. Observational re-run.
+REGIME_DROP_SECTORS = {"Technology", "Industrials"}
+
+# File-drawer / phantom-trials: the 64-config grid is the multiple testing the DSR can
+# SEE; PHANTOM_MULT is the honest lifetime-iteration estimate. Grade stays on the
+# objective ×1 grid DSR; the page shows the ladder as a sensitivity.
+PHANTOM_MULT = 5
+PHANTOM_MULTS = (1, 5, 10)
+
+# Scenario fan (observational): regime-conditioned block bootstrap of the
+# risk-conscious book's daily returns. Env SCEN_SIMS=0 skips (fast iteration).
+SCEN_HORIZON = 252
+SCEN_BLOCK = 21
+SCEN_TILT = 3.0
+SCEN_SIMS = int(os.environ.get("SCEN_SIMS", "2000"))
+
+# Factor-spanning regression (observational). Env FACTORS=0 skips (offline).
+FACTORS = int(os.environ.get("FACTORS", "1"))
 
 
-def _desc(cfg: MomentumConfig) -> str:
-    parts = []
-    if cfg.vol_adjust:
-        parts.append("volatility-adjusted")
-    if cfg.sector_neutral:
-        parts.append("sector-neutral")
-    if cfg.trend_filter:
-        parts.append("trend-filtered (200d kill-switch)")
-    parts.append(f"equal-weight top-{cfg.slots}")
-    parts.append("quarterly" if cfg.freq == "Q" else "monthly")
-    if cfg.lazy:
-        parts.append("lazy-rebalanced")
-    return ", ".join(parts)
+def build_variants(res: dict, vt: dict, spx, train: dict, val: dict, test: dict,
+                   quant: dict, capital: float, *, dsr: float, mc_p: float, overlap: float,
+                   strategy: MomentumConfig = STRATEGY,
+                   train_end=TRAIN_END, val_end=VAL_END) -> list[dict]:
+    """Two parallel 'variant bundles' of identical shape: the raw strategy and its
+    volatility-targeted (risk-conscious) twin. Selection is IDENTICAL across both
+    (same holdings_log / trades).
+
+    Each bundle carries TWO window sets: `train/val/test/full` on the pre-registered
+    selection basis (backtest_stats — what the grid/adoption rules read) and `windows`
+    on the canonical display basis (qg.window_metrics — what every comparison surface
+    renders). net_return/max drawdown agree across bases; only the Sharpe convention
+    differs. The grade is display-layer, so it reads the canonical test Sharpe."""
+    tr = res["runs"][1.0]["trades"]
+    raw_eq = res["runs"][1.0]["equity"]
+
+    def _canon(eq):
+        return {k: qg.window_metrics(eq, lo, hi)
+                for k, (lo, hi) in sreg.window_bounds(eq, train_end, val_end).items()}
+
+    raw_windows = _canon(raw_eq)
+    raw = dict(
+        label=f"Original (raw, {strategy.code})", short="Original", key="raw", color=C_RAW,
+        equity=raw_eq, holdings_log=res["holdings_log"], trades=tr,
+        train=train, val=val, test=test, full=res["runs"][1.0]["stats"],
+        windows=raw_windows,
+        perf=quant["perf"], bench=quant["bench"], roll=quant["roll"],
+        grade=qg.grade(raw_windows.get("test", {}).get("sharpe", 0.0), dsr, mc_p, overlap),
+        exposure=None, exposure_latest=1.0)
+
+    rc_eq = vt["equity"]
+    te, ve = pd.Timestamp(train_end), pd.Timestamp(val_end)
+    one = pd.Timedelta(days=1)
+    rc_test = _stats_slice(rc_eq, tr, ve + one, rc_eq.index[-1], capital)
+    rc_windows = _canon(rc_eq)
+    rc = dict(
+        label=f"Risk-conscious (vol-target {RISK_TARGET_VOL:.0%})", short="Risk-conscious",
+        key="rc", color=C_RC,
+        equity=rc_eq, holdings_log=res["holdings_log"], trades=tr,
+        train=_stats_slice(rc_eq, tr, rc_eq.index[0], te, capital),
+        val=_stats_slice(rc_eq, tr, te + one, ve, capital),
+        test=rc_test,
+        full=_stats_slice(rc_eq, tr, rc_eq.index[0], rc_eq.index[-1], capital),
+        windows=rc_windows,
+        perf=vt,
+        bench=qg.vs_benchmark(rc_eq, spx) if spx is not None else {},
+        roll=qg.rolling_sharpe(rc_eq),
+        grade=qg.grade(rc_windows.get("test", {}).get("sharpe", 0.0), dsr, mc_p, overlap),
+        exposure=vt.get("exposure"),
+        exposure_latest=vt.get("exposure_latest", vt.get("avg_exposure", 1.0)))
+    return [raw, rc]
+
+
+MEGACAP_INDEX = "Nasdaq 100"          # per-interval yardstick for the holdings table
+DIP_WINDOW = 21                       # buy-the-dip lookback: 1-month reversal horizon (~21 sessions)
+VALUE_VT_ADOPTED = "2026-07-16"       # date the vol-managed value sleeve cleared its pre-registered gate
+
+
+def _arm_holdings_table(hl_log, prices, index_series, name_map, giants) -> tuple:
+    """Per rebalance period: each held name's % return over the hold, the equal-weight
+    basket total, and the index's return over the SAME interval — so every interval is
+    scored against the yardstick. Returns a tuple of period dicts (newest last)."""
+    from build_megacap_report import _period_returns
+    idx = index_series.dropna() if index_series is not None else None
+    out = []
+    for h in hl_log:
+        if not h.get("picks"):
+            continue
+        d0, d1 = pd.Timestamp(h["date"]), pd.Timestamp(h["next"])
+        rets = _period_returns(prices, h["picks"], d0, d1)
+        if not rets:
+            continue
+        names = [dict(t=t, name=name_map.get(t, t), ret=float(rets[t]),
+                      giant=t in giants)
+                 for t in sorted(h["picks"], key=lambda x: -rets.get(x, -9))
+                 if t in rets]
+        basket = sum(rets.values()) / len(rets)
+        iret = float("nan")
+        if idx is not None:
+            p0, p1 = idx.loc[:d0], idx.loc[:d1]
+            if len(p0) and len(p1) and float(p0.iloc[-1]) > 0:
+                iret = float(p1.iloc[-1]) / float(p0.iloc[-1]) - 1.0
+        out.append(dict(start=str(d0.date()), end=str(d1.date()), names=names,
+                        basket=basket, index=iret))
+    return tuple(out)
+
+
+def _megacap_arms():
+    """Run the mega-cap headline-N arms (size / growth / momentum) on the live EDGAR
+    fundamentals cache → ({arm: equity}, covered-name count, {arm: holdings table}).
+    (None, 0, {}) when no cache / empty coverage. Cheap (~seconds); the cap/revenue
+    panels are strictly point-in-time (filing-dated), so no look-ahead leaks."""
+    try:
+        import pandas as _pd
+        from build_megacap_report import (load_data, HEADLINE_N, K as MC_K,
+                                           GLOBAL_GIANTS, META_CSV)
+        from tools.megacap import run_arms, run_value_arms, ARMS
+        from tools.dipbuy import run_dipbuy
+        _IDXN = MEGACAP_INDEX
+        data = load_data()
+        if data["coverage"]["covered"] == 0:
+            return None, 0, {}
+        res = run_arms(data["prices"], data["slip"], data["cap"], data["yoy"],
+                       n=HEADLINE_N, k=MC_K, capital=CAPITAL)
+        dip_res = run_dipbuy(data["prices"], data["slip"], data["cap"],
+                             n=HEADLINE_N, k=MC_K, window=DIP_WINDOW, capital=CAPITAL)
+        val_res = run_value_arms(data["prices"], data["slip"], data["cap"],
+                                 data["rev"], data["yoy"], n=HEADLINE_N, k=MC_K,
+                                 capital=CAPITAL)
+        arms = {arm: res[arm]["runs"][1.0].get("equity") for arm in ARMS}
+        arms["dip"] = dip_res["runs"][1.0].get("equity")
+        arms["value"] = val_res["value"]["runs"][1.0].get("equity")
+        arms["garp"] = val_res["garp"]["runs"][1.0].get("equity")
+        # Constructed books: 50/50 momentum+value blend (offense+defense) and vol-managed value.
+        arms["combo"] = qg.blend_equity({"momentum": arms["momentum"], "value": arms["value"]},
+                                        {"momentum": 0.5, "value": 0.5}, CAPITAL)
+        _vt = qg.vol_target(arms["value"], target_vol=RISK_TARGET_VOL,
+                            turn_cost_bps=RC_TURN_BPS) if arms["value"] is not None else {}
+        arms["value_vt"] = _vt.get("equity")
+        # holdings tables: name map (EDGAR universe + giants) + the Nasdaq interval index
+        try:
+            nm = dict(_pd.read_csv(META_CSV)[["ticker", "name"]].values)
+        except Exception:
+            nm = {}
+        nm.update({tk: disp for disp, tk in GLOBAL_GIANTS.items()})
+        giants = set(GLOBAL_GIANTS.values())
+        bench = data.get("benchmarks")
+        idx = (bench[_IDXN] if bench is not None and _IDXN in getattr(bench, "columns", [])
+               else None)
+        holdings = {arm: _arm_holdings_table(res[arm]["holdings_log"], data["prices"],
+                                             idx, nm, giants) for arm in ARMS}
+        holdings["dip"] = _arm_holdings_table(dip_res["holdings_log"], data["prices"],
+                                              idx, nm, giants)
+        for kind in ("value", "garp"):
+            holdings[kind] = _arm_holdings_table(val_res[kind]["holdings_log"],
+                                                 data["prices"], idx, nm, giants)
+        return arms, int(data["coverage"]["covered"]), holdings
+    except Exception:
+        return None, 0, {}
+
+
+# Mega-cap arm → (record id, display name). Names put the DISTINCTIVE word first so
+# the left-menu label (r.name pre-em-dash head) is unique under the shared "Mega-cap"
+# family header; the em-dash tail carries the method.
+_MEGACAP_ARM_META = {
+    "size": ("megacap_size", "Largest-cap — top-25 PIT market-cap"),
+    "growth": ("megacap_growth", "Revenue growth — fastest trailing YoY"),
+    "momentum": ("megacap_momentum", "12-1 momentum — within the mega-caps"),
+}
+
+# Value arms systematize the user's own thesis — "value at a fair price". Only revenue +
+# shares are available (no earnings), so valuation = price-to-sales, US filers only (one
+# revenue currency; see megacap.ps_panel). id, menu name, verdict phrase.
+_VALUE_ARM_META = {
+    "value": ("megacap_value", "Value — cheapest price-to-sales (US mega-caps)",
+              "buying the cheapest-on-sales names"),
+    "garp": ("megacap_garp", "GARP — growth at a reasonable price (US mega-caps)",
+             "buying cheap-relative-to-growth names"),
+}
+
+
+def sleeve_gate(sleeve: dict, control: dict, *, sharpe_tol: float = 0.15) -> dict:
+    """Pre-registered adoption gate for a DEFENSIVE (vol-managed) sleeve vs its control, on
+    the train+val windows ONLY — test stays a confirmation, never fitted. `sleeve`/`control`
+    are {'train': (sharpe, max_dd), 'val': (sharpe, max_dd)}. A sleeve earns adoption when it:
+      (a) strictly improves the VALIDATION Sharpe — it must win the stress it exists for;
+      (b) stays within `sharpe_tol` of the control's TRAIN Sharpe — it can't collapse in the
+          calm bull tape (a defensive book gives up a little upside, not all of it); and
+      (c) cuts max drawdown in BOTH windows — it must genuinely de-risk, not just re-shape.
+    Generic (any vol-managed sleeve vs its control), not tuned to one book. Returns
+    {'passed': bool, 'reason': str}."""
+    s_tr, sdd_tr = sleeve["train"]; s_vl, sdd_vl = sleeve["val"]
+    c_tr, cdd_tr = control["train"]; c_vl, cdd_vl = control["val"]
+    wins_val = s_vl > c_vl
+    holds_train = s_tr >= c_tr - sharpe_tol
+    derisks = abs(sdd_tr) < abs(cdd_tr) and abs(sdd_vl) < abs(cdd_vl)
+    passed = bool(wins_val and holds_train and derisks)
+    ok = lambda b: "✓" if b else "✗"
+    reason = (f"val Sharpe {s_vl:+.2f} vs {c_vl:+.2f} ({ok(wins_val)}); train Sharpe "
+              f"{s_tr:+.2f} vs {c_tr:+.2f} within {sharpe_tol:.2f} ({ok(holds_train)}); "
+              f"drawdown cut both windows ({ok(derisks)})")
+    return {"passed": passed, "reason": reason}
+
+
+def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=None,
+                   bench=None, ew_eq=None, portfolio_roi=None,
+                   train_end=TRAIN_END, val_end=VAL_END,
+                   megacap_names: int = 0, megacap_arms=None,
+                   megacap_holdings=None) -> list:
+    """Normalize everything gather() computed into StrategyRecords — the ONE list every
+    comparison surface (leaderboard, parallel chart, dossiers) renders. Adding a future
+    strategy = one make_record() call here (curve-bearing) or one STATIC_RECORDS entry
+    (ledger-only). No engine calls — curves come in, records go out.
+
+    Statuses derive from the same ensemble["adopt"] branch that decides what
+    local/strategy_track.csv tracks, so the ★ live row always agrees with the tracker."""
+    raw, rc = variants
+    ens_adopt = bool(ensemble and ensemble.get("adopt"))
+    recs = []
+    if ensemble and ensemble.get("equity") is not None:
+        codes = " + ".join(ensemble["codes"])
+        recs.append(sreg.make_record(
+            "mom_ens", f"Momentum ensemble — top-{ensemble['n']} quarterly ({codes})",
+            "momentum", "adopted" if ens_adopt else "candidate",
+            equity=ensemble["equity"], train_end=train_end, val_end=val_end,
+            adopted="2026-07-06" if ens_adopt else None,
+            cost_model=f"slip + €{FEE_EUR:.0f}/order per sleeve",
+            avg_exposure=1.0,
+            gate=(f"pre-reg rule: min(train,val) {ensemble['ens_min']:.2f} ≥ "
+                  f"{ensemble['single_min']:.2f} − 0.05 → "
+                  + ("ADOPTED" if ens_adopt else "bench")),
+            live=ens_adopt, color="#c586c0"))
+    recs.append(sreg.make_record(
+        "mom_rc", rc["label"], "momentum",
+        "variant" if ens_adopt else "adopted",
+        variant_of="mom_ens" if ens_adopt else None,
+        equity=rc["equity"], windows=rc.get("windows"),
+        train_end=train_end, val_end=val_end,
+        cost_model=f"slip + €{FEE_EUR:.0f} + {RC_TURN_BPS:.0f}bp resize",
+        avg_exposure=rc["perf"].get("avg_exposure"),
+        gate=None if ens_adopt else "single pick_ultimate book (ensemble on the bench)",
+        live=not ens_adopt, color=C_RC))
+    recs.append(sreg.make_record(
+        "mom_raw", "Momentum — raw (unmanaged)", "momentum", "reference",
+        variant_of="mom_rc",
+        equity=raw["equity"], windows=raw.get("windows"),
+        train_end=train_end, val_end=val_end,
+        cost_model=f"slip + €{FEE_EUR:.0f} · full-invested",
+        avg_exposure=1.0,
+        verdict="reference — inflated (survivorship + full exposure on a high-vol book); "
+                "curve in the lab only",
+        flags=("inflated",), color=C_RAW))
+    if vol_core_eq is not None and vol_core:
+        recs.append(sreg.make_record(
+            "vol_core", "GARCH vol-managed IWDA core", "vol-managed core", "adopted",
+            equity=vol_core_eq, train_end=train_end, val_end=val_end,
+            adopted="2026-07-05",
+            cost_model="5bp band-rebalance + €1",
+            avg_exposure=vol_core.get("managed", {}).get("avg_exposure"),
+            gate="PASS (pre-registered, vol lab)", href="vol.html",
+            color="#569cd6"))
+    if bench is not None:
+        start = pd.Timestamp(START)
+        for rid, col in (("bench_msci", "MSCI World"), ("bench_spx", "S&P 500")):
+            if col in getattr(bench, "columns", []):
+                recs.append(sreg.make_record(
+                    rid, f"{col} (buy-hold)", "benchmark", "benchmark",
+                    equity=bench[col].dropna().loc[start:],
+                    train_end=train_end, val_end=val_end,
+                    cost_model="—", avg_exposure=1.0))
+    if ew_eq is not None:
+        recs.append(sreg.make_record(
+            "ew_baseline", "Equal-weight initial picks (buy-hold)", "benchmark",
+            "benchmark", equity=ew_eq, train_end=train_end, val_end=val_end,
+            cost_model="—", avg_exposure=1.0, color=theme.FG_DIM))
+    if portfolio_roi is not None and not getattr(portfolio_roi, "empty", True):
+        curve = 1.0 + portfolio_roi / 100.0
+        recs.append(sreg.make_record(
+            "portfolio", "Your portfolio (real, cash-flow-timed)", "your book",
+            "portfolio", since=str(portfolio_roi.index[0].date()),
+            windows=dict(full=qg.window_metrics(curve, curve.index[0], curve.index[-1])),
+            cost_model="real fills",
+            verdict="money-weighted real book over its own window — head-to-head below",
+            color="#ffffff"))
+    if megacap_arms:
+        # Live results: one curve-bearing record per arm (uniform pane, registry row,
+        # chart trace). Survivor-biased universe like the momentum family, so the
+        # verdict leads with the internal-comparison caveat — real numbers, honestly
+        # framed, no adoption gate yet.
+        n_txt = f"{megacap_names} EDGAR names" if megacap_names else "live EDGAR cache"
+        # The Largest-cap arm is the control every other arm is scored against: does a tilt
+        # (reversal, value, GARP) beat simply owning the biggest names? Verdicts state it.
+        def _full_ret(e):
+            s = e.dropna() if e is not None and not getattr(e, "empty", True) else pd.Series(dtype=float)
+            return float(s.iloc[-1] / s.iloc[0] - 1.0) if len(s) > 1 else float("nan")
+        size_r = _full_ret(megacap_arms.get("size"))
+        def _win_ret(e, key):
+            s = e.dropna() if e is not None and not getattr(e, "empty", True) else pd.Series(dtype=float)
+            if len(s) < 2:
+                return float("nan")
+            lo, hi = sreg.window_bounds(s, train_end, val_end)[key]
+            return qg.window_metrics(s, lo, hi)["net_return"]
+        size_val = _win_ret(megacap_arms.get("size"), "val")
+        for arm, (rid, nm) in _MEGACAP_ARM_META.items():
+            eq = megacap_arms.get(arm)
+            if eq is None or getattr(eq, "empty", True):
+                continue
+            recs.append(sreg.make_record(
+                rid, nm, "mega-cap", "candidate",
+                equity=eq, train_end=train_end, val_end=val_end,
+                href="megacap.html", cost_model="slippage (half-spread)",
+                holdings=(megacap_holdings or {}).get(arm, ()),
+                gate=f"incubating — top-25 PIT cap screen ({n_txt}); no pre-registered "
+                     "adoption gate yet",
+                verdict="survivor-biased universe → internal comparison only, not an "
+                        "achievable return; full N-sweep on megacap.html"))
+        # Buy-the-dip reversal book — a 4th mega-cap arm, but a distinct thesis (short-term
+        # reversal, not size/growth/trend), so it gets its OWN verdict rather than the shared
+        # internal-comparison line. The verdict is DATA-DRIVEN: it compares the reversal book
+        # to the Largest-cap arm (its control — same universe, no dip tilt) and states plainly
+        # whether the overreaction premium survives, so it can't silently rot into a false
+        # win. Registered only when its curve is present.
+        dip_eq = megacap_arms.get("dip")
+        if dip_eq is not None and not getattr(dip_eq, "empty", True):
+            dip_r = _full_ret(dip_eq)
+            have_cmp = size_r == size_r and dip_r == dip_r
+            beats = have_cmp and dip_r > size_r
+            if have_cmp:
+                finding = (
+                    f"The overreaction premium does NOT survive on mega-caps: reversal "
+                    f"returned {dip_r*100:+.0f}% full-window vs the Largest-cap arm's "
+                    f"{size_r*100:+.0f}% — buying the biggest 1-month losers underperforms "
+                    f"simply holding the biggest names. "
+                    if not beats else
+                    f"Reversal returned {dip_r*100:+.0f}% full-window vs the Largest-cap "
+                    f"arm's {size_r*100:+.0f}%, edging its control — but on a survivor-biased "
+                    f"universe, so treat it as internal comparison, not achievable alpha. ")
+            else:
+                finding = ("Hold the k biggest 1-month losers among the top-25 mega-caps — "
+                           "read against the Largest-cap arm below. ")
+            recs.append(sreg.make_record(
+                "megacap_dip",
+                "Dip-buy — 1-month reversal on the top-25 mega-caps", "mega-cap",
+                "candidate", equity=dip_eq, train_end=train_end, val_end=val_end,
+                href="megacap.html", cost_model="slippage (half-spread), t+1 fill",
+                holdings=(megacap_holdings or {}).get("dip", ()),
+                gate=f"incubating — hold the k biggest 1-month losers among the top-25 PIT "
+                     f"mega-caps ({n_txt}); {'LAGS' if not beats else 'vs'} the Largest-cap "
+                     "arm. No adoption gate pre-registered.",
+                verdict="Short-term reversal on the most-efficient names — the hardest case "
+                        "for the effect. " + finding + "Survivor-biased universe → an "
+                        "internal comparison against the arms below, not an absolute return."))
+        # Value + GARP — the user's own "value at a fair price" thesis, systematized on
+        # price-to-sales (US filers only). Each carries the same data-driven verdict vs the
+        # Largest-cap control.
+        for kind, (rid, nm, phrase) in _VALUE_ARM_META.items():
+            eq = megacap_arms.get(kind)
+            if eq is None or getattr(eq, "empty", True):
+                continue
+            r = _full_ret(eq)
+            beats = r == r and size_r == size_r and r > size_r
+            if r == r and size_r == size_r:
+                vfind = (f"Returned {r*100:+.0f}% full-window vs the Largest-cap arm's "
+                         f"{size_r*100:+.0f}% — {phrase} "
+                         f"{'beats' if beats else 'LAGS on total return'} simply holding the "
+                         "biggest names. ")
+            else:
+                vfind = phrase.capitalize() + ". "
+            # The real edge of a value tilt is downside, not upside: if it held up through
+            # the validation drawdown while the Largest-cap arm bled, say so — that is where
+            # 'value at a fair price, no huge bets' actually pays.
+            arm_val = _win_ret(eq, "val")
+            if arm_val == arm_val and size_val == size_val and arm_val > 0 > size_val:
+                vfind += (f"But defensive where it counts: {arm_val*100:+.0f}% through the "
+                          f"validation drawdown while the Largest-cap arm lost "
+                          f"{abs(size_val)*100:.0f}% — the trade-off is upside in the bull run "
+                          "for resilience in the fall. ")
+            recs.append(sreg.make_record(
+                rid, nm, "mega-cap", "candidate",
+                equity=eq, train_end=train_end, val_end=val_end,
+                href="megacap.html", cost_model="slippage (half-spread)",
+                holdings=(megacap_holdings or {}).get(kind, ()),
+                gate=f"incubating — top-25 PIT cap screen, US filers only (P/S needs one "
+                     f"revenue currency); {n_txt}. No adoption gate pre-registered.",
+                verdict="Systematizing 'value at a fair price' on mega-caps. " + vfind +
+                        "US filers only (P/S currency-safety); survivor-biased universe → an "
+                        "internal comparison against the arms below, not an absolute return."))
+        # Constructed books from the arms above — the "can a blend beat just owning the
+        # biggest?" test. combo = 50/50 momentum(offense)+value(defense); value_vt =
+        # vol-managed value. Derived curves (no own holdings). The honest win condition is
+        # RISK-ADJUSTED (Sharpe) + drawdown, not raw return — data-driven verdict says which.
+        size_eq = megacap_arms.get("size")
+        size_m = (qg.perf_metrics(size_eq.dropna())
+                  if size_eq is not None and not getattr(size_eq, "empty", True) else {})
+        for kind, rid, nm, desc in (
+            ("combo", "megacap_combo", "Combo — 50/50 momentum + value (offense + defense)",
+             "a 50/50 daily-rebalanced blend of the momentum (offense) and value (defense) arms"),
+            ("value_vt", "megacap_value_vt", "Value, vol-managed — value arm at 15% target vol",
+             "the value arm scaled to a 15% volatility target (de-risk only, rest in cash)")):
+            eq = megacap_arms.get(kind)
+            if eq is None or getattr(eq, "empty", True):
+                continue
+            m = qg.perf_metrics(eq.dropna())
+            wc = ""
+            if size_m:
+                better = (m["sharpe"] > size_m["sharpe"]) or (abs(m["max_dd"]) < abs(size_m["max_dd"]))
+                wc = (f"Sharpe {m['sharpe']:.2f} vs the Largest-cap arm's {size_m['sharpe']:.2f}, "
+                      f"max drawdown {m['max_dd']*100:.0f}% vs {size_m['max_dd']*100:.0f}% — "
+                      f"{'improves' if better else 'does not improve'} the risk-adjusted profile. ")
+            # value_vt faces the pre-registered defensive-sleeve gate (train+val only); combo
+            # stays an incubating candidate.
+            status, adopted_date, note = "candidate", None, ""
+            gate_txt = (f"incubating — constructed from the mega-cap arms ({n_txt}); the win "
+                        "condition is risk-adjusted, not raw return. No adoption gate pre-registered.")
+            if kind == "value_vt" and size_eq is not None and not getattr(size_eq, "empty", True):
+                def _wm(e, key):
+                    s = e.dropna()
+                    lo, hi = sreg.window_bounds(s, train_end, val_end)[key]
+                    mm = qg.window_metrics(s, lo, hi)
+                    return (mm["sharpe"], mm["max_dd"])
+                g = sleeve_gate({"train": _wm(eq, "train"), "val": _wm(eq, "val")},
+                                {"train": _wm(size_eq, "train"), "val": _wm(size_eq, "val")})
+                if g["passed"]:
+                    status, adopted_date = "adopted", VALUE_VT_ADOPTED
+                    gate_txt = "PASS (pre-registered defensive-sleeve gate) — " + g["reason"]
+                    note = ("Adopted as a DEFENSIVE sleeve — not a size-beater: it trades "
+                            "bull-run upside for resilience, winning the validation drawdown and "
+                            "cutting risk throughout. Test is confirmation, not a blind holdout "
+                            "(it was observed in development). ")
+                else:
+                    gate_txt = "defensive-sleeve gate NOT cleared — " + g["reason"]
+            recs.append(sreg.make_record(
+                rid, nm, "mega-cap", status,
+                equity=eq, train_end=train_end, val_end=val_end, adopted=adopted_date,
+                cost_model="slippage (half-spread)"
+                           + (f" + {RC_TURN_BPS:.0f}bp resize" if kind == "value_vt" else ""),
+                gate=gate_txt,
+                verdict=f"Built from your own arms: {desc}. " + note + wc +
+                        "Survivor-biased universe → an internal comparison against the arms "
+                        "below, not an absolute return."))
+    else:
+        if megacap_names:
+            mc_gate = (f"incubating — EDGAR PIT fundamentals live for {megacap_names} names; "
+                       "adoption gate not yet pre-registered")
+            mc_verdict = ("PIT market-cap screen → size / YoY-revenue-growth / 12-1 momentum "
+                          f"arms, running on SEC-EDGAR filing-dated shares+revenue "
+                          f"({megacap_names} names) — full N-sweep on megacap.html.")
+            mc_flags = ()
+        else:
+            mc_gate = "awaiting cap data — run the EDGAR fundamentals fetch"
+            mc_verdict = ("PIT market-cap screen → size / YoY-revenue-growth / 12-1 momentum "
+                          "arms; no fundamentals data yet.")
+            mc_flags = ("awaiting_data",)
+        recs.append(sreg.make_record(
+            "megacap", "Mega-cap PIT screen — size / growth / momentum", "mega-cap",
+            "research", href="megacap.html",
+            gate=mc_gate, verdict=mc_verdict, flags=mc_flags))
+    recs.extend(sreg.STATIC_RECORDS)
+    sreg.assign_colors(recs)
+    return recs
+
+
+def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return,
+                      membership=None, turnover=None):
+    """Multi-intensity on-population delisting stress (bull/base/bear). Inject synthetic
+    deaths into the LIVE names at each preset's hazard/loss, re-run the SAME strategy
+    SURV_SIMS×. Observational — never feeds selection/sizing. Seeds 0..K-1 shared.
+
+    Returns {"presets": {name: stress_summarize(...) + hazard/loss}, "clean": {...},
+    "sims": K}."""
+    dead = set(meta_df.loc[meta_df["delisting_date"].notna(), "ticker"])
+    live_cols = [c for c in prices.columns if c not in dead]
+    base_map = delisting_map(meta_df)
+    base_deaths = death_map(meta_df)
+    window = _equity_window(res)
+    first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
+
+    def _alpha(eq, bench):
+        if eq is None or bench is None:
+            return float("nan")
+        vb = qg.vs_benchmark(eq, bench)
+        return float(vb.get("alpha_ann", float("nan"))) if vb else float("nan")
+
+    def _rc(eq):
+        return qg.vol_target(eq, target_vol=RISK_TARGET_VOL, turn_cost_bps=RC_TURN_BPS)
+
+    raw_eq0 = res["runs"][1.0]["equity"]
+    rc0 = _rc(raw_eq0)
+    rc_eq0 = rc0.get("equity")
+    ew0 = equal_weight_curve(prices, first_picks, window, CAPITAL) if first_picks else None
+    clean = dict(
+        ret={"raw": float(base_return), "rc": float(rc0.get("net_return", float("nan")))},
+        alpha={"raw": _alpha(raw_eq0, spx), "rc": _alpha(rc_eq0, spx)},
+        edge={"raw": _alpha(raw_eq0, ew0), "rc": _alpha(rc_eq0, ew0)})
+
+    presets = {}
+    for name, (hz, (lo, hi)) in STRESS_PRESETS.items():
+        raw_rets, hits, deaths_n = [], [], []
+        a_raw, a_rc, e_raw, e_rc = [], [], [], []
+        for s in range(SURV_SIMS):
+            inj_live, deaths = survivorship.inject_delistings(
+                prices[live_cols], hazard_annual=hz, loss_lo=lo, loss_hi=hi, seed=s)
+            if not deaths:                                    # no deaths this draw -> clean values
+                raw_rets.append(base_return); hits.append(0); deaths_n.append(0)
+                a_raw.append(clean["alpha"]["raw"]); a_rc.append(clean["alpha"]["rc"])
+                e_raw.append(clean["edge"]["raw"]); e_rc.append(clean["edge"]["rc"])
+                continue
+            inj = prices.copy(); inj[live_cols] = inj_live
+            dmap = dict(base_map); dmap.update({t: dt for t, (dt, _l) in deaths.items()})
+            dd = dict(base_deaths); dd.update({t: dt for t, (dt, _l) in deaths.items()})
+            r = run_momentum(inj, {t: slip[t] for t in inj.columns if t in slip},
+                             lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
+                             start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                             sectors=sectors, benchmark=spx,
+                             pit=PITUniverse(inj, dmap, deaths=dd, membership=membership),
+                             execute_lag=EXEC_LAG, turnover=turnover, turn_floor=MIN_TURNOVER,
+                             **cfg.kwargs())
+            req = r["runs"][1.0]["equity"]
+            rrc = _rc(req).get("equity")
+            inj_ew = equal_weight_curve(inj, first_picks, window, CAPITAL) if first_picks else None
+            raw_rets.append(r["runs"][1.0]["stats"]["net_return"])
+            a_raw.append(_alpha(req, spx)); a_rc.append(_alpha(rrc, spx))
+            e_raw.append(_alpha(req, inj_ew)); e_rc.append(_alpha(rrc, inj_ew))
+            held = sum(1 for h in r["holdings_log"] for t in h["picks"]
+                       if t in deaths and h["date"] <= deaths[t][0] < h.get("next", deaths[t][0]))
+            hits.append(held); deaths_n.append(len(deaths))
+        st = survivorship.stress_summarize(base_return, raw_rets, hits, deaths_n,
+                                           a_raw, a_rc, e_raw, e_rc)
+        st["hazard"], st["loss"] = hz, (lo, hi)
+        presets[name] = st
+    return dict(presets=presets, clean=clean, sims=SURV_SIMS)
 
 
 def gather(force: bool = False, refresh: bool | None = None) -> dict:
     refresh = force if refresh is None else refresh
     prices = pd.read_csv(PRICES_CSV, index_col=0, parse_dates=True)
-    prices = to_xetra_calendar(prices)                         # L&S/XETRA sessions only (tradeable days)
+    prices = to_xetra_calendar(prices)                         # L&S/XETRA sessions only
     prices = winsorize_prices(prices, cap=WINSOR_CAP)          # de-glitch the raw feed
-    meta_df = pd.read_csv(META_CSV)                            # universe is pre-filtered at build time
-    # Universe is now TR-native (tools.tr_tradeable --enumerate → tools.build_tr_universe):
-    # every live name is one you can trade on TR, by construction — no separate filter.
+    meta_df = pd.read_csv(META_CSV)
     n_live = int(meta_df["delisting_date"].isna().sum())
     meta = {r["ticker"]: dict(r) for _, r in meta_df.iterrows()}
     slip = {t: _slip(m) for t, m in meta.items() if t in prices.columns}
-    pit = PITUniverse(prices, delisting_map(meta_df))
+    sectors = {t: m.get("sector") for t, m in meta.items()}     # real GICS (enrich_sectors)
+    turnover = (pd.read_csv(TURN_CSV, index_col=0, parse_dates=True)
+                if TURN_CSV.exists() else None)
+    snap_store = universe_snapshot.load_store()
+    ticker_isin = {r["ticker"]: str(r["isin"]) for _, r in meta_df.iterrows()
+                   if pd.notna(r.get("isin"))}
+    membership = (snap_store, ticker_isin) if len(snap_store) else None
+    pit = PITUniverse(prices, delisting_map(meta_df), deaths=death_map(meta_df),
+                      membership=membership)
 
     benches = {n: v for n, v in BENCHMARKS.items() if n != "Bitcoin"}   # equities/bonds only
     bench_tickers = [tk for tk, _ in benches.values()]
@@ -88,22 +630,32 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     bench = bench_raw.rename(columns={tk: name for name, (tk, _) in benches.items()})
     spx = bench["S&P 500"] if "S&P 500" in bench.columns else bench.iloc[:, 0]
 
-    # No sector data on the global universe → sectors=None (sector-neutral configs excluded).
+    # ── Dynamic config selection: full 64-config grid, then pick_ultimate ──
+    grid = run_grid(prices, slip, sectors=sectors, benchmark=spx, pit=pit, start=START,
+                    configs=ALL_CONFIGS, train_end=TRAIN_END, val_end=VAL_END, capital=CAPITAL,
+                    lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG,
+                    turnover=turnover, turn_floor=MIN_TURNOVER)
+    picked = pick_ultimate(grid, capital=CAPITAL, fee_eur=FEE_EUR)
+    cfg = picked["config"] if picked else STRATEGY
+
     res = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=CAPITAL,
                        cost_mults=COST_MULTS, start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
-                       min_price=MIN_PRICE, sectors=None, benchmark=spx, pit=pit,
-                       execute_lag=EXEC_LAG, **STRATEGY.kwargs())
+                       min_price=MIN_PRICE, sectors=sectors, benchmark=spx, pit=pit,
+                       execute_lag=EXEC_LAG, turnover=turnover, turn_floor=MIN_TURNOVER,
+                       **cfg.kwargs())
     eq, tr = res["runs"][1.0]["equity"], res["runs"][1.0]["trades"]
     te, ve = pd.Timestamp(TRAIN_END), pd.Timestamp(VAL_END)
     train = _stats_slice(eq, tr, eq.index[0], te, CAPITAL)
     val = _stats_slice(eq, tr, te + pd.Timedelta(days=1), ve, CAPITAL)
     test = _stats_slice(eq, tr, ve + pd.Timedelta(days=1), eq.index[-1], CAPITAL)
     hits = sum(len(h.get("dead", set())) for h in res["holdings_log"])
+    # Equal-weight buy-hold of the first rebalance's picks — the survivorship-honest
+    # baseline. Computed here (not at render time) so the registry can carry it.
+    window = _equity_window(res)
+    first_picks = next((h["picks"] for h in res["holdings_log"] if h["picks"]), [])
+    ew_eq = equal_weight_curve(prices, first_picks, window, CAPITAL) if first_picks else None
 
-    # ── Upper bound: drop dead names that were never TR-tradeable (ISIN domicile absent
-    #    from the live TR set — e.g. the 200 Korean corpses TR never offered). Including them
-    #    only adds forced death-losses, so removing them lifts the result: the all-dead run is
-    #    the lower bound, this the upper. Re-run the SAME strategy on the trimmed graveyard.
+    # ── Upper bound: drop dead names that were never TR-tradeable ──
     live_cc = {str(i)[:2] for i, dl in zip(meta_df["isin"], meta_df["delisting_date"])
                if pd.isna(dl) and isinstance(i, str) and len(str(i)) >= 2}
     keep = [(pd.isna(dl) or (isinstance(i, str) and str(i)[:2] in live_cc))
@@ -112,32 +664,51 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     n_dead_dropped = int(meta_df["delisting_date"].notna().sum() - ub_meta["delisting_date"].notna().sum())
     ub_tickers = set(ub_meta["ticker"])
     ub_prices = prices[[c for c in prices.columns if c in ub_tickers]]
-    ub_pit = PITUniverse(ub_prices, delisting_map(ub_meta))
+    ub_pit = PITUniverse(ub_prices, delisting_map(ub_meta), deaths=death_map(ub_meta),
+                         membership=membership)
     ub_res = run_momentum(ub_prices, {t: slip[t] for t in ub_prices.columns if t in slip},
                           lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
                           start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
-                          sectors=None, benchmark=spx, pit=ub_pit, execute_lag=EXEC_LAG,
-                          **STRATEGY.kwargs())
+                          sectors=sectors, benchmark=spx, pit=ub_pit, execute_lag=EXEC_LAG,
+                          turnover=turnover, turn_floor=MIN_TURNOVER, **cfg.kwargs())
     ub_eq, ub_tr = ub_res["runs"][1.0]["equity"], ub_res["runs"][1.0]["trades"]
     bounds = dict(lower_full=test["net_return"], n_dead_dropped=n_dead_dropped,
                   upper_full=ub_res["runs"][1.0]["stats"]["net_return"],
                   lower_full_all=res["runs"][1.0]["stats"]["net_return"],
                   upper_test=_stats_slice(ub_eq, ub_tr, ve + pd.Timedelta(days=1),
                                           ub_eq.index[-1], CAPITAL)["net_return"])
-    grid = run_grid(prices, slip, sectors=None, benchmark=spx, pit=pit, start=START,
-                    configs=[c for c in ALL_CONFIGS if not c.sector_neutral],
-                    train_end=TRAIN_END, val_end=VAL_END, capital=CAPITAL,
-                    lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG)
-    # ── Significance & robustness: random-selection null, deflated Sharpe, bootstrap CI ──
+    # ── On-population survivorship (holding leak) ──
+    surv_inject = None
+    delisting_stress = None
+    if SURV_SIMS > 0:
+        try:
+            delisting_stress = _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res,
+                                                 base_return=res["runs"][1.0]["stats"]["net_return"],
+                                                 membership=membership, turnover=turnover)
+            surv_inject = delisting_stress["presets"]["base"]   # base == single-intensity
+        except Exception as e:
+            print(f"delisting-stress skipped: {e}", file=sys.stderr)
+            delisting_stress = None
+            surv_inject = None
+
+    # ── Significance & robustness: random-selection null, deflated Sharpe, bootstrap ──
     hl = res["holdings_log"]
     rb_dates = [h["date"] for h in hl] + [hl[-1]["next"]]
     elig = precompute_eligibility(prices, slip, rb_dates, liq_max=LIQ_MAX,
-                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE, pit=pit)
+                                  min_obs=LOOKBACK + SKIP, min_price=MIN_PRICE, pit=pit,
+                                  turnover=turnover, turn_floor=MIN_TURNOVER)
     pools = sig.period_pools(prices, rb_dates, elig, execute_lag=EXEC_LAG)
     strat_rets = sig.strategy_period_returns(hl)
-    ppy = {"Q": 4.0, "M": 12.0, "W": 52.0}.get(STRATEGY.freq, 12.0)
-    mc = sig.monte_carlo_null(pools, strat_rets, k=STRATEGY.slots, ppy=ppy, n_trials=1000, seed=0)
-    dsr = sig.deflated_sharpe_ratio(strat_rets, [c["full"]["sharpe"] for c in grid["cells"]], ppy=ppy)
+    ppy = {"Q": 4.0, "M": 12.0, "W": 52.0}.get(cfg.freq, 12.0)
+    mc = sig.monte_carlo_null(pools, strat_rets, k=cfg.slots, ppy=ppy, n_trials=1000, seed=0)
+    trial_sharpes = [c["full"]["sharpe"] for c in grid["cells"]]
+    dsr = sig.deflated_sharpe_ratio(strat_rets, trial_sharpes, ppy=ppy)   # grid-only (objective)
+    n_grid = dsr.get("n_trials_observed", len(trial_sharpes))
+    dsr_phantom = [dict(mult=m, n=n_grid * m,
+                        **{k: sig.deflated_sharpe_ratio(strat_rets, trial_sharpes, ppy=ppy,
+                           n_trials_effective=n_grid * m)[k] for k in ("dsr", "sr_benchmark_annual")})
+                   for m in PHANTOM_MULTS]
+    t_stat = float(dsr["sharpe_annual"] * np.sqrt(max(len(strat_rets) / ppy, 1e-9)))  # Harvey t
     ci = sig.bootstrap_sharpe_cagr_ci(strat_rets, ppy=ppy, seed=0)
 
     # ── Quant scorecard: industry metrics + an honest letter grade ──
@@ -147,700 +718,349 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
     di = {str(r["isin"]) for r, dl in zip(meta_df.to_dict("records"), meta_df["delisting_date"])
           if pd.notna(dl) and str(r["isin"])}
     overlap = len(li & di) / max(len(di), 1)
+    test_canon = qg.window_metrics(eq, ve + pd.Timedelta(days=1), eq.index[-1])
     quant = dict(perf=qg.perf_metrics(eq), bench=qg.vs_benchmark(eq, spx),
                  trades=qg.trade_metrics(tr, CAPITAL, years), roll=qg.rolling_sharpe(eq),
-                 grade=qg.grade(test["sharpe"], dsr["dsr"], mc["p_sharpe"], overlap),
+                 grade=qg.grade(test_canon.get("sharpe", 0.0), dsr["dsr"], mc["p_sharpe"], overlap),
                  isin_overlap=overlap,
-                 vol_target=qg.vol_target(eq, target_vol=RISK_TARGET_VOL))
+                 vol_target=qg.vol_target(eq, target_vol=RISK_TARGET_VOL, turn_cost_bps=RC_TURN_BPS))
 
-    # ── Your real portfolio's ROI (cumulative %), for the head-to-head ──
-    portfolio_roi = None
+    # ── Observational diagnostics (read-only; NEVER feed selection or sizing) ──
+    spx_ret = spx.pct_change().dropna()
+    reg = regime.hmm_regime(spx_ret, rebalance_dates(spx_ret.index, "Q"))
+    if len(reg):
+        below = (~regime.trend_state(spx)).reindex(reg.index).fillna(False)
+        reg["trend_broken"] = below.astype(bool)
+    eff_bets = []
+    for h in res["holdings_log"]:
+        picks = [t for t in h["picks"] if t in prices.columns]
+        if len(picks) < 2:
+            continue
+        win = prices[picks].loc[:h["date"]].tail(LOOKBACK).pct_change().dropna(how="all")
+        m = qg.effective_bets(win, np.full(len(picks), 1.0 / len(picks)))
+        if m:
+            eff_bets.append(dict(date=h["date"], **m))
+
+    # ── Regime attribution (observational): three lenses, same cfg ──
+    ratt = None
+    try:
+        kept = regime_attr.restrict_universe(prices, sectors, REGIME_DROP_SECTORS)
+        strip_res = run_momentum(kept, {t: slip[t] for t in kept.columns if t in slip},
+                                 lookback=LOOKBACK, skip=SKIP, capital=CAPITAL, cost_mults=(1.0,),
+                                 start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR, min_price=MIN_PRICE,
+                                 sectors=sectors, benchmark=spx,
+                                 pit=PITUniverse(kept, delisting_map(meta_df),
+                                                 deaths=death_map(meta_df), membership=membership),
+                                 execute_lag=EXEC_LAG, turnover=turnover, turn_floor=MIN_TURNOVER,
+                                 **cfg.kwargs())
+        s_eq, s_tr = strip_res["runs"][1.0]["equity"], strip_res["runs"][1.0]["trades"]
+        s_test = _stats_slice(s_eq, s_tr, ve + pd.Timedelta(days=1), s_eq.index[-1], CAPITAL)
+        cond = regime_attr.conditional_performance(eq.pct_change().dropna(),
+                                                   reg["risk_off"], ppy=ppy) if len(reg) else None
+        pre = _stats_slice(eq, tr, eq.index[0], ve, CAPITAL)     # train+val combined
+        ratt = dict(
+            strip=dict(full_test_sharpe=test["sharpe"], full_test_return=test["net_return"],
+                       strip_test_sharpe=s_test["sharpe"], strip_test_return=s_test["net_return"],
+                       n_dropped=int(len(prices.columns) - len(kept.columns)),
+                       n_kept=int(len(kept.columns)), dropped=sorted(REGIME_DROP_SECTORS)),
+            cond=cond,
+            pre=dict(sharpe=pre["sharpe"], net_return=pre["net_return"], end=str(VAL_END)))
+    except Exception:
+        ratt = None
+
+    # ── The two variant bundles (original + risk-conscious), full parity ──
+    variants = build_variants(res, quant["vol_target"], spx, train, val, test, quant, CAPITAL,
+                              dsr=dsr["dsr"], mc_p=mc["p_sharpe"], overlap=overlap, strategy=cfg)
+
+    # ── Factor-spanning regression (observational, never selection) ──
+    factor_reg = None
+    if FACTORS:
+        try:
+            fac, fac_src = factors.fetch_factors_daily(force=refresh)
+            fx = cached_price_history(["EURUSD=X"], period="9y",
+                                      force=refresh)["EURUSD=X"].dropna()
+
+            def _excess_usd(equity):
+                r = equity.pct_change().dropna()
+                r_usd = factors.to_usd(r, fx)
+                return (r_usd - fac["RF"].reindex(r_usd.index)).dropna()
+
+            raw_reg = factors.factor_regression(_excess_usd(eq), fac)
+            rc_reg = factors.factor_regression(_excess_usd(variants[1]["equity"]), fac)
+            if raw_reg:
+                key = "FF5+WML" if "FF5+WML" in raw_reg else next(iter(raw_reg))
+                factor_reg = dict(source=fac_src, raw=raw_reg, rc=rc_reg,
+                                  n=raw_reg[key]["n"],
+                                  start=str(eq.index[0].date()), end=str(eq.index[-1].date()))
+        except Exception as e:
+            print(f"factor regression skipped: {e}", file=sys.stderr)
+            factor_reg = None
+
+    # ── Adopted overlay: GARCH vol-managed MSCI World core (pre-registered gates) ──
+    vol_core = None
+    vol_core_eq = None
+    try:
+        from tools import vol_forecast as vf
+        core_px = cached_price_history(["IWDA.AS"], period="9y",
+                                       force=refresh)["IWDA.AS"].dropna()
+        core_r = core_px.pct_change().dropna()
+        fc = vf.garch11_vol(core_r)
+        vm = vf.vol_managed(core_r, fc, target_vol=RISK_TARGET_VOL,
+                            band=0.10, cost_bps=5.0, fee_eur=1.0,
+                            capital=CAPITAL)
+        bh = qg.perf_metrics((1.0 + core_r).cumprod() * CAPITAL)
+        w_now = float(min(RISK_TARGET_VOL / fc.iloc[-1], 1.0)) if len(fc) else None
+        vol_core_eq = vm.get("equity")               # the registry's comparable curve
+        vol_core = dict(etf="MSCI World (IWDA.AS)", bh=bh,
+                        managed={k: vm[k] for k in ("sharpe", "ann_return",
+                                                    "max_dd", "avg_exposure",
+                                                    "n_trades_per_year")},
+                        fc_now=float(fc.iloc[-1]) if len(fc) else None,
+                        w_now=w_now, asof=str(core_r.index[-1].date()))
+    except Exception as e:
+        print(f"vol-core overlay skipped: {e}", file=sys.stderr)
+
+    # ── Ensemble candidate (pre-registered method upgrade, +1 ledger trial):
+    #    equal-capital average of the top-3 QUARTERLY configs by min(train,val).
+    #    ADOPTION RULE (fixed ex ante): adopt over the single pick iff
+    #    ensemble min(train,val) ≥ single's min(train,val) − 0.05.
+    ensemble = None
+    try:
+        top3 = pick_top_n(grid, n=3, freq="Q", capital=CAPITAL, fee_eur=FEE_EUR)
+        if picked is not None and len(top3) >= 2:
+            sleeves = []
+            sleeve_books = []          # per-sleeve holdings for the buy-now panel + history
+            for c in top3:
+                rr = run_momentum(prices, slip, k=c["config"].slots,
+                                  lookback=LOOKBACK, skip=SKIP,
+                                  capital=CAPITAL / len(top3),
+                                  cost_mults=(1.0,), freq="Q",
+                                  liq_max=LIQ_MAX, fee_eur=FEE_EUR,
+                                  min_price=MIN_PRICE, start=START,
+                                  sectors=sectors, benchmark=spx, pit=pit,
+                                  execute_lag=EXEC_LAG, turnover=turnover,
+                                  turn_floor=MIN_TURNOVER,
+                                  vol_adjust=c["config"].vol_adjust,
+                                  sector_neutral=c["config"].sector_neutral,
+                                  trend_filter=c["config"].trend_filter,
+                                  lazy=c["config"].lazy)
+                sleeves.append(rr["runs"][1.0])
+                sleeve_books.append(dict(code=c["code"], slots=c["config"].slots,
+                                         holdings_log=rr["holdings_log"]))
+            idx = sleeves[0]["equity"].index
+            for sl in sleeves[1:]:
+                idx = idx.union(sl["equity"].index)
+            parts = [sl["equity"].reindex(idx).ffill()
+                     .fillna(CAPITAL / len(top3)) for sl in sleeves]
+            ens_eq = sum(parts)
+            e_tr = _stats_slice(ens_eq, [], ens_eq.index[0], te, CAPITAL)
+            e_va = _stats_slice(ens_eq, [], te + pd.Timedelta(days=1), ve, CAPITAL)
+            e_te = _stats_slice(ens_eq, [], ve + pd.Timedelta(days=1),
+                                ens_eq.index[-1], CAPITAL)
+            ens_min = min(e_tr["sharpe"], e_va["sharpe"])
+            single_min = min(picked["train"]["sharpe"], picked["val"]["sharpe"])
+            qd = [dd for dd in rebalance_dates(ens_eq.index, "Q")]
+            pr = ens_eq.reindex(qd).dropna().pct_change().dropna()
+            dsr5 = sig.deflated_sharpe_ratio(
+                pr, trial_sharpes, ppy=4.0,
+                n_trials_effective=(n_grid + 1) * PHANTOM_MULT)["dsr"] \
+                if len(pr) > 8 else None
+            ens_alpha = None
+            if factor_reg is not None:
+                try:
+                    areg = factors.factor_regression(_excess_usd(ens_eq), fac)
+                    if areg:
+                        akey = "FF5+WML" if "FF5+WML" in areg else next(iter(areg))
+                        ens_alpha = dict(model=akey,
+                                         alpha_ann=areg[akey]["alpha_ann"],
+                                         alpha_t=areg[akey]["alpha_t"],
+                                         n=areg[akey]["n"])
+                except Exception:
+                    ens_alpha = None
+            ensemble = dict(codes=[c["code"] for c in top3], n=len(top3),
+                            sleeves=sleeve_books,
+                            train=e_tr, val=e_va, test=e_te,
+                            max_dd=qg.perf_metrics(ens_eq).get("max_dd",
+                                                               float("nan")),
+                            trades_per_year=float(sum(c["trades_per_year"]
+                                                      for c in top3)),
+                            ens_min=float(ens_min), single_min=float(single_min),
+                            single_code=picked["code"],
+                            adopt=bool(ens_min >= single_min - 0.05),
+                            dsr5=dsr5, alpha=ens_alpha, equity=ens_eq)
+    except Exception as e:
+        print(f"ensemble skipped: {e}", file=sys.stderr)
+
+    # ── Live tracking (pre-registered kill criteria, tools/track.py) ──
+    track_d = None
+    try:
+        from tools import track as _track
+        live_eq = (ensemble["equity"] if ensemble and ensemble["adopt"]
+                   else variants[1]["equity"])
+        r_last = float(live_eq.pct_change().dropna().iloc[-1])
+        tpath = ROOT / "local" / "strategy_track.csv"
+        _track.append_snapshot(str(live_eq.index[-1].date()),
+                               dict(r_live=r_last,
+                                    equity=float(live_eq.iloc[-1]),
+                                    pick=(f"ens[{','.join(ensemble['codes'])}]"
+                                          if ensemble and ensemble["adopt"]
+                                          else cfg.code)),
+                               path=tpath)
+        trk = _track.read_track(tpath)
+        lv = _track.live_vs_backtest(trk, sharpe_lo=ci.get("sharpe_lo", 0.0),
+                                     backtest_max_dd=quant["perf"].get(
+                                         "max_dd", -0.3))
+        track_d = dict(n=lv.get("n", 0), needed=lv.get("needed", 63),
+                       kill=lv.get("kill", False),
+                       reasons=lv.get("reasons", []),
+                       path="local/strategy_track.csv")
+    except Exception as e:
+        print(f"tracking skipped: {e}", file=sys.stderr)
+
+    # ── Venture instrumentation (charter M-A): LIVE path only ──
+    venture = None
+    ritual = None
+    try:
+        from tools import track as _tr2
+        from tools import venture as vt
+        trk2 = _tr2.read_track(ROOT / "local" / "strategy_track.csv")
+        cf_path = ROOT / "local" / "venture_cashflows.csv"
+        if trk2 is not None and "equity" in trk2.columns \
+                and len(trk2.dropna(subset=["equity"])) >= 2:
+            live_book = trk2["equity"].dropna()
+            if not cf_path.exists():
+                cf_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame([dict(date=str(live_book.index[0].date()),
+                                   amount=float(CAPITAL),
+                                   note="seed (paper)")]).to_csv(cf_path,
+                                                                 index=False)
+            cf = pd.read_csv(cf_path, parse_dates=["date"])
+            iwda = cached_price_history(["IWDA.AS"], period="9y",
+                                        force=refresh)["IWDA.AS"].dropna()
+            vs = vt.venture_summary(cf, live_book, iwda)
+            venture = dict(**vs, live=True, satellite=dict(live=0, cap=3),
+                           deposits=int(len(cf)))
+        else:
+            n_rows = 0 if trk2 is None else int(len(trk2))
+            venture = dict(live=False, n_rows=n_rows,
+                           satellite=dict(live=0, cap=3))
+    except Exception as e:
+        print(f"venture section skipped: {e}", file=sys.stderr)
+    try:
+        items = []
+
+        def _age(name, last_iso):
+            if not last_iso:
+                items.append(dict(name=name, last="never", age_days=9999,
+                                  alarm=True))
+                return
+            age = (pd.Timestamp.now() - pd.Timestamp(last_iso)).days
+            items.append(dict(name=name, last=str(last_iso)[:10],
+                              age_days=int(age), alarm=bool(age > 35)))
+
+        snap = universe_snapshot.load_store()
+        _age("TR snapshot", snap["snapshot_date"].max() if len(snap) else None)
+        for name, path, col in (
+                ("Short-register fetch",
+                 ROOT / "data/universe/short_positions.csv", "fetched_at"),
+                ("BaFin dealings fetch",
+                 ROOT / "data/universe/insider_dealings.csv", "fetched_at")):
+            last = None
+            if path.exists():
+                df_ = pd.read_csv(path, usecols=[col])
+                last = df_[col].max()
+            _age(name, last)
+        _age("Universe price fetch",
+             pd.Timestamp(PRICES_CSV.stat().st_mtime, unit="s").isoformat()
+             if PRICES_CSV.exists() else None)
+        ritual = dict(items=items)
+    except Exception as e:
+        print(f"ritual section skipped: {e}", file=sys.stderr)
+
+    # ── Scenario fan (observational) ──
+    scenarios = None
+    if SCEN_SIMS > 0 and len(reg):
+        try:
+            rc_ret = variants[1]["equity"].pct_change().dropna()
+            if len(rc_ret) > SCEN_HORIZON + SCEN_BLOCK:
+                scenarios = scenario.regime_scenarios(
+                    rc_ret, reg["risk_off"], horizon=SCEN_HORIZON, block=SCEN_BLOCK,
+                    n_sims=SCEN_SIMS, tilt=SCEN_TILT, seed=0)
+        except Exception:
+            scenarios = None
+
+    # ── Your real portfolio's ROI + a same-scale strategy run, for the head-to-head ──
+    portfolio_roi, vs_scale, portfolio_bench = None, None, {}
     pf_csv = ROOT / "input" / "portfolio.csv"
     if pf_csv.exists():
+        txns = None
         try:
             txns = parse_portfolio(pf_csv)["transactions"]
-            pr, _ = build_roi_timeseries(txns)
+            pr, pf_bench = build_roi_timeseries(txns)   # keep the cash-flow-matched benchmarks
             if pr is not None and not pr.empty:
                 portfolio_roi = pr
+                portfolio_bench = pf_bench or {}        # the /portfolio report's own market view
         except Exception:
             portfolio_roi = None
+        try:                                    # vs_scale is separable — a failure here
+            invested = sum(float(t["price"])    # must NOT wipe portfolio_roi parsed above
+                           for t in (txns or []) if t["action"] == "buy")
+            if invested > 0:
+                vsr = run_momentum(prices, slip, lookback=LOOKBACK, skip=SKIP, capital=invested,
+                                   cost_mults=(1.0,), start=START, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
+                                   min_price=MIN_PRICE, sectors=sectors, benchmark=spx, pit=pit,
+                                   execute_lag=EXEC_LAG, turnover=turnover,
+                                   turn_floor=MIN_TURNOVER, **cfg.kwargs())
+                vse = vsr["runs"][1.0]["equity"]
+                vs_scale = dict(capital=invested, raw_equity=vse,
+                                rc_equity=qg.vol_target(vse, target_vol=RISK_TARGET_VOL,
+                                                        turn_cost_bps=RC_TURN_BPS).get("equity"))
+        except Exception:
+            vs_scale = None
 
     n_countries = len({m.get("country") for m in meta.values()} - {"—", None})
+    mc_arms, mc_names, mc_holdings = _megacap_arms()   # live screen → curves + holdings tables
+    registry = build_registry(variants, ensemble=ensemble, vol_core=vol_core,
+                              vol_core_eq=vol_core_eq, bench=bench, ew_eq=ew_eq,
+                              portfolio_roi=portfolio_roi, megacap_names=mc_names,
+                              megacap_arms=mc_arms, megacap_holdings=mc_holdings)
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta, quant=quant,
-                portfolio_roi=portfolio_roi,
-                strategy=STRATEGY, train=train, val=val, test=test, graveyard_hits=hits,
-                grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
+                portfolio_roi=portfolio_roi, portfolio_bench=portfolio_bench,
+                vs_scale=vs_scale, variants=variants,
+                registry=registry, ew_eq=ew_eq,
+                strategy=cfg, raw_windows=dict(train=train, val=val, test=test),
+                graveyard_hits=hits,
+                surv_inject=surv_inject, delisting_stress=delisting_stress,
+                factor_reg=factor_reg, vol_core=vol_core,
+                ensemble={k: v for k, v in (ensemble or {}).items()
+                          if k != "equity"} or None,
+                track=track_d, venture=venture, ritual=ritual,
+                grid=grid, n_dead=int(death_mask(meta_df).sum()),
+                turnover_pit=turnover is not None,
                 n_countries=n_countries,
-                n_live=n_live, bounds=bounds,
-                significance=dict(mc=mc, dsr=dsr, ci=ci, ppy=ppy))
-
-
-def sec_intro(d: dict) -> str:
-    cfg = d["strategy"]
-    nc = d["n_countries"]
-    return (f'<div class="note"><b>Chosen strategy — {cfg.code} ({_desc(cfg)}).</b> '
-            "Picked from the <b>32-config grid</b> for the highest worst-case "
-            "<b>min(train, validation) Sharpe</b> among configs that pay for their own trading "
-            "costs and are positive in both windows — so the result rides robustness, not one "
-            "lucky rally. (Sector-neutral is excluded: the global universe carries no sector "
-            "data, so it would be a silent no-op.) The universe is the liquid, "
-            f"<b>Trade-Republic-investable</b> names across <b>{nc} countries</b>, each priced off "
-            "its <b>home exchange × EUR FX</b> — the way Lang &amp; Schwarz actually fills you "
-            "(NVIDIA on NASDAQ, Samsung on KRX, Rheinmetall on XETRA, in their own currency, "
-            "converted to EUR). Behind a <b>≥100k/day turnover</b> floor. Long-only, walk-forward, "
-            "executable. Not advice.</div>")
-
-
-def sec_perf(d: dict, public: bool) -> str:
-    full = d["res"]["runs"][1.0]["stats"]
-    test = d["test"]
-    out = ["<h2>Performance</h2>",
-           "<p class='dim'>Train = 2018–21 (used to pick the config), validation = 2022–23 "
-           "(used to compare configs), <b>test = 2024→ (held out — never touched the "
-           "choice)</b>. The <b>test</b> column is the only truly out-of-sample number; "
-           "trust it over the eye-popping full-window total.</p>"]
-    cards = [
-        _card("Test net return", _pct(test["net_return"] * 100)),
-        _card("Test Sharpe", f"{test['sharpe']:.2f}"),
-        _card("Test max DD", _pct(test["max_drawdown"] * 100)),
-        _card("Full net return", _pct(full["net_return"] * 100)),
-    ]
-    if not public:
-        cards.append(_card("Net P&L", f"€{full['net_return'] * d['capital']:+,.0f}"))
-    out.append(f'<div class="cards">{"".join(cards)}</div>')
-    rows = "".join(
-        f"<tr><td>{name}</td><td class='num'>{_pct(s['net_return'] * 100)}</td>"
-        f"<td class='num mono'>{s['sharpe']:.2f}</td>"
-        f"<td class='num'>{_pct(s['max_drawdown'] * 100)}</td></tr>"
-        for name, s in (("Train 2018–21", d["train"]), ("Validation 2022–23", d["val"]),
-                        ("Test 2024→ (held out)", test), ("Full 2018→", full)))
-    out.append("<table><tr><th>Window</th><th class='num'>Net return</th>"
-               "<th class='num'>Sharpe</th><th class='num'>Max DD</th></tr>" + rows + "</table>")
-    return "".join(out)
-
-
-def _yearly_returns(series: pd.Series) -> pd.Series:
-    """Calendar-year returns keyed by year int: each year from the prior year's last
-    close to this year's last close; the first year runs from inception."""
-    s = series.dropna()
-    last = s.groupby(s.index.year).last()
-    prev = last.shift(1)
-    if len(prev):
-        prev.iloc[0] = s.iloc[0]          # first year measured from inception
-    return (last / prev - 1.0).dropna()
-
-
-def sec_yearly(d: dict, public: bool) -> str:
-    eq = d["res"]["runs"][1.0]["equity"].dropna()
-    if len(eq) < 2:
-        return ""
-    sret = _yearly_returns(eq)
-    bench = d["benchmarks"]
-    spx = bench["S&P 500"] if "S&P 500" in bench.columns else None
-    bret = _yearly_returns(spx.reindex(eq.index).ffill()) if spx is not None else pd.Series(dtype=float)
-    # € P&L per year — the actual paper-account change (private builds only)
-    last = eq.groupby(eq.index.year).last()
-    prev = last.shift(1)
-    prev.iloc[0] = eq.iloc[0]
-    pnl = (last - prev).dropna()
-
-    rows = []
-    for y, r in sret.items():
-        eur = f"<td class='num mono'>€{pnl.get(y, 0.0):+,.0f}</td>" if not public else ""
-        b = (f"<td class='num'>{_pct(bret[y] * 100)}</td>"
-             if y in bret.index else "<td class='num dim'>—</td>")
-        rows.append(f"<tr><td class='mono'>{y}</td>"
-                    f"<td class='num'>{_pct(r * 100)}</td>{eur}{b}</tr>")
-    eur_hdr = "<th class='num'>P&amp;L (€10k)</th>" if not public else ""
-    pnl_note = ("the €10k paper account's actual P&amp;L, and " if not public else "and ")
-    return ("<h2>Yearly P&amp;L</h2>"
-            "<p class='dim'>Calendar-year net return of the strategy (first year from "
-            f"inception), {pnl_note}the S&amp;P 500 over the same year. 2018 and 2026 are "
-            "part-years.</p>"
-            "<table><tr><th>Year</th><th class='num'>Strategy</th>" + eur_hdr +
-            "<th class='num'>S&amp;P 500</th></tr>" + "".join(rows) + "</table>")
-
-
-def sec_risk_conscious(d: dict, public: bool) -> str:
-    """The risk-conscious variant: the same picks, volatility-targeted so the book de-risks
-    into turbulence. Cuts drawdown and lifts the Sharpe vs the raw strategy."""
-    vt = d.get("quant", {}).get("vol_target")
-    base = d.get("quant", {}).get("perf")
-    if not vt or not base or "equity" not in vt:
-        return ""
-    be, ve = d["res"]["runs"][1.0]["equity"], vt["equity"]
-    broi = (be / be.iloc[0] - 1.0) * 100.0
-    vroi = (ve / ve.iloc[0] - 1.0) * 100.0
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=broi.index, y=broi.values, name="Raw strategy (A·"+"··EF)",
-                             line=dict(color="#808080", width=1.6)))
-    fig.add_trace(go.Scatter(x=vroi.index, y=vroi.values, name="Risk-conscious (vol-targeted)",
-                             line=dict(color="#4ec9b0", width=2.4)))
-    fig.add_hline(y=0, line_dash="dash", line_color=theme.FG_DIM)
-    fig.update_layout(height=420, yaxis=dict(title="Cumulative ROI (%)", ticksuffix="%"),
-                      hovermode="x unified", margin=dict(t=20))
-
-    def r(label, m, exp=None):
-        e = f"<td class='num mono'>{exp*100:.0f}%</td>" if exp is not None else "<td class='num dim'>100%</td>"
-        return (f"<tr><td>{label}</td><td class='num'>{_pct(m['ann_return']*100)}</td>"
-                f"<td class='num mono'>{m['ann_vol']*100:.0f}%</td><td class='num mono'>{m['sharpe']:.2f}</td>"
-                f"<td class='num'>{_pct(m['max_dd']*100)}</td>{e}</tr>")
-    return (
-        "<h2>Risk-conscious version</h2>"
-        f"<p class='dim'>Same momentum picks, but the book is <b>volatility-targeted to "
-        f"{RISK_TARGET_VOL:.0%}</b>: each day it scales exposure toward that vol using the prior "
-        "day's realised vol (no look-ahead, no leverage — it only ever de-risks) and parks the rest "
-        "in cash. When momentum gets turbulent the book automatically shrinks. The raw strategy's "
-        "−44% drawdown is the price of its raw return; this is how you'd actually run it.</p>"
-        f"<div class='chart'>{fig_html(fig)}</div>"
-        "<table><tr><th>Version</th><th class='num'>Ann. return</th><th class='num'>Vol</th>"
-        "<th class='num'>Sharpe</th><th class='num'>Max DD</th><th class='num'>Avg exposure</th></tr>"
-        f"{r('Raw (full-invested)', base)}{r('Risk-conscious', vt, vt['avg_exposure'])}</table>"
-        f"<p class='dim'>Vol-targeting cuts the drawdown from <b>{_pct(base['max_dd']*100)}</b> to "
-        f"<b>{_pct(vt['max_dd']*100)}</b> and lifts the Sharpe from <b>{base['sharpe']:.2f}</b> to "
-        f"<b>{vt['sharpe']:.2f}</b>, at ~<b>{vt['avg_exposure']*100:.0f}%</b> average exposure "
-        "(the rest in cash) — lower absolute return, far better risk-adjusted. Same survivorship "
-        "caveats apply to the underlying signal.</p>")
-
-
-def sec_vs_portfolio(d: dict, public: bool) -> str:
-    """Head-to-head: your real Trade Republic portfolio vs the momentum strategy over the
-    same window. Private only (it's your actual book)."""
-    pr = d.get("portfolio_roi")
-    if public or pr is None or getattr(pr, "empty", True):
-        return ""
-    eq = d["res"]["runs"][1.0]["equity"]
-    start = pr.index[0]
-    eqw = eq[eq.index >= start].dropna()
-    prw = pr[pr.index >= start].dropna()
-    if len(eqw) < 5 or len(prw) < 5:
-        return ""
-    strat = (eqw / eqw.iloc[0] - 1.0) * 100.0          # strategy cumulative ROI % from your start
-    # risk-conscious (vol-targeted) curve over the same window
-    vt = d.get("quant", {}).get("vol_target") or {}
-    rcw = vt.get("equity")
-    rc = None
-    if rcw is not None:
-        rcw = rcw[rcw.index >= start].dropna()
-        if len(rcw) >= 5:
-            rc = (rcw / rcw.iloc[0] - 1.0) * 100.0
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=prw.index, y=prw.values, name="Your portfolio (real)",
-                             line=dict(color="#ffffff", width=2.6)))
-    fig.add_trace(go.Scatter(x=strat.index, y=strat.values, name="Momentum — raw",
-                             line=dict(color="#dcdcaa", width=1.8)))
-    if rc is not None:
-        fig.add_trace(go.Scatter(x=rc.index, y=rc.values, name="Momentum — risk-conscious",
-                                 line=dict(color="#4ec9b0", width=2.4)))
-    fig.add_hline(y=0, line_dash="dash", line_color=theme.FG_DIM)
-    fig.update_layout(height=440, yaxis=dict(title="Cumulative ROI (%)", ticksuffix="%"),
-                      hovermode="x unified", margin=dict(t=20))
-
-    def stat(roi_pct):
-        m = qg.perf_metrics(1.0 + roi_pct / 100.0)
-        return roi_pct.iloc[-1], m.get("sharpe", 0.0), m.get("max_dd", 0.0) * 100.0
-    pt, ps, pdd = stat(prw)
-    st, ss, sdd = stat(strat)
-    yrs = max((prw.index[-1] - start).days / 365.25, 1e-9)
-    rows = (f"<tr><td>Your portfolio</td><td class='num'>{_pct(pt)}</td>"
-            f"<td class='num mono'>{ps:.2f}</td><td class='num'>{_pct(pdd)}</td></tr>"
-            f"<tr><td>Momentum — raw</td><td class='num'>{_pct(st)}</td>"
-            f"<td class='num mono'>{ss:.2f}</td><td class='num'>{_pct(sdd)}</td></tr>")
-    if rc is not None:
-        rt, rs, rdd = stat(rc)
-        rows += (f"<tr><td>Momentum — risk-conscious</td><td class='num'>{_pct(rt)}</td>"
-                 f"<td class='num mono'>{rs:.2f}</td><td class='num'>{_pct(rdd)}</td></tr>")
-    lead = st - pt
-    return (
-        "<h2>You vs the strategy</h2>"
-        f"<p class='dim'>Same window — since your first trade ({start.date()}, ~{yrs:.1f}y). "
-        "<span style='color:#fff'>White</span> = your real book; "
-        "<span style='color:#dcdcaa'>gold</span> = the raw momentum strategy; "
-        "<span style='color:#4ec9b0'>teal</span> = the risk-conscious (vol-targeted) version — all "
-        "hypothetical, lump-sum. Apples-to-pears (your book is cash-flow-timed), and the strategies "
-        "carry every caveat below — survivorship especially — so read the gap as indicative.</p>"
-        f"<div class='chart'>{fig_html(fig)}</div>"
-        "<table><tr><th>Book</th><th class='num'>Total ROI</th><th class='num'>Sharpe</th>"
-        f"<th class='num'>Max DD</th></tr>{rows}</table>"
-        f"<p class='dim'>Over this window the raw strategy is <b>{_pct(lead)}</b> "
-        f"{'ahead of' if lead >= 0 else 'behind'} your portfolio on total return — but watch the "
-        "drawdown and Sharpe columns: the risk-conscious version is the fairer comparison to how "
-        "you actually run money.</p>")
-
-
-def sec_grade(d: dict, public: bool) -> str:
-    q = d["quant"]
-    p, bm, tm, rl, g = q["perf"], q["bench"], q["trades"], q["roll"], q["grade"]
-    gcolor = {"A": "#46c84e", "B": "#9acd32", "C": "#d7ba7d", "D": "#e8a04e", "F": "#ef4444"}[g["letter"]]
-
-    def row(k, v):
-        return f"<tr><td>{k}</td><td class='num mono'>{v}</td></tr>"
-    perf_rows = "".join([
-        row("Sharpe (full, daily)", f"{p['sharpe']:.2f}"), row("Sortino", f"{p['sortino']:.2f}"),
-        row("Calmar (CAGR/maxDD)", f"{p['calmar']:.2f}"), row("Omega", f"{p['omega']:.2f}"),
-        row("Ann. return", _pct(p['ann_return']*100)), row("Ann. vol", _pct(p['ann_vol']*100)),
-        row("Max drawdown", _pct(p['max_dd']*100)), row("Underwater (days)", f"{p['dd_days']}"),
-        row("Skew / kurtosis", f"{p['skew']:.2f} / {p['kurtosis']:.2f}"),
-        row("VaR 95 / CVaR 95 (daily)", f"{p['var95']*100:.1f}% / {p['cvar95']*100:.1f}%")])
-    bench_rows = "".join([
-        row("Beta vs S&amp;P", f"{bm['beta']:.2f}"), row("Alpha (annual)", _pct(bm['alpha_ann']*100)),
-        row("Correlation", f"{bm['corr']:.2f}"), row("Information ratio", f"{bm['info_ratio']:.2f}"),
-        row("Tracking error", _pct(bm['tracking_error']*100)),
-        row("Up / down capture", f"{bm['up_capture']:.2f} / {bm['down_capture']:.2f}")]) if bm else ""
-    trade_rows = "".join([
-        row("Hit rate", _pct(tm['hit_rate']*100)), row("Profit factor", f"{tm['profit_factor']:.2f}"),
-        row("Payoff (avgW/avgL)", f"{tm['payoff']:.2f}"), row("Trades / year", f"{tm['trades_per_year']:.0f}")]) if tm else ""
-    roll_rows = "".join([
-        row("12m Sharpe — median", f"{rl['roll_sharpe_med']:.2f}"),
-        row("12m Sharpe — worst", f"{rl['roll_sharpe_min']:.2f}"),
-        row("12m windows positive", _pct(rl['roll_sharpe_pos_frac']*100))]) if rl else ""
-
-    flags = "".join(f"<li>{f}</li>" for f in g["flags"])
-    score_card = _card("Score / 100", f"{g['score']:.0f}")
-    sharpe_card = _card("Full Sharpe", f"{p['sharpe']:.2f}")
-    dd_card = _card("Max DD", _pct(p["max_dd"] * 100))
-    return (
-        "<h2>Quant scorecard &amp; honest grade</h2>"
-        f"<div class='cards'>"
-        f"<div class='card'><div class='k'>Grade</div>"
-        f"<div class='v' style='color:{gcolor};font-size:2rem'>{g['letter']}</div></div>"
-        f"{score_card}{sharpe_card}{dd_card}</div>"
-        "<p class='dim'>Graded like a risk committee: standard ratios, benchmark attribution, "
-        "trade quality and stability — then the headline is <b>docked for what it doesn't "
-        "correct</b>. The full-window daily Sharpe (<b>"
-        f"{p['sharpe']:.2f}</b>) and the −{abs(p['max_dd'])*100:.0f}% max drawdown are the sober "
-        "view; the eye-popping test total is regime + survivorship.</p>"
-        "<div style='display:flex;flex-wrap:wrap;gap:1.5rem'>"
-        f"<table><tr><th>Risk / return</th><th class='num'>Value</th></tr>{perf_rows}</table>"
-        f"<table><tr><th>vs S&amp;P 500</th><th class='num'>Value</th></tr>{bench_rows}</table>"
-        f"<table><tr><th>Trade quality</th><th class='num'>Value</th></tr>{trade_rows}</table>"
-        f"<table><tr><th>Stability</th><th class='num'>Value</th></tr>{roll_rows}</table>"
-        "</div>"
-        "<div class='note warn'><b>Bias audit — why this is <i>not</i> clean alpha.</b> "
-        f"Is it real? Partly. Momentum-<i>selection</i> beats a random book on the same universe "
-        f"(p={d['significance']['mc']['p_sharpe']:.3f}, deflated-Sharpe "
-        f"{d['significance']['dsr']['dsr']:.0%}) — a genuine, modest tilt. But the <i>level</i> is "
-        f"inflated, and the honest verdict is a <b>{g['letter']}</b>:<ul>{flags}</ul>"
-        "Bottom line: a real but small momentum tilt riding survivorship + a small-cap regime — "
-        "a known, decaying premium, not novel alpha. If it looks too easy, it is.</div>")
-
-
-def sec_significance(d: dict, public: bool) -> str:
-    s = d["significance"]
-    mc, dsr, ci = s["mc"], s["dsr"], s["ci"]
-    pct_beat = 100.0 * (1.0 - mc["p_sharpe"])
-
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(x=mc["null_sharpe"], nbinsx=40, name="random books",
-                               marker_color=theme.FG_DIM, opacity=0.85))
-    fig.add_vline(x=mc["strat_sharpe"], line_color="#dcdcaa", line_width=2.5,
-                  annotation_text="this strategy", annotation_position="top")
-    fig.add_vline(x=mc["null_sharpe_median"], line_color="#569cd6", line_dash="dash",
-                  annotation_text="random median", annotation_position="bottom")
-    fig.update_layout(height=340, bargap=0.02, showlegend=False,
-                      xaxis_title="Gross annualised Sharpe (per-rebalance)",
-                      yaxis_title="random books", margin=dict(t=20))
-
-    cards = [
-        _card("p-value vs random", f"{mc['p_sharpe']:.3f}"),
-        _card("Beats random books", f"{pct_beat:.1f}%"),
-        _card("Deflated Sharpe (P real>0)", "—" if dsr['dsr'] != dsr['dsr'] else f"{dsr['dsr']:.0%}"),
-        _card(f"Sharpe {ci['conf']}% CI", f"{ci['sharpe_lo']:.2f} – {ci['sharpe_hi']:.2f}"),
-    ]
-    verdict = ("clears" if mc["p_sharpe"] < 0.05 else "does <b>not</b> clear")
-    dsr_txt = ("—" if dsr["dsr"] != dsr["dsr"] else
-               f"After haircutting for the <b>{dsr['n_trials']} configs we scanned</b>, the return "
-               f"skew/kurtosis and the {dsr['T']}-period sample length, the <b>Deflated Sharpe</b> "
-               f"puts P(true Sharpe&gt;0) at <b>{dsr['dsr']:.0%}</b> (benchmark a lucky winner had to "
-               f"clear: {dsr['sr_benchmark_annual']:.2f} annualised).")
-    return ("<h2>Significance &amp; robustness</h2>"
-            "<p class='dim'>Three desk-grade sanity checks, all on <b>gross per-rebalance</b> "
-            "returns so the comparison is pure selection (costs hit a random book about the same). "
-            f"<b>(1) Better than noise?</b> {mc['n_trials']:,} random books — same eligible pool, "
-            "same dates, {k} names picked at <i>random</i> each rebalance — give the grey null "
-            "below; momentum’s Sharpe (gold line) {verdict} the 5% bar with "
-            "<b>p = {p:.3f}</b>. The random median (blue) is the universe’s own drift — beating it "
-            "is the actual edge. <b>(2) Real after scanning configs?</b> {dsr} <b>(3) How wide the "
-            "error bar?</b> a circular block-bootstrap puts the annualised Sharpe’s {conf}% CI at "
-            "<b>{slo:.2f}–{shi:.2f}</b> and CAGR at <b>{clo:.0f}%–{chi:.0f}%</b>.</p>"
-            .format(k=d["strategy"].slots, verdict=verdict, p=mc["p_sharpe"], dsr=dsr_txt,
-                    conf=ci["conf"], slo=ci["sharpe_lo"], shi=ci["sharpe_hi"],
-                    clo=ci["cagr_lo"] * 100, chi=ci["cagr_hi"] * 100) +
-            f'<div class="cards">{"".join(cards)}</div>'
-            f"<div class='chart'>{fig_html(fig)}</div>"
-            "<p class='dim'>A low p-value says the <i>selection</i> adds value over drawing names "
-            "at random from the same liquid pool; it does not promise the level repeats. Read it "
-            "with the regime and capacity caveats below.</p>")
-
-
-def sec_timeline(d: dict) -> str:
-    lines = []
-    for h in d["res"]["holdings_log"]:
-        dead = h.get("dead", set())
-        spans = " ".join(
-            f"<span style='color:{_pnl_color(h['ret'].get(t, 0.0), t in dead)}' "
-            f"title='{t} {h['ret'].get(t, 0.0):+.0%}'>{_disp(d['meta'], t)}</span>"
-            for t in h["picks"])
-        spans = spans or "<span class='dim'>cash</span>"
-        rv = [v for v in h["ret"].values() if pd.notna(v)]
-        mret = sum(rv) / len(rv) if rv else 0.0
-        lines.append(f"<div><span class='mono dim'>{h['date'].date()}</span> "
-                     f"<b style='color:{_pnl_color(mret, False)}'>{mret:+.1%}</b> {spans}</div>")
-    return ("<h2>Every rebalance, colored by outcome</h2>"
-            "<p class='dim'>Each line is one rebalance’s picks, colored by that holding "
-            "period’s return — <span style='color:#0a6b00'>■</span> ≥+20% · "
-            "<span style='color:#46c84e'>■</span> up · <span style='color:#ef4444'>■</span> down · "
-            "<span style='color:#7a0000'>■</span> ≤−20% · <span style='color:#000'>■</span> "
-            "defaulted (delisted/died). Hover for the %.</p>"
-            f"<div style='font-size:0.78rem;line-height:1.7'>{''.join(lines)}</div>")
-
-
-def sec_caveat(d: dict) -> str:
-    hits = d.get("graveyard_hits", 0)
-    test_ret = d["test"]["net_return"] * 100
-    surv = (f"it held <b>0</b> of them into death" if hits == 0 else
-            f"it held <b>{hits}</b> into delisting, liquidated by the graveyard at the last price")
-    nlive = d.get("n_live")
-    b = d.get("bounds", {})
-    bound_txt = ""
-    if b:
-        bound_txt = (
-            f' Trimming the {b["n_dead_dropped"]} never-TR-tradeable corpses (the 200 Korean + a few) '
-            f'moves the held-out test from <b>{b["lower_full"]*100:+.1f}%</b> to '
-            f'<b>{b["upper_test"]*100:+.1f}%</b> — all but identical, but for the <i>wrong</i> reason: '
-            f'the graveyard barely overlaps the live universe, so it isn’t correcting anything.')
-    trade = (
-        f' <b>Tradeability is built in, not assumed.</b> The {nlive:,} live names are TR’s own '
-        f'instrument list — <i>enumerated</i> from a Trade Republic account and priced at their '
-        f'home listing (Milan, Tokyo, etc.) via yfinance — so every one is a name you can actually '
-        f'buy (a few TR lists but restricts in your region may slip in). The {d["n_dead"]} delisted '
-        f'names are the survivorship graveyard; we report the all-corpses result as the conservative '
-        f'<b>lower bound</b>.{bound_txt}')
-    ov = d.get("quant", {}).get("isin_overlap", 0.0)
-    return (
-        f'<div class="note warn"><b>The dominant caveat — survivorship is NOT corrected.</b> '
-        f'The live universe is Trade Republic’s <i>current</i> list — names that <b>survived to '
-        f'today</b>. A name that pumped then delisted before now is simply absent, so the backtest '
-        f'only ever picks from winners-that-made-it. The {d["n_dead"]} “graveyard” names are a '
-        f'near-disjoint EODHD relic (<b>{ov*100:.0f}%</b> ISIN overlap with the live set), so they '
-        f'do <b>not</b> fix it.{bound_txt} This inflates the headline and is the single biggest reason '
-        f'to distrust the level — see the bias audit in the scorecard above.{trade}'
-        f'<br><br>The other caveats: <b>(1) Regime</b> — 2024→ was an exceptional small-cap momentum '
-        f'tape; even the held-out {test_ret:+.0f}% test figure is regime-specific and will <b>not</b> '
-        f'repeat. <b>(2) Concentration</b> — top-{d["strategy"].slots}, no sector/geographic cap, so '
-        f'the book can pile into one theme; a few names drive the curve. <b>(3) Capacity</b> — picks '
-        f'are liquid enough for a small account, but modeled slippage (25bps) understates real fills '
-        f'in size. <b>(4) Mechanics</b> — daily closes, €1/order, slippage modeled not measured, and '
-        f'<b>past performance is not future returns</b>.</div>')
+                n_live=n_live, bounds=bounds, regime=reg, eff_bets=eff_bets,
+                regime_attr=ratt, scenarios=scenarios,
+                significance=dict(mc=mc, dsr=dsr, ci=ci, ppy=ppy,
+                                  dsr_phantom=dsr_phantom, t_stat=t_stat,
+                                  phantom_mult=PHANTOM_MULT))
 
 
 def build(d: dict, public: bool = False) -> str:
-    """One page: the chosen strategy up top (intro → picks → equity → perf → timeline →
-    caveats), then a <hr> and the research lab below (the 32-config grid, feasibility, every
-    variation's timeline, the survivorship note, and the method). Local-only output."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cfg = d["strategy"]
-    body = "".join([
-        f"<h1>Momentum strategy — {cfg.code}</h1>",
-        f"<p class='dim'>generated {now} · <a href='report.html'>← portfolio</a></p>",
-        # ── the chosen strategy ──
-        sec_intro(d),
-        sec_holdings(d),
-        sec_curve(d),
-        sec_perf(d, public),
-        sec_risk_conscious(d, public),
-        sec_vs_portfolio(d, public),
-        sec_grade(d, public),
-        sec_significance(d, public),
-        sec_yearly(d, public),
-        sec_timeline(d),
-        sec_caveat(d),
-        # ── the lab (private/live only): how this config was chosen + all the rest ──
-        ("".join([
-            "<hr style='margin:3rem 0;border:0;border-top:2px solid #333'>",
-            "<h1>Research lab</h1><p class='dim'>How the config above was chosen — the whole "
-            "32-config grid it was picked from, and the supporting data. Skip unless you "
-            "want the workings.</p>",
-            sec_survivorship(d), sec_grid(d), sec_feasibility(d), sec_timelines(d), sec_method(),
-        ]) if not public else ""),
-    ])
-    return page(f"Strategy — {cfg.code}", body)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  STRATEGIES HUB — every strategy on one page, ordered by conviction, each at
-#  full depth by reusing that strategy's own section functions (no duplication).
-# ════════════════════════════════════════════════════════════════════════════
-
-_HUB_CSS = """
-.hubgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:18px 0 8px}
-.hubcard{display:block;text-decoration:none;color:inherit;background:#252526;border:1px solid #333;
- border-radius:10px;padding:16px 18px;position:relative;overflow:hidden;transition:border-color .15s}
-.hubcard:hover{border-color:#569cd6}
-.hubcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--bar,#569cd6)}
-.hubcard .hn{font-size:15px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px;color:#e8e8e8}
-.hubcard .ht{font-size:12.5px;color:#9a9a9a;line-height:1.45;margin:4px 0 12px;min-height:2.6em}
-.hubcard .hs{display:flex;gap:16px;font-size:12px;color:#b5b5b5;flex-wrap:wrap}
-.hubcard .hs b{color:#e8e8e8;font-variant-numeric:tabular-nums}
-.hbadge{display:inline-block;font:600 10px ui-monospace,Menlo,monospace;letter-spacing:.06em;
- padding:3px 8px;border-radius:20px;color:#0b0b0b;margin-bottom:8px}
-.stratband{margin:3rem 0 0;padding:14px 0 2px;border-top:2px solid #333}
-.stratband h1{margin:0;font-size:1.7rem}
-.stratband .role{font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.12em;text-transform:uppercase;color:#808080}
-.hubstub{background:#2a2a2b;border:1px solid #3a3a3a;border-radius:8px;padding:14px 16px;color:#b5b5b5;font-size:13.5px}
-"""
-
-_BADGE = dict(good="#46c84e", warn="#d7ba7d", crit="#ef4444", neutral="#569cd6", teal="#4ec9b0")
-
-
-def _badge(text, kind="neutral"):
-    return f'<span class="hbadge" style="background:{_BADGE[kind]}">{text}</span>'
-
-
-def _g(dct, *path, default=None):
-    """Defensive nested get: _g(d,'a','b') → d['a']['b'] or default."""
-    cur = dct
-    for k in path:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
-
-_PAIRS_PKL = ROOT / "local" / "buffer" / "hub_pairs.pkl"
-
-
-def _cached_pairs(populate: bool = False):
-    """Pairs runs thousands of Engle-Granger cointegration tests (10+ min) — far too slow
-    to ever run inside a page build. So the hub NEVER scans inline: it reads a pickle if
-    one exists (best-effort, any age), else returns None and the section shows a stub.
-    The cache is populated out-of-band by `python build_strategy_report.py --pairs`
-    (background it once); its result moves slowly, so a stale-ish cache is fine."""
-    import pickle
-    if not populate:
-        try:
-            with open(_PAIRS_PKL, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            return None                                  # no cache → stub, no scan
-    d = P.gather(force=True)                             # the slow scan, only on --pairs
-    try:
-        _PAIRS_PKL.parent.mkdir(parents=True, exist_ok=True)
-        with open(_PAIRS_PKL, "wb") as f:
-            pickle.dump(d, f)
-    except Exception:
-        pass
-    return d
-
-
-def gather_all(force: bool = False, refresh: bool | None = None) -> dict:
-    """Gather every strategy's data. Each is independent and guarded — one failing
-    (e.g. pairs needs a live fetch) never sinks the page; its card shows the reason.
-    Pairs is served from an 18h pickle cache (its scan is minutes)."""
-    refresh = force if refresh is None else refresh
-    out: dict = {}
-    for key, fn in (("mom", lambda: gather(force=force, refresh=refresh)),
-                    ("vol", lambda: V.gather(force=force, refresh=refresh)),
-                    ("edge", lambda: E.gather(force=force, refresh=refresh)),
-                    ("pairs", lambda: _cached_pairs())):    # cache-only, never scans inline
-        try:
-            out[key] = fn()
-        except Exception as exc:                       # noqa: BLE001 — report, don't crash
-            out[key] = None
-            out[f"{key}_err"] = f"{type(exc).__name__}: {exc}"
-            print(f"  [hub] {key} unavailable — {out[f'{key}_err']}")
-    if out.get("pairs") is None and "pairs_err" not in out:
-        out["pairs_err"] = ("cache empty — populate once with "
-                            "<span class='mono'>python build_strategy_report.py --pairs</span> "
-                            "(~10-min cointegration scan), or open the <a href='/pairs' "
-                            "target='_top'>dedicated /pairs page</a>")
-    return out
-
-
-def _hub_cards(d: dict) -> str:
-    mom, vol, edge, pairs = d.get("mom"), d.get("vol"), d.get("edge"), d.get("pairs")
-    cards = []
-
-    # 1 — momentum core (return engine)
-    if mom:
-        test = mom.get("test", {})
-        full = _g(mom, "res", "runs", 1.0, "stats", default={})
-        grade = _g(mom, "quant", "grade", "letter", default="—")
-        cards.append(_card_html("momentum", "Momentum core", "teal",
-            _badge("RETURN ENGINE", "teal"),
-            "12-1 cross-sectional on small/illiquid names funds can't crowd — the capacity edge.",
-            [("Test Sharpe", f"{test.get('sharpe', 0):.2f}"),
-             ("Full return", _pct(full.get("net_return", 0) * 100)),
-             ("Grade", grade)]))
-    else:
-        cards.append(_stub_card("momentum", "Momentum core", d.get("mom_err")))
-
-    # 2 — vol overlay (ADOPT)
-    if vol:
-        v = _g(vol, "verdicts", "etf", "verdict", default="—")
-        garch = _g(vol, "etf", "variants", "garch", default={})
-        bh = _g(vol, "etf", "bh", default={})
-        kind = "good" if str(v).startswith("ADOPT") else "warn"
-        cards.append(_card_html("vol", "Volatility overlay", kind, _badge(v.upper(), kind),
-            "Forecast tomorrow's risk (GARCH/learned), size exposure to it. De-risk only, no leverage.",
-            [("ETF Sharpe", f"{bh.get('sharpe', 0):.2f}→{garch.get('sharpe', 0):.2f}"),
-             ("Max DD", f"{bh.get('max_dd', 0) * 100:.0f}%→{garch.get('max_dd', 0) * 100:.0f}%"),
-             ("Avg exp", f"{garch.get('avg_exposure', 1) * 100:.0f}%")]))
-    else:
-        cards.append(_stub_card("vol", "Volatility overlay", d.get("vol_err")))
-
-    # 3 — structural stack (composite)
-    ov = _g(edge, "stack", "overlay", default={}) if edge else {}
-    if ov:
-        cards.append(_card_html("edge", "Structural stack", "neutral", _badge("COMPOSITE", "neutral"),
-            "Capacity + horizon: momentum core, vol-managed to target vol. The book you'd actually run.",
-            [("Ann. return", _pct(ov.get("ann_return", 0) * 100)),
-             ("Sharpe", f"{ov.get('sharpe', 0):.2f}"),
-             ("Max DD", f"{ov.get('max_dd', 0) * 100:.0f}%")]))
-    else:
-        cards.append(_stub_card("edge", "Structural stack", d.get("edge_err") or "needs momentum core"))
-
-    # 4 — pairs (market-neutral)
-    if pairs:
-        st = _g(pairs, "bt", "runs", 1.0, "stats", default={})
-        cards.append(_card_html("pairs", "Pairs trading", "neutral", _badge("MARKET-NEUTRAL", "neutral"),
-            "Cointegration spreads, walk-forward, α/β/μ/σ frozen on the formation window.",
-            [("Live pairs", str(len(pairs.get("live", [])))),
-             ("BT Sharpe", f"{st.get('sharpe', 0):.2f}"),
-             ("BT return", _pct(st.get("net_return", 0) * 100))]))
-    else:
-        cards.append(_stub_card("pairs", "Pairs trading", d.get("pairs_err")))
-
-    # 5 — tax-loss sleeve (verdict last, whatever it is)
-    if edge:
-        sv = _g(edge, "sleeve_verdict", "verdict", default="—")
-        mc = _g(edge, "mc", default={})
-        kind = "good" if sv == "KEEP" else "crit"
-        cards.append(_card_html("taxloss", "Tax-loss sleeve", kind, _badge(sv, kind),
-            "Forced-flow seasonal: buy December's crushed losers, sell in January. Judged by a random-selection null.",
-            [("Verdict", sv),
-             ("MC p-value", f"{mc.get('p_sharpe', float('nan')):.2f}"),
-             ("vs random", f"{mc.get('strat_total', 0) * 100:+.0f}% / {mc.get('null_total_median', 0) * 100:+.0f}%")]))
-    else:
-        cards.append(_stub_card("taxloss", "Tax-loss sleeve", d.get("edge_err")))
-
-    return ('<div class="note">Every strategy in the book, ordered by weight of evidence — '
-            'return engines first, the automatically-cut sleeve last. Each card jumps to its '
-            'full section.</div>'
-            f'<div class="hubgrid">{"".join(cards)}</div>')
-
-
-def _card_html(anchor, name, kind, badge, thesis, stats):
-    bar = _BADGE[kind]
-    sh = "".join(f'<div><span class="dim">{k}</span> <b>{v}</b></div>' for k, v in stats)
-    return (f'<a href="#{anchor}" class="hubcard" style="--bar:{bar}">{badge}'
-            f'<div class="hn">{name}</div><div class="ht">{thesis}</div>'
-            f'<div class="hs">{sh}</div></a>')
-
-
-def _stub_card(anchor, name, err):
-    return (f'<a href="#{anchor}" class="hubcard" style="--bar:#666">{_badge("UNAVAILABLE", "warn")}'
-            f'<div class="hn">{name}</div><div class="ht">Not built this run — {err or "no data"}.</div>'
-            f'<div class="hs dim">see section below</div></a>')
-
-
-def _band(anchor, title, role):
-    return f'<div class="stratband" id="{anchor}"><div class="role">{role}</div><h1>{title}</h1></div>'
-
-
-def _safe(fn, *args, label=""):
-    """Render a section, converting any failure into an inline note instead of a 500."""
-    try:
-        return fn(*args)
-    except Exception as exc:                            # noqa: BLE001
-        return f'<div class="hubstub">Section {label or fn.__name__} failed: {type(exc).__name__}: {exc}</div>'
-
-
-def build_all(d: dict, public: bool = False) -> str:
-    """The strategies hub: index cards, then every strategy full-depth in conviction order."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    mom, vol, edge, pairs = d.get("mom"), d.get("vol"), d.get("edge"), d.get("pairs")
-    parts = [f"<style>{_HUB_CSS}</style>",
-             "<h1>Strategies</h1>",
-             f"<p class='dim'>generated {now} · <a href='report.html'>← portfolio</a> · "
-             "all strategies, ordered by conviction · <b>not advice</b></p>",
-             _hub_cards(d)]
-
-    # 1 — Momentum core (flagship detail)
-    if mom:
-        parts += [_band("momentum", f"Momentum core — {mom['strategy'].code}", "1 · return engine · capacity edge"),
-                  _safe(sec_intro, mom), _safe(sec_holdings, mom), _safe(sec_curve, mom),
-                  _safe(sec_perf, mom, public), _safe(sec_risk_conscious, mom, public),
-                  _safe(sec_vs_portfolio, mom, public), _safe(sec_grade, mom, public),
-                  _safe(sec_significance, mom, public), _safe(sec_yearly, mom, public),
-                  _safe(sec_timeline, mom), _safe(sec_caveat, mom)]
-    else:
-        parts += [_band("momentum", "Momentum core", "1 · return engine"),
-                  f'<div class="hubstub">Unavailable — {d.get("mom_err")}</div>']
-
-    # 2 — Volatility overlay (full artifact depth, reusing the vol page's own sections)
-    if vol:
-        parts += [_band("vol", "Volatility overlay", "2 · risk control · forecast the variance, not the mean"),
-                  _safe(V.sec_thesis, vol), _safe(V.sec_verdict, vol), _safe(V.sec_today, vol),
-                  _safe(V.sec_forecast_eval, vol), _safe(V.sec_mean_null, vol), _safe(V.sec_etf, vol),
-                  _safe(V.sec_momentum, vol), _safe(V.sec_significance, vol), _safe(V.sec_costs, vol),
-                  _safe(V.sec_method, vol)]
-    else:
-        parts += [_band("vol", "Volatility overlay", "2 · risk control"),
-                  f'<div class="hubstub">Unavailable — {d.get("vol_err")}</div>']
-
-    # 3 — Structural stack (the composite you'd run)
-    if edge:
-        parts += [_band("edge", "Structural stack", "3 · composite · capacity + horizon, vol-managed"),
-                  _safe(E.sec_edges, edge), _safe(E.sec_stack, edge)]
-    else:
-        parts += [_band("edge", "Structural stack", "3 · composite"),
-                  f'<div class="hubstub">Unavailable — {d.get("edge_err")}</div>']
-
-    # 4 — Pairs (market-neutral)
-    if pairs:
-        parts += [_band("pairs", "Pairs trading", "4 · market-neutral · statistical arbitrage"),
-                  _safe(P.sec_intro), _safe(P.sec_snapshot, pairs), _safe(P.sec_pair_charts, pairs),
-                  _safe(P.sec_backtest, pairs, public), _safe(P.sec_costs, pairs), _safe(P.sec_method)]
-    else:
-        parts += [_band("pairs", "Pairs trading", "4 · market-neutral"),
-                  f'<div class="hubstub">Unavailable — {d.get("pairs_err")}</div>']
-
-    # 5 — Tax-loss sleeve (the verdict — last)
-    if edge:
-        parts += [_band("taxloss", "Tax-loss sleeve", "5 · forced-flow seasonal · pre-registered verdict"),
-                  _safe(E.sec_verdict, edge), _safe(E.sec_today, edge), _safe(E.sec_seasonal, edge),
-                  _safe(E.sec_method, edge)]
-    else:
-        parts += [_band("taxloss", "Tax-loss sleeve", "5 · forced-flow seasonal"),
-                  f'<div class="hubstub">Unavailable — {d.get("edge_err")}</div>']
-
-    return page("Strategies", "".join(parts))
+    """Render the page — all presentation lives in strategy_ui."""
+    return ui.render(d, public)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--refresh", action="store_true")
-    ap.add_argument("--solo", action="store_true", help="momentum-only page (the old /strategy)")
-    ap.add_argument("--pairs", action="store_true",
-                    help="populate the pairs cache (the slow one-time cointegration scan)")
     args = ap.parse_args()
+    d = gather(refresh=args.refresh)
     local = ROOT / "local/strategy.html"
     local.parent.mkdir(exist_ok=True)
-    if args.pairs:
-        d = _cached_pairs(populate=True)
-        print(f"pairs cache written: {len(d['live'])} live pairs, {d['n_tested']} tested")
-        return
-    if args.solo:
-        local.write_text(build(gather(refresh=args.refresh)))
-        print(f"wrote {local}  (momentum solo {STRATEGY.code})")
-    else:
-        d = gather_all(refresh=args.refresh)
-        local.write_text(build_all(d))                  # live/local only — no docs/ export
-        built = [k for k in ("mom", "vol", "edge", "pairs") if d.get(k)]
-        print(f"wrote {local}  (strategies hub: {', '.join(built)})")
+    local.write_text(build(d))                          # live/local only — no docs/ export
+    print(f"wrote {local}  (strategy {d['strategy'].code}: registry of "
+          f"{len(d.get('registry') or [])} records)")
     if args.open:
         webbrowser.open(local.as_uri())
 

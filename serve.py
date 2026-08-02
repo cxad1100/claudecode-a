@@ -25,6 +25,8 @@ import build_scenarios_report as S
 import build_strategy_report as ST   # the Strategy page folds the momentum lab in as its lower half
 import build_vol_report as V         # vol lab — forecast-based volatility targeting
 import build_edge_report as E        # edge stack — structural edges (capacity/flows/horizon/costs)
+import build_econo_report as EC      # econophysics lab — signals vs the production gate
+import build_megacap_report as MC    # mega-cap PIT screen — size/growth/momentum arms
 
 PORT = 8000
 
@@ -36,11 +38,16 @@ PAGES = {
     "scenarios": dict(loader="/scenarios", build="/scenarios-report", snap=S.ROOT / "local/scenarios.html"),
     "vol":      dict(loader="/vol",      build="/vol-report",       snap=V.ROOT / "local/vol.html"),
     "edge":     dict(loader="/edge",     build="/edge-report",      snap=E.ROOT / "local/edge.html"),
+    "econo":    dict(loader="/econo",    build="/econo-report",     snap=EC.OUT),
+    "megacap":  dict(loader="/megacap",  build="/megacap-report",   snap=MC.ROOT / "local/megacap.html"),
 }
 
 # cross-page nav links shown in the top bar, in display order.
 # Pairs / Momentum-lab / Scenarios routes still exist (PAGES below) but are
 # unlinked — the live site is just Portfolio + the chosen Strategy.
+# The live site is Portfolio + Strategy (which now carries the adopted
+# vol-managed core). Lab pages (/vol /edge /econo) stay routable for research
+# but off the bar — killed and observational results don't share the stage.
 _NAV = [
     ("main",     "/",         "Portfolio"),
     ("strategy", "/strategy", "Strategy"),
@@ -114,6 +121,9 @@ def _inject(html: str, page: str, as_of: str | None = None,
     # break out of the loader iframe.
     html = (html.replace("href='pairs.html'", "href='/pairs' target='_top'")
                 .replace("href='momentum.html'", "href='/momentum' target='_top'")
+                .replace("href='econo.html'", "href='/econo' target='_top'")
+                .replace("href='megacap.html'", "href='/megacap' target='_top'")
+                .replace("href='edge.html'", "href='/edge' target='_top'")
                 .replace("href='report.html'", "href='/' target='_top'")
                 .replace("href='index.html'", "href='/' target='_top'"))
     return html.replace("<main>", "<main>" + _bar(page, as_of, stale, stale_msg, note), 1)
@@ -150,8 +160,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 html = P.build(d, public=False)
                 stale, as_of = None, None
             elif page == "strategy":
-                d = ST.gather_all(force=force)
-                html = ST.build_all(d, public=False)
+                d = ST.gather(force=force)
+                html = ST.build(d, public=False)
                 stale, as_of = None, None
             elif page == "vol":
                 d = V.gather(force=force)
@@ -160,6 +170,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif page == "edge":
                 d = E.gather(force=force)
                 html = E.build(d, public=False)
+                stale, as_of = None, None
+            elif page == "econo":
+                d = EC.gather()          # several minutes: full experiment re-run
+                html = EC.build(d, public=False)
                 stale, as_of = None, None
             else:  # scenarios (local-only)
                 d = S.gather(force=force)
@@ -196,6 +210,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(_loader("/vol-report" + ("?force=1" if force else "")))
         elif path == "/edge":
             self._send(_loader("/edge-report" + ("?force=1" if force else "")))
+        elif path == "/econo":
+            self._send(_loader("/econo-report" + ("?force=1" if force else "")))
+        elif path == "/megacap":
+            self._send(_loader("/megacap-report" + ("?force=1" if force else "")))
         elif path == "/report":
             self._serve_report("main", force)
         elif path == "/pairs-report":
@@ -208,6 +226,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_report("vol", force)
         elif path == "/edge-report":
             self._serve_report("edge", force)
+        elif path == "/econo-report":
+            self._serve_report("econo", force)
+        elif path == "/megacap-report":
+            self._serve_report("megacap", force)
         else:
             self.send_error(404)
 

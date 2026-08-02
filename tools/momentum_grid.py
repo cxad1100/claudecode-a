@@ -53,7 +53,8 @@ def _stats_slice(equity: pd.Series, trades: list, lo, hi, capital: float) -> dic
 
 def run_grid(prices, slippage_bps, *, sectors=None, benchmark=None, pit=None,
              configs=None, start="2018-01-01", train_end="2022-12-31", val_end=None,
-             capital=10_000.0, lookback=252, skip=21, execute_lag=0) -> dict:
+             capital=10_000.0, lookback=252, skip=21, execute_lag=0,
+             turnover=None, turn_floor=100_000.0, turn_window=6) -> dict:
     """Run each config walk-forward over [start, end]; partition each equity curve +
     trades into train (≤ train_end), validation (train_end < t ≤ val_end) and — when
     `val_end` is given — a held-out test (> val_end). `test` is the honest check: the
@@ -72,7 +73,9 @@ def run_grid(prices, slippage_bps, *, sectors=None, benchmark=None, pit=None,
     cand_dates = [d for d in rebalance_dates(prices.index, "M")
                   if len(prices.loc[:d]) >= lookback + 1 and d >= cutoff]
     elig_by_date = precompute_eligibility(prices, slippage_bps, cand_dates,
-                                          min_obs=lookback + skip, pit=pit)
+                                          min_obs=lookback + skip, pit=pit,
+                                          turnover=turnover, turn_floor=turn_floor,
+                                          turn_window=turn_window)
     score_by_date = precompute_scores(prices, cand_dates, lookback, skip)
     cells = []
     for cfg in configs:
@@ -107,6 +110,30 @@ def feasibility(cell: dict, *, capital: float = 10_000.0, fee_eur: float = 1.0) 
                 pays_for_itself=cell["full"]["net_return"] * 100.0 > drag_pct)
 
 
+def pick_top_n(grid: dict, *, n: int = 3, freq: str = "Q",
+               capital: float = 10_000.0, fee_eur: float = 1.0) -> list:
+    """Top-n cells by worst-case robustness min(train,val) within ONE rebalance
+    frequency — the ensemble picker. Averaging near-tied configs is the
+    variance-reduction answer to pick_ultimate's knife edge (a 0.02 gap in
+    min(train,val) once flipped a 0.33-vs-0.97 test Sharpe); a single-frequency
+    ensemble keeps rebalance dates aligned so the significance machinery still
+    applies. Same filters as pick_ultimate: pays for itself, positive in BOTH
+    train and validation. Never sees test."""
+    cands = []
+    for c in grid["cells"]:
+        cfreq = c.get("freq") or (c["config"].freq if c.get("config") else None)
+        if cfreq != freq:
+            continue
+        if not feasibility(c, capital=capital, fee_eur=fee_eur)["pays_for_itself"]:
+            continue
+        if c["train"]["net_return"] <= 0 or c["val"]["net_return"] <= 0:
+            continue
+        robust = min(c["train"]["sharpe"], c["val"]["sharpe"])
+        cands.append((robust, -c["trades_per_year"], c))
+    cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [c for _, _, c in cands[:n]]
+
+
 def pick_ultimate(grid: dict, *, capital: float = 10_000.0, fee_eur: float = 1.0):
     """The 'ultimate' config: among configs that pay for themselves and are positive
     in BOTH train and validation, the one maximising min(train_Sharpe, val_Sharpe) —
@@ -123,3 +150,44 @@ def pick_ultimate(grid: dict, *, capital: float = 10_000.0, fee_eur: float = 1.0
     if not cands:
         return None
     return max(cands, key=lambda x: (x[0], x[1]))[2]
+
+
+def _window_values(grid: dict, window: str, metric: str) -> list:
+    """Every config's `window` `metric` across the grid, skipping cells that lack the
+    window or carry NaN — the raw sample the distribution/percentile helpers share."""
+    out = []
+    for c in grid.get("cells", []):
+        w = c.get(window)
+        if not w:
+            continue
+        v = w.get(metric)
+        if v is not None and v == v:                       # not None, not NaN
+            out.append(float(v))
+    return out
+
+
+def grid_distribution(grid: dict, *, window: str = "test") -> dict:
+    """Distribution of every config's `window` sharpe and net_return across the WHOLE
+    grid — the honest 'complete data across all configs' summary that refuses the
+    single-best cherry-pick. Returns {"n", "sharpe", "ret"}, each metric a
+    {"n","median","lo","hi","min","max"} (lo/hi = 10th/90th pctile) or None if empty."""
+    def _summ(xs):
+        if not xs:
+            return None
+        s = pd.Series(xs, dtype=float)
+        return dict(n=len(xs), median=float(s.median()),
+                    lo=float(s.quantile(0.10)), hi=float(s.quantile(0.90)),
+                    min=float(s.min()), max=float(s.max()))
+    sh = _window_values(grid, window, "sharpe")
+    rt = _window_values(grid, window, "net_return")
+    return dict(n=max(len(sh), len(rt)), sharpe=_summ(sh), ret=_summ(rt))
+
+
+def grid_percentile(grid: dict, value: float, *, window: str = "test",
+                    metric: str = "sharpe") -> float:
+    """Percentile (0..100) of `value` among all configs' `window` `metric` — where the
+    live book sits inside the full grid. NaN if no cell qualifies."""
+    xs = _window_values(grid, window, metric)
+    if not xs:
+        return float("nan")
+    return 100.0 * sum(x <= value for x in xs) / len(xs)

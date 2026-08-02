@@ -48,30 +48,48 @@ def momentum_scores(prices: pd.DataFrame, asof, lookback: int = 252,
 
 
 def eligible(prices: pd.DataFrame, asof, slippage_bps: dict,
-             liq_max: int = 30, min_obs: int = 273, min_price: float = 1.0) -> set[str]:
+             liq_max: int = 30, min_obs: int = 273, min_price: float = 1.0,
+             turnover: pd.DataFrame | None = None, turn_floor: float = 100_000.0,
+             turn_window: int = 6) -> set[str]:
     """Tradeable names at `asof`: tight half-spread, enough history, and a last
     price >= min_price. The price floor drops sub-EUR1 penny listings whose 12-1
-    momentum is dominated by tick/illiquidity noise rather than real return."""
+    momentum is dominated by tick/illiquidity noise rather than real return.
+
+    When a monthly `turnover` frame is given (month-end index, per-ticker median daily
+    EUR turnover), a covered name must ALSO clear `turn_floor` on the median of its last
+    `turn_window` monthly values at/before `asof` — point-in-time liquidity, replacing
+    the build-time full-window gate (a mild look-ahead) for covered names. Uncovered
+    names (graveyard, pre-refresh data) keep the static build-time gate."""
     hist = prices.loc[:asof]
     last = hist.ffill().iloc[-1]                  # last valid price per ticker (vectorized)
     count = hist.notna().sum()                    # observations per ticker (vectorized)
+    tw = (turnover.loc[:asof].tail(turn_window)
+          if turnover is not None and len(turnover) else None)
     out: set[str] = set()
     for t in prices.columns:
         if slippage_bps.get(t, 10**9) > liq_max:
             continue
-        if count[t] >= min_obs and last[t] >= min_price:
-            out.add(t)
+        if count[t] < min_obs or last[t] < min_price:
+            continue
+        if tw is not None and t in tw.columns:
+            s = tw[t].dropna()
+            if len(s) and float(s.median()) < turn_floor:
+                continue
+        out.add(t)
     return out
 
 
 def precompute_eligibility(prices: pd.DataFrame, slippage_bps: dict, dates, *,
                            liq_max: int = 30, min_obs: int = 273,
-                           min_price: float = 1.0, pit=None) -> dict:
+                           min_price: float = 1.0, pit=None,
+                           turnover: pd.DataFrame | None = None,
+                           turn_floor: float = 100_000.0, turn_window: int = 6) -> dict:
     """{date: eligible ∩ listed} per date — config-independent, so the grid computes
     it once and shares it across all 64 configs (otherwise the dominant cost)."""
     out = {}
     for d in dates:
-        e = eligible(prices, d, slippage_bps, liq_max, min_obs, min_price)
+        e = eligible(prices, d, slippage_bps, liq_max, min_obs, min_price,
+                     turnover=turnover, turn_floor=turn_floor, turn_window=turn_window)
         if pit is not None:
             e = {t for t in e if pit.listed(t, d)}
         out[d] = e
@@ -185,8 +203,11 @@ def run_momentum(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 15,
                  sector_neutral: bool = False, benchmark=None,
                  trend_filter: bool = False, lazy: bool = False, pit=None,
                  execute_lag: int = 0,
+                 turnover: pd.DataFrame | None = None, turn_floor: float = 100_000.0,
+                 turn_window: int = 6,
                  elig_by_date: dict | None = None,
-                 score_by_date: dict | None = None) -> dict:
+                 score_by_date: dict | None = None,
+                 sectors_by_date: dict | None = None) -> dict:
     """Walk-forward momentum backtest.
 
     Returns {"runs": {mult: {equity, trades, stats}}, "holdings_log": [...],
@@ -202,6 +223,9 @@ def run_momentum(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 15,
     last traded price (liquidated to cash) so the backtest eats the real loss.
     `execute_lag=1` fills one bar after the signal (t+1) instead of at the signal-day
     close, removing the same-bar look-ahead; scores still use only data through `d`.
+    `sectors_by_date` ({date: {ticker: group}}) swaps the static sector map for a
+    per-rebalance grouping (e.g. trailing-correlation clusters) in the B round-robin;
+    None (default) leaves behavior byte-identical to the static `sectors` path.
     """
     dates = [d for d in rebalance_dates(prices.index, freq)
              if len(prices.loc[:d]) >= lookback + 1]
@@ -219,14 +243,17 @@ def run_momentum(prices: pd.DataFrame, slippage_bps: dict, *, k: int = 15,
         if elig_by_date is not None:                          # precomputed (grid: shared across configs)
             elig = elig_by_date.get(d, set())
         else:
-            elig = eligible(prices, d, slippage_bps, liq_max, lookback + skip, min_price)
+            elig = eligible(prices, d, slippage_bps, liq_max, lookback + skip, min_price,
+                            turnover=turnover, turn_floor=turn_floor, turn_window=turn_window)
             if pit is not None:
                 elig = {t for t in elig if pit.listed(t, d)}  # drop already-dead names
         if trend_filter and benchmark is not None and not trend_ok(benchmark, d):
             picks = []                                         # kill-switch → cash
         else:
+            group_map = (sectors_by_date.get(d, sectors)
+                         if sectors_by_date is not None else sectors)
             picks = select_topk(scores, elig, k,
-                                 sectors=sectors if sector_neutral else None)
+                                 sectors=group_map if sector_neutral else None)
         died = pit.died_between(d, dates[i + 1]) if pit is not None else set()
         dead = {t for t in picks if t in died}
         holdings_log.append(dict(date=d, next=dates[i + 1], picks=picks,

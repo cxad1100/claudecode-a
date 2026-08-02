@@ -84,11 +84,19 @@ table {{ border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.88
 th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid {GRID}; }}
 th {{ color: {FG_DIM}; font-weight: 500; font-size: 0.78rem; text-transform: uppercase;
      letter-spacing: 0.04em; }}
-td.num, th.num {{ text-align: right; }}
+td.num, th.num {{ text-align: right; white-space: nowrap; }}
 .note {{ background: {BG_PANEL}; border-left: 3px solid {ACCENT}; border-radius: 4px;
          padding: 10px 14px; margin: 12px 0; font-size: 0.88rem; }}
 .warn {{ border-left-color: {YELLOW}; }}
 .chart {{ margin: 8px 0 4px; }}
+/* side-by-side comparison (Original | Risk-conscious); collapses on narrow screens */
+.cmp {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; align-items: start; margin: 10px 0; }}
+.cmp > div {{ min-width: 0; }}          /* let tables shrink instead of overflowing */
+.cmp h3 {{ margin-top: 0; }}
+.cmp.stretch {{ align-items: stretch; }}                 /* equal-height panels */
+.cmp.stretch > .note {{ height: 100%; margin: 0; }}      /* notes fill the cell, same level */
+.cmp .pick-sub {{ min-height: 2em; margin-bottom: 6px; }} /* align table tops across columns */
+@media (max-width: 760px) {{ .cmp {{ grid-template-columns: 1fr; }} }}
 details {{ margin: 10px 0; }}
 summary {{ cursor: pointer; color: {ACCENT}; font-size: 0.9rem; }}
 a {{ color: {ACCENT}; text-decoration: none; }}

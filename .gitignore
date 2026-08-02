@@ -19,6 +19,7 @@ data/global_dead_prices.csv
 data/proxy_prices.csv
 data/proxy_meta.csv
 data/universe/universe_prices.csv
+data/universe/universe_turnover.csv
 data/universe/_candidates.csv
 data/universe/figi_cache.json
 data/universe/.tr_session/

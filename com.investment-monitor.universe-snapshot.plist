@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Monthly REMINDER (not an unattended fetch) to capture a point-in-time TR universe
+     snapshot for the Tier-1 survivorship fix. The fetch needs interactive 2FA, so this
+     only posts a notification; you run the one-liner it names. Install:
+        cp com.investment-monitor.universe-snapshot.plist ~/Library/LaunchAgents/
+        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.investment-monitor.universe-snapshot.plist
+     Remove:
+        launchctl bootout gui/$(id -u)/com.investment-monitor.universe-snapshot -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.investment-monitor.universe-snapshot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/osascript</string>
+        <string>-e</string>
+        <string>display notification "Refresh the PIT universe: cd ~/code/investment-monitor &amp;&amp; .venv/bin/python -m tools.universe_snapshot --enumerate" with title "TR universe snapshot due" sound name "Glass"</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

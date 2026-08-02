@@ -312,3 +312,19 @@ def test_pnl_color_buckets():
     assert bmr._pnl_color(-0.05, False) == "#ef4444"   # down → red
     assert bmr._pnl_color(-0.40, False) == "#7a0000"   # a lot down → dark red
     assert bmr._pnl_color(0.30, True) == "#000000"     # defaulted overrides → black
+
+
+def test_eligible_turnover_gate_is_point_in_time():
+    idx = pd.bdate_range("2024-01-02", periods=420)
+    prices = pd.DataFrame({"X": 10.0, "Y": 10.0, "Z": 10.0}, index=idx)
+    slip = {"X": 10, "Y": 10, "Z": 10}
+    months = pd.date_range("2024-01-31", periods=12, freq="ME")
+    turn = pd.DataFrame({"X": [200_000.0] * 12,
+                         "Y": [50_000.0] * 6 + [200_000.0] * 6}, index=months)
+    early, late = months[4], months[11]
+    e_early = eligible(prices, early, slip, min_obs=10, turnover=turn)
+    e_late = eligible(prices, late, slip, min_obs=10, turnover=turn)
+    assert "Y" not in e_early          # trailing 6m median 50k < 100k floor THEN
+    assert "Y" in e_late               # liquidity recovered -> eligible NOW
+    assert "X" in e_early and "Z" in e_early   # Z uncovered -> static-gate fallback
+    assert eligible(prices, early, slip, min_obs=10) == {"X", "Y", "Z"}  # None -> old behavior

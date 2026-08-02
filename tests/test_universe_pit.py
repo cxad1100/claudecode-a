@@ -55,3 +55,47 @@ def test_last_price_at_or_before_asof():
     pit = PITUniverse(_frame(), delisting={"DEAD": idx[199]})
     assert pit.last_price("DEAD") == 2.0                       # final bar before death
     assert pit.last_price("LIVE", asof=idx[0]) == 10.0          # clipped to asof
+
+
+# ── snapshot membership gate + deaths/exits split ────────────────────────────
+
+def _mprices(*tickers, start="2026-01-02", n=200):
+    idx = pd.bdate_range(start, periods=n)
+    return pd.DataFrame({t: 1.0 for t in tickers}, index=idx)
+
+
+def _store(entries):
+    return pd.DataFrame([dict(snapshot_date=d, isin=z, name="", country="")
+                         for d, z in entries])
+
+
+def test_membership_no_knowledge_before_first_snapshot():
+    pit = PITUniverse(_mprices("AAA", "BBB"), {},
+                      membership=(_store([("2026-06-01", "IA")]),
+                                  {"AAA": "IA", "BBB": "IB"}))
+    assert pit.listed("BBB", "2026-05-15")            # pre-snapshot: unrestricted
+    assert pit.listed("AAA", "2026-06-15")
+    assert not pit.listed("BBB", "2026-06-15")        # not offered at the snapshot
+
+
+def test_membership_latest_snapshot_wins():
+    store = _store([("2026-03-02", "IA"), ("2026-03-02", "IB"), ("2026-06-01", "IA")])
+    pit = PITUniverse(_mprices("AAA", "BBB"), {},
+                      membership=(store, {"AAA": "IA", "BBB": "IB"}))
+    assert pit.listed("BBB", "2026-04-01")            # in the March snapshot
+    assert not pit.listed("BBB", "2026-06-02")        # dropped by June's
+
+
+def test_membership_unknown_isin_and_empty_store_allowed():
+    pit = PITUniverse(_mprices("CCC"), {},
+                      membership=(_store([("2026-03-02", "IA")]), {}))
+    assert pit.listed("CCC", "2026-04-01")            # no ISIN → no membership claim
+    pit2 = PITUniverse(_mprices("CCC"), {}, membership=(_store([]), {"CCC": "IC"}))
+    assert pit2.listed("CCC", "2026-04-01")           # empty store → unrestricted
+
+
+def test_deaths_subset_feeds_died_between_exits_still_gate():
+    exits = {"AAA": pd.Timestamp("2026-03-02"), "BBB": pd.Timestamp("2026-03-02")}
+    pit = PITUniverse(_mprices("AAA", "BBB"), exits, deaths={"AAA": exits["AAA"]})
+    assert pit.died_between("2026-02-01", "2026-04-01") == {"AAA"}   # demoted ≠ died
+    assert not pit.listed("BBB", "2026-03-03")                       # but exit gates

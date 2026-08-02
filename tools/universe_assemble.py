@@ -43,7 +43,32 @@ def assemble_prices(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return out.loc[:, ~out.columns.duplicated()]
 
 
-def delisting_map(meta: pd.DataFrame) -> dict:
-    """meta → {ticker: Timestamp} for the dead names only (PITUniverse input)."""
+_DEATH_REASONS = {"", "delisted"}
+
+
+def death_mask(meta: pd.DataFrame) -> pd.Series:
+    """Real deaths only. The ledger (tools.universe_reconcile) records demoted/removed
+    exits with a delisting_date too — they gate eligibility but are NOT graveyard deaths.
+    Rows with no exit_reason column/value are the pre-ledger EODHD graveyard = deaths."""
+    dl = meta["delisting_date"].notna()
+    if "exit_reason" not in meta.columns:
+        return dl
+    return dl & meta["exit_reason"].fillna("").isin(_DEATH_REASONS)
+
+
+def exit_map(meta: pd.DataFrame) -> dict:
+    """meta → {ticker: Timestamp} for EVERY exited name (deaths + demotions + removals)
+    — the map that ends PIT eligibility (PITUniverse `delisting` input)."""
     d = meta.dropna(subset=["delisting_date"])
     return {r.ticker: pd.Timestamp(r.delisting_date) for r in d.itertuples(index=False)}
+
+
+def death_map(meta: pd.DataFrame) -> dict:
+    """Deaths only (PITUniverse `deaths` input — feeds died_between/graveyard stats)."""
+    d = meta[death_mask(meta)]
+    return {r.ticker: pd.Timestamp(r.delisting_date) for r in d.itertuples(index=False)}
+
+
+def delisting_map(meta: pd.DataFrame) -> dict:
+    """Back-compat alias: all exits (what gates eligibility)."""
+    return exit_map(meta)

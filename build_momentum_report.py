@@ -27,7 +27,8 @@ from tools.pairs_universe import UNIVERSE, fetch_prices
 from tools.portfolio_tools import BENCHMARKS
 from tools.data_buffer import cached_price_history
 from tools.universe_pit import PITUniverse
-from tools.universe_assemble import delisting_map
+from tools.universe_assemble import delisting_map, death_map, death_mask
+from tools import universe_snapshot
 from tools.momentum_grid import run_grid, feasibility, ALL_CONFIGS
 
 # ── Settings (one place) ──────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ REBAL_LABEL = {"M": "monthly", "W": "weekly", "Q": "quarterly"}
 ROOT = Path(__file__).parent
 PRICES_CSV = ROOT / "data" / "universe" / "universe_prices.csv"
 META_CSV = ROOT / "data" / "universe" / "universe_meta.csv"
+TURN_CSV = ROOT / "data" / "universe" / "universe_turnover.csv"   # written by fetch; absent = static gate
 # The universe is now TR-native (tools.tr_tradeable --enumerate → tools.build_tr_universe):
 # every live name is tradeable on TR by construction, so there is no separate tradeability filter.
 
@@ -89,7 +91,7 @@ def _slip(m) -> int:
 
 def gather(force: bool = False, refresh: bool | None = None, with_grid: bool = True) -> dict:
     """Load the survivorship-corrected dataset (survivors ∪ 270 dead), run the
-    walk-forward with the active graveyard, and (when `with_grid`) the 32-config
+    walk-forward with the active graveyard, and (when `with_grid`) the 64-config
     matrix. `force`/`refresh` only re-fetch the benchmark series."""
     refresh = force if refresh is None else refresh
     prices = pd.read_csv(PRICES_CSV, index_col=0, parse_dates=True)
@@ -98,7 +100,18 @@ def gather(force: bool = False, refresh: bool | None = None, with_grid: bool = T
     meta_df = pd.read_csv(META_CSV)                            # TR-native universe (already tradeable)
     meta = {r["ticker"]: dict(r) for _, r in meta_df.iterrows()}
     slip = {t: _slip(m) for t, m in meta.items() if t in prices.columns}
-    pit = PITUniverse(prices, delisting_map(meta_df))
+    sectors = {t: m.get("sector") for t, m in meta.items()}     # real GICS now (tools.enrich_sectors)
+    # PIT extras: monthly turnover (liquidity gate; absent until the next fetch), the TR
+    # snapshot store (membership gate, active from the first snapshot forward), and the
+    # exits/deaths split (ledger demotions gate eligibility but aren't graveyard deaths).
+    turnover = (pd.read_csv(TURN_CSV, index_col=0, parse_dates=True)
+                if TURN_CSV.exists() else None)
+    snap_store = universe_snapshot.load_store()
+    ticker_isin = {r["ticker"]: str(r["isin"]) for _, r in meta_df.iterrows()
+                   if pd.notna(r.get("isin"))}
+    membership = (snap_store, ticker_isin) if len(snap_store) else None
+    pit = PITUniverse(prices, delisting_map(meta_df), deaths=death_map(meta_df),
+                      membership=membership)
 
     benches = {n: v for n, v in BENCHMARKS.items() if n != "Bitcoin"}   # equities/bonds only
     bench_tickers = [tk for tk, _ in benches.values()]
@@ -106,18 +119,21 @@ def gather(force: bool = False, refresh: bool | None = None, with_grid: bool = T
     bench = bench_raw.rename(columns={tk: name for name, (tk, _) in benches.items()})
     spx = bench["S&P 500"] if "S&P 500" in bench.columns else bench.iloc[:, 0]
 
-    # No sector data on the global universe → sector-neutral (B) configs excluded from the grid.
+    # Sectors are real now (tools.enrich_sectors) → sector-neutral (B) configs join the grid.
     res = run_momentum(prices, slip, k=K, lookback=LOOKBACK, skip=SKIP, capital=CAPITAL,
                        cost_mults=COST_MULTS, freq=REBAL, liq_max=LIQ_MAX, fee_eur=FEE_EUR,
-                       min_price=MIN_PRICE, start=START, pit=pit, execute_lag=EXEC_LAG)
-    grid = (run_grid(prices, slip, sectors=None, benchmark=spx, pit=pit, start=START,
-                     configs=[c for c in ALL_CONFIGS if not c.sector_neutral],
+                       min_price=MIN_PRICE, start=START, pit=pit, execute_lag=EXEC_LAG,
+                       turnover=turnover, turn_floor=MIN_TURNOVER)
+    grid = (run_grid(prices, slip, sectors=sectors, benchmark=spx, pit=pit, start=START,
+                     configs=ALL_CONFIGS,
                      train_end=TRAIN_END, val_end=VAL_END, capital=CAPITAL,
-                     lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG)
+                     lookback=LOOKBACK, skip=SKIP, execute_lag=EXEC_LAG,
+                     turnover=turnover, turn_floor=MIN_TURNOVER)
             if with_grid else None)
 
     return dict(prices=prices, res=res, benchmarks=bench, capital=CAPITAL, meta=meta,
-                grid=grid, n_dead=int(meta_df["delisting_date"].notna().sum()),
+                grid=grid, n_dead=int(death_mask(meta_df).sum()),
+                turnover_pit=turnover is not None,
                 n_countries=len({m.get("country") for m in meta.values()} - {"—", None}))
 
 
@@ -263,6 +279,11 @@ def sec_rebalance_log(d: dict) -> str:
 
 def sec_caveat(d: dict) -> str:
     nc = d.get("n_countries", 0)
+    liq = ("Liquidity is gated <b>point-in-time</b> — every rebalance re-checks the "
+           "trailing 6-month median turnover, so there is no full-window liquidity "
+           "look-ahead" if d.get("turnover_pit") else
+           "Membership uses peak turnover over the whole window, so there is a mild "
+           "liquidity look-ahead")
     return f"""
 <div class="note warn">
 <b>Read the result as relative, not absolute — but not because of survivorship.</b>
@@ -270,12 +291,12 @@ The universe is survivorship-<i>corrected</i> (delisted/collapsed names are carr
 liquidated by the graveyard, below), and momentum barely feels it anyway: it buys
 <i>winners</i>, so it almost never holds a name into its death. The real reasons the
 headline is optimistic are <b>regime</b> (2023→ was an exceptional momentum tape) and
-<b>concentration</b> (a top-k that a few explosive names dominate, with no sector or
-geographic cap). The universe is the liquid, <b>Trade-Republic-investable</b> set across
+<b>concentration</b> (a top-k that a few explosive names dominate; sector-neutral B now
+caps single-sector piling, but there is no per-name weight cap). The universe is the liquid,
+<b>Trade-Republic-investable</b> set across
 {nc} countries, each priced off its <b>home exchange × EUR FX</b> (the Lang &amp; Schwarz
 model — NVIDIA on NASDAQ, Samsung on KRX, in their own currency converted to EUR), behind a
-≥100k/day turnover floor. Membership uses peak turnover over the whole window, so there is a
-mild liquidity look-ahead, and TR-routability is assumed from liquidity, not verified. Daily
+≥100k/day turnover floor. {liq}, and TR-routability is assumed from liquidity, not verified. Daily
 closes only — intraday execution and borrow costs (for any future short overlay) are ignored.
 </div>"""
 
@@ -339,13 +360,15 @@ def sec_grid(d: dict) -> str:
             f"{test_cells}"
             f"<td class='num mono'>{c['trades_per_year']:.0f}</td></tr>")
     test_hdr = "<th class='num'>Test ret</th><th class='num'>Test Sh</th>" if has_test else ""
-    return ("<h2>32-config grid (A·C·D·E·F)</h2>"
-            "<p class='dim'>A vol-adj · C trend-filter · D 10-slot · E quarterly · F lazy "
-            "(B sector-neutral is excluded — no sector data on this universe). Ranked by "
+    return ("<h2>64-config grid (A·B·C·D·E·F)</h2>"
+            "<p class='dim'>A vol-adj · B sector-neutral · C trend-filter · D 10-slot · E quarterly "
+            "· F lazy (B now live — real GICS sectors sourced via tools.enrich_sectors). Ranked by "
             "<b>validation</b> Sharpe; train = 2018–21 "
             "(picks the config), validation = 2022–23, <b>test = 2024→ (held out, never "
             "informs the pick)</b>. A config you'd trust holds up across all three — "
-            "especially test.</p>"
+            "especially test. <i>Basis note: these Sharpes are the pre-registered selection "
+            "criterion (arithmetic √252 per window) — intentionally not the canonical geometric "
+            "basis the strategy page's registry table quotes.</i></p>"
             "<table><tr><th>Cfg</th><th class='num'>Train ret</th><th class='num'>Train Sh</th>"
             "<th class='num'>Val ret</th><th class='num'>Val Sh</th>" + test_hdr +
             "<th class='num'>Trades/yr</th></tr>" + "".join(rows) + "</table>")
