@@ -211,3 +211,49 @@ def test_signals_no_lookahead():
     full = generate_signals(z)
     for k in (10, 50, 150):
         assert generate_signals(z.iloc[:k]).tolist() == full.iloc[:k].tolist()
+
+
+# ── half_life must be total: the live .F universe feeds it degenerate spreads ──
+
+def test_half_life_constant_spread_is_non_reverting_not_a_crash():
+    """Two near-perfectly collinear legs (cross-listings of the same issuer, which the
+    .F universe is full of) produce a numerically constant spread. statsmodels'
+    add_constant then skips its own constant column and params.iloc[1] used to raise
+    IndexError — killing the whole walk-forward scan ~18 minutes in."""
+    flat = pd.Series([3.0] * 300, index=pd.bdate_range("2020-01-01", periods=300))
+    assert half_life(flat) == float("inf")
+
+
+def test_half_life_degenerate_inputs_return_inf():
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    assert half_life(pd.Series(dtype=float)) == float("inf")          # empty
+    assert half_life(pd.Series([1.0, 2.0], index=idx[:2])) == float("inf")   # too short
+    nan = pd.Series([float("nan")] * 300, index=idx)
+    assert half_life(nan) == float("inf")
+    inf = pd.Series([float("inf")] * 300, index=idx)
+    assert half_life(inf) == float("inf")
+
+
+def test_degenerate_pair_is_filtered_not_fatal():
+    """select_pairs must survive a collinear pair and simply not select it — the
+    hl_min<=hl<=hl_max rule rejects inf through the normal path, no special case."""
+    from tools.pairs_engine import select_pairs
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    rng = np.random.default_rng(0)
+    base = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))
+    px = pd.DataFrame({"A": base, "B": base * 2.0}, index=idx)   # perfectly collinear
+    out = select_pairs(px, [("A", "B")], p_max=0.05, top_n=5)
+    assert out["selected"] == []
+    for pr in out["selected"]:
+        assert np.isfinite(pr["half_life"])
+
+
+def test_half_life_still_measures_a_real_ar1():
+    """The fix must not change a pair that previously fitted."""
+    rng = np.random.default_rng(1)
+    n, rho = 5000, -0.05
+    s = np.zeros(n)
+    for i in range(1, n):
+        s[i] = s[i - 1] + rho * s[i - 1] + rng.normal(0, 0.1)
+    hl = half_life(pd.Series(s, pd.bdate_range("2010-01-04", periods=n)))
+    assert 5 < hl < 30 and np.isfinite(hl)

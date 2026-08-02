@@ -35,10 +35,34 @@ def engle_granger(a: pd.Series, b: pd.Series) -> dict:
 
 def half_life(spread: pd.Series) -> float:
     """Mean-reversion half-life in trading days from an AR(1) fit:
-    Δs_t = c + ρ·s_{t-1} + ε  →  HL = −ln2/ρ. Non-reverting (ρ ≥ 0) → inf."""
+    Δs_t = c + ρ·s_{t-1} + ε  →  HL = −ln2/ρ. Non-reverting (ρ ≥ 0) → inf.
+
+    Total by design: a degenerate spread returns inf rather than raising. Two legs that
+    are near-perfectly collinear (the live .F universe is full of them — cross-listings
+    of the same issuer) produce a numerically CONSTANT spread. statsmodels'
+    add_constant then skips adding its own constant, the design matrix has one column,
+    and reading params.iloc[1] raised IndexError — which killed the entire walk-forward
+    scan partway through, ~18 minutes in.
+
+    inf is the honest answer, not merely a convenient one: a constant spread has no mean
+    reversion to measure. It also composes with the caller's existing
+    `hl_min <= hl <= hl_max` filter, so such a pair is rejected by the normal rule rather
+    than by a special case. Pairs that previously fitted are unaffected."""
     ds = spread.diff().dropna()
     lag = spread.shift(1).dropna()
-    rho = float(sm.OLS(ds, sm.add_constant(lag)).fit().params.iloc[1])
+    if len(lag) < 3 or not np.isfinite(lag.to_numpy()).all():
+        return float("inf")
+    if float(lag.std()) == 0.0:            # constant spread: nothing to regress on
+        return float("inf")
+    try:
+        params = sm.OLS(ds, sm.add_constant(lag)).fit().params
+    except Exception:
+        return float("inf")                # singular / pathological window
+    if len(params) < 2:                    # add_constant skipped a constant column
+        return float("inf")
+    rho = float(params.iloc[1])
+    if not np.isfinite(rho):
+        return float("inf")
     return float("inf") if rho >= 0 else float(-np.log(2.0) / rho)
 
 
