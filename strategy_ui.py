@@ -1294,9 +1294,16 @@ def _pane_strategy(d: dict, r, public: bool) -> str:
         core = _no_curve_panel(r)
     method = _fold("method / verdict", r.status,
                    "<p>" + (r.verdict or r.gate or "\u2014") + "</p>")
+    # A record promoted from the lab cache renders its own curve, so it never reaches
+    # _no_curve_panel -- which was the only place its lab link was shown. Keep the link
+    # in the header for every record that has one: the pane summarises, the lab page
+    # holds the full workings.
+    lab = (f" <a href='{r.href}' class='dim' style='font-size:0.8rem'>{r.href} \u2197</a>"
+           if r.href else "")
     return (f"<section class='pane' id='pane-rec-{r.id}' hidden>"
             f"{_crumb()}"
-            f"<h2 style='color:{r.color or theme.FG}'>{r.name} {_badge(r.status)}</h2>"
+            f"<h2 style='color:{r.color or theme.FG}'>{r.name} {_badge(r.status)}"
+            f"{lab}</h2>"
             f"{core}{_holdings_section(r)}{method}</section>")
 
 

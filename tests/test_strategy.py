@@ -1257,3 +1257,22 @@ def test_thinning_does_not_touch_window_metrics():
     rec = next(r for r in d["registry"] if r.equity is not None and r.windows)
     full = qg.window_metrics(rec.equity.dropna(), rec.equity.index[0], rec.equity.index[-1])
     assert abs(full["net_return"] - rec.windows["full"]["net_return"]) < 1e-9
+
+
+def test_promoted_records_keep_their_lab_link(tmp_path, monkeypatch):
+    """A record promoted from the cache renders its own curve, so it never reaches
+    _no_curve_panel — which used to be the only place its lab link appeared. The pane
+    summarises; the lab page holds the workings, so the way there must survive."""
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+    idx = pd.bdate_range("2018-01-01", periods=500)
+    rng = np.random.default_rng(11)
+    sc.save("pairs", pd.Series(10_000 * np.exp(np.cumsum(rng.normal(0.0002, 0.01, 500))),
+                               index=idx),
+            source="build_pairs_report", cache_dir=tmp_path)
+    rec = next(r for r in bs._ledger_records(set(), TE, VE) if r.id == "pairs")
+    assert rec.equity is not None and rec.href == "pairs.html"
+    d = _fake_d()
+    pane = ui._pane_strategy(d, rec, public=False)
+    assert "class='chart'" in pane                 # it has its curve
+    assert "pairs.html" in pane                    # and still points at the lab
