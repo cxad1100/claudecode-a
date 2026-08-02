@@ -2,6 +2,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import build_strategy_report as bs
 import strategy_ui as ui
@@ -11,6 +12,19 @@ from tools.momentum import run_momentum
 from tools.momentum_grid import _stats_slice, MomentumConfig
 
 TE, VE = "2019-06-30", "2019-09-30"          # fixture window boundaries
+
+
+@pytest.fixture(autouse=True)
+def _isolated_strategy_cache(tmp_path, monkeypatch):
+    """Every test here runs against an EMPTY cross-page strategy cache.
+
+    build_registry reads tools/strategy_cache to promote ledger records that a lab has
+    computed a curve for. Without this fixture the suite would pass or fail depending on
+    whether anyone had run `--gather-labs` on the machine — the tests that need a cached
+    artifact create one themselves."""
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path / "strategy_cache")
+
 
 
 def _fake_d(megacap_arms=None):
@@ -1028,3 +1042,195 @@ def test_master_detail_shell_and_reframe():
     assert "class='app'" in html
     assert "internal comparison" in html.lower()             # survivorship banner
     assert "megacap.html" in html and "awaiting" in html.lower()
+
+
+# ── Left menu: every strategy and variant is its own entry with its own pane ──────
+
+def test_every_registry_record_gets_a_menu_entry_and_a_pane():
+    """The menu is the index of the whole program: every record the registry produced —
+    live books, variants, references, benchmarks, your real portfolio, and the ledger —
+    is selectable and opens its own pane. A record with no entry is a strategy the page
+    silently hid."""
+    d = _fake_d()
+    html = bs.build(d, public=False)
+    for r in d["registry"]:
+        assert f"data-pane='rec-{r.id}'" in html, f"{r.id} has no menu entry"
+        assert f"id='pane-rec-{r.id}'" in html, f"{r.id} has no pane"
+    assert len(ui._paned_records(d)) == len(d["registry"])
+
+
+def test_menu_groups_benchmarks_the_book_and_the_ledger():
+    d = _fake_d()
+    spine = ui._spine(d)
+    for title in ("Benchmarks", "Your portfolio", "Momentum"):
+        assert title in spine
+    # the ledger strategies are present and marked as the file-drawer, not hidden
+    assert "data-pane='rec-pairs'" in spine and "s-led" in spine
+
+
+def test_menu_marks_records_that_have_no_curve():
+    """A hollow dot is the promise that the pane behind it will be honest about the gap."""
+    d = _fake_d()
+    spine = ui._spine(d)
+    assert "dot hollow" in spine                      # ledger rows carry no curve
+    curved = [r for r in d["registry"] if r.equity is not None]
+    assert curved, "fixture should have curve-bearing records"
+
+
+def test_curveless_pane_states_the_gap_and_invents_nothing():
+    """The old pane rendered a bare 'Awaiting data' box. It must instead say plainly that
+    no curve is cached, link to the lab that owns the workings, and show the fields the
+    record really carries — never a fabricated Sharpe or return."""
+    r = next(x for x in sreg.STATIC_RECORDS if x.id == "pairs")
+    html = ui._no_curve_panel(r)
+    assert "No equity curve is cached" in html
+    assert "pairs.html" in html                       # link to the real workings
+    assert "Research only" in html                    # why it is in the ledger
+    assert "class='chart'" not in html                # no chart
+    assert "class='cards'" not in html                # no stat tiles
+    assert "Sharpe" not in html                       # no invented metric
+
+
+def test_ledger_panes_render_the_honest_panel():
+    d = _fake_d()
+    r = next(x for x in d["registry"] if x.id == "edge_taxloss")
+    pane = ui._pane_strategy(d, r, public=False)
+    assert "No equity curve is cached" in pane and "edge.html" in pane
+
+
+def test_portfolio_pane_shows_its_metrics_and_its_own_faithful_chart():
+    """The real book has window metrics but no rebasable curve — its pane must still show
+    real output (its metrics + the cash-flow-matched chart), not the curve-less panel."""
+    d = _fake_d()
+    r = next(x for x in d["registry"] if x.id == "portfolio")
+    pane = ui._pane_strategy(d, r, public=False)
+    assert "No equity curve is cached" not in pane
+    assert "class='cards'" in pane                    # stat tiles from its windows
+    assert "cash-flow-matched" in pane                # its own faithful panel
+
+
+# ── Overview: strategies + benchmarks + the real book on one comparison page ──────
+
+def test_overview_head_to_head_puts_book_strategies_and_benchmarks_on_one_axis():
+    d = _fake_d()
+    home = ui._pane_compare_all(d, public=False)
+    assert "Head-to-head" in home
+    assert "Your portfolio (real)" in home
+    # it must disclose that the bases differ rather than implying a clean comparison
+    assert "Basis differs by line" in home
+
+
+def test_head_to_head_is_rebased_at_the_books_start_not_the_strategies():
+    d = _fake_d()
+    start = d["portfolio_roi"].dropna().index[0].strftime("%Y-%m-%d")
+    assert start in ui._chart_since_book(d, public=False)
+
+
+def test_head_to_head_is_private_only():
+    assert ui._chart_since_book(_fake_d(), public=True) == ""
+
+
+def test_head_to_head_absent_without_a_real_book():
+    d = _fake_d()
+    d["portfolio_roi"] = None
+    assert ui._chart_since_book(d, public=False) == ""
+
+
+def test_comparison_chart_carries_every_strategy_including_the_reference():
+    """'Every strategy' includes the inflated raw reference — but dashed and off by
+    default, so it is available without silently flattering the picture."""
+    d = _fake_d()
+    chart = ui._chart_all(d, public=False)
+    assert "reference, inflated" in chart
+    assert "legendonly" in chart
+
+
+# ── Ledger promotion from the cross-page lab cache ────────────────────────────────
+
+def test_cached_lab_curve_promotes_a_ledger_record(tmp_path, monkeypatch):
+    """When a lab has left a cached curve, the ledger record stops being a dead link and
+    becomes a full curve-bearing strategy with real window metrics."""
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+    idx = pd.bdate_range("2018-01-01", periods=500)
+    rng = np.random.default_rng(3)
+    curve = pd.Series(10_000 * np.exp(np.cumsum(rng.normal(0.0004, 0.01, 500))), index=idx)
+    sc.save("pairs", curve, source="build_pairs_report", cache_dir=tmp_path,
+            cost_model="half-spread", avg_exposure=0.5)
+
+    recs = bs._ledger_records(set(), TE, VE)
+    pairs = next(r for r in recs if r.id == "pairs")
+    assert pairs.equity is not None
+    assert pairs.windows["test"]["sharpe"] == pairs.windows["test"]["sharpe"]   # not NaN
+    assert pairs.cost_model == "half-spread"
+    assert "lab run" in pairs.verdict          # staleness is stamped, never hidden
+    assert "build_pairs_report" in pairs.verdict
+    # everything without an artifact passes through untouched
+    taxloss = next(r for r in recs if r.id == "edge_taxloss")
+    assert taxloss.equity is None
+
+
+def test_uncached_ledger_records_are_unchanged(tmp_path, monkeypatch):
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+    recs = bs._ledger_records(set(), TE, VE)
+    assert {r.id for r in recs} == {r.id for r in sreg.STATIC_RECORDS}
+    assert all(r.equity is None for r in recs)
+
+
+def test_a_new_lab_variant_reaches_the_menu_with_no_code_change(tmp_path, monkeypatch):
+    """A lab that registers a brand-new variant in the cache earns a menu entry and a
+    pane purely from its own metadata — the framework contract for future strategies."""
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+    idx = pd.bdate_range("2018-01-01", periods=400)
+    rng = np.random.default_rng(4)
+    curve = pd.Series(10_000 * np.exp(np.cumsum(rng.normal(0.0003, 0.009, 400))), index=idx)
+    sc.save("vol_har", curve, source="build_vol_report", cache_dir=tmp_path,
+            name="HAR-RV vol overlay", family="vol-managed core", status="candidate",
+            href="vol.html")
+    recs = bs._ledger_records(set(), TE, VE)
+    har = next(r for r in recs if r.id == "vol_har")
+    assert har.name == "HAR-RV vol overlay" and har.family == "vol-managed core"
+    assert har.status == "candidate" and har.equity is not None
+
+
+def test_cache_never_overrides_a_live_record(tmp_path, monkeypatch):
+    """A stale artifact must never shadow a strategy this run actually computed."""
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+    idx = pd.bdate_range("2018-01-01", periods=300)
+    sc.save("mom_rc", pd.Series(range(300), index=idx, dtype=float),
+            source="stale", cache_dir=tmp_path, name="Impostor", family="momentum")
+    recs = bs._ledger_records({"mom_rc"}, TE, VE)
+    assert not any(r.id == "mom_rc" for r in recs)
+
+
+def test_lab_variants_are_on_the_chart_but_start_hidden(tmp_path, monkeypatch):
+    """A lab with a dozen forecaster variants must not swamp the comparison chart. Every
+    one is still ON the axis — just one legend click away rather than drawn by default."""
+    from tools import strategy_cache as sc
+    monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+    idx = pd.bdate_range("2018-01-01", periods=500)
+    rng = np.random.default_rng(7)
+    for name in ("vol_etf_har", "vol_etf_ridge"):
+        sc.save(name, pd.Series(10_000 * np.exp(np.cumsum(rng.normal(0.0004, 0.008, 500))),
+                                index=idx),
+                source="build_vol_report", cache_dir=tmp_path,
+                name=f"{name} overlay", family="vol-managed core", status="variant")
+    recs = bs._ledger_records(set(), TE, VE)
+    lab = [r for r in recs if r.id.startswith("vol_etf_")]
+    assert len(lab) == 2
+    assert all("lab_variant" in r.flags for r in lab)
+    assert all(r.equity is not None for r in lab)
+
+    d = _fake_d()
+    d["registry"] = list(d["registry"]) + lab
+    sreg.assign_colors(d["registry"])
+    chart = ui._chart_all(d, public=False)
+    for r in lab:
+        assert r.name in chart                       # present on the axis
+    assert chart.count("legendonly") >= 2            # but not drawn by default
+    # and each still earns its own menu entry + pane
+    spine = ui._spine(d)
+    assert all(f"data-pane='rec-{r.id}'" in spine for r in lab)

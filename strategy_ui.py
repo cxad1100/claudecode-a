@@ -103,8 +103,13 @@ main {{ max-width: 1360px; }}
 .spine .s-rec {{ padding-left: 22px; font-size: 0.85rem; color: {theme.FG_DIM}; }}
 .spine .s-rec.active {{ color: #fff; }}
 .spine .s-fam {{ margin-top: 12px; }}
+.spine .s-led {{ opacity: 0.62; }}
+.spine .s-led.active {{ opacity: 1; }}
 .spine .dot {{ width: 9px; height: 9px; border-radius: 50%; flex: none;
           box-shadow: 0 0 0 1px rgba(255,255,255,0.14); }}
+/* hollow = record carries no equity curve (verdict-only pane) */
+.spine .dot.hollow {{ background: none; border: 1.5px solid {theme.FG_DIM};
+          box-shadow: none; }}
 .spine .s-sep {{ border: 0; border-top: 1px solid {theme.GRID}; margin: 12px 2px; }}
 .pane[hidden] {{ display: none; }}
 .pane > .crumb {{ margin: 0 0 10px; font-size: 0.78rem; color: {theme.FG_DIM}; }}
@@ -900,17 +905,22 @@ def _fam_color(members: list) -> str:
 
 
 _MENU_TITLE = {"momentum": "Momentum", "vol-managed core": "Vol-managed core",
-               "mega-cap": "Mega-cap"}
+               "mega-cap": "Mega-cap", "edge": "Edge", "pairs": "Pairs",
+               "econo": "Econophysics", "benchmark": "Benchmarks",
+               "your book": "Your portfolio"}
+
+# Ledger statuses render dimmed in the menu — they are real entries with real panes,
+# but they are the file-drawer (tried, not promoted), not the live book.
+_LEDGER_STATUS = ("killed", "cut", "research")
 
 
 def _paned_records(d: dict) -> list:
-    """Every strategy that earns a left-menu entry + a detail pane: the curve-bearing
-    books (adopted/candidate/variant) plus the mega-cap incubating card."""
-    recs = [r for r in sreg.family_ordered(d.get("registry") or [])
-            if r.status in ("adopted", "candidate", "variant")]
-    inc = [r for r in sreg.family_ordered(d.get("registry") or [])
-           if r.status == "research" and r.id == "megacap"]
-    return recs + inc
+    """EVERY registry record earns a left-menu entry and a detail pane — the live books
+    and their variants, the references, the benchmarks, your real portfolio, and the
+    ledger (killed / cut / cross-page research). family_ordered keeps each family's
+    variants contiguous and ranks families by their best status, so the menu reads
+    live-money-first and never splits a family."""
+    return list(sreg.family_ordered(d.get("registry") or []))
 
 
 def _menu_name(r) -> str:
@@ -923,9 +933,10 @@ def _crumb() -> str:
 
 
 def _spine(d: dict) -> str:
-    """The left menu: Overview + one entry per strategy, grouped by family —
-    strategies ONLY, no research/ops/lab entries. Every entry is a
-    <button data-pane=…>; the router swaps the matching stage pane."""
+    """The left menu: Overview + one entry per registry record, grouped by family.
+    Every strategy and every variant is its own entry with its own pane — the live
+    books, their variants, the benchmarks, your real portfolio and the ledger. Each
+    entry is a <button data-pane=…>; the router swaps the matching stage pane."""
     recs = _paned_records(d)
     items = ["<button data-pane='home' class='s-home'>\u25a6 Overview \u2014 all strategies</button>"]
     for fam in list(dict.fromkeys(r.family for r in recs)):
@@ -934,10 +945,16 @@ def _spine(d: dict) -> str:
                      f"style='padding:8px 8px 2px'>{_MENU_TITLE.get(fam, fam.capitalize())}</span></div>")
         for r in members:
             star = "\u2605 " if r.live else ""
+            cls = "s-rec" + (" s-led" if r.status in _LEDGER_STATUS else "")
+            col = r.color or theme.FG_DIM
+            # Hollow dot = this record carries no equity curve, so a data gap is
+            # visible in the menu before you click into the pane.
+            dot = (f"<span class='dot' style='background:{col}'></span>"
+                   if r.equity is not None
+                   else f"<span class='dot hollow' style='border-color:{col}'></span>")
             items.append(
-                f"<button data-pane='rec-{r.id}' class='s-rec'>"
-                f"<span class='dot' style='background:{r.color or theme.FG_DIM}'></span>"
-                f"{star}{_menu_name(r)}</button>")
+                f"<button data-pane='rec-{r.id}' class='{cls}' "
+                f"title='{r.status} &#183; {r.name}'>{dot}{star}{_menu_name(r)}</button>")
     return f"<nav class='spine'>{''.join(items)}</nav>"
 
 
@@ -948,16 +965,26 @@ def _chart_all(d: dict, public: bool) -> str:
     reads as a loser; it gets its own faithful cash-flow-matched panel (sec_portfolio_roi)."""
     window = _equity_window(d["res"])
     recs = [r for r in sreg.family_ordered(d.get("registry") or [])
-            if r.equity is not None and "inflated" not in r.flags
-            and r.status in ("adopted", "candidate", "variant")]
+            if r.equity is not None
+            and r.status in ("adopted", "candidate", "variant", "reference")]
     fig = go.Figure()
     for r in recs:
         srs = r.equity.reindex(window).ffill().dropna()
         if len(srs) < 2:
             continue
+        # The inflated raw reference IS on the axis (every strategy is), but dashed and
+        # off by default: it overstates (survivorship + full exposure), so it must never
+        # dominate the picture by accident. Click its legend entry to bring it in.
+        infl = "inflated" in r.flags
+        lab = "lab_variant" in r.flags
         nm = f"\u2605 {r.name}" if r.live else r.name
-        fig.add_trace(go.Scatter(x=srs.index, y=srs / srs.iloc[0] * 100.0, name=nm,
-                                 line=dict(color=r.color, width=2.6 if r.live else 1.8)))
+        if infl:
+            nm += " \u2014 reference, inflated"
+        fig.add_trace(go.Scatter(
+            x=srs.index, y=srs / srs.iloc[0] * 100.0, name=nm,
+            visible="legendonly" if (infl or lab) else True,
+            line=dict(color=r.color, width=2.6 if r.live else 1.8,
+                      dash="dash" if infl else "solid")))
     ew = d.get("ew_eq")
     if ew is not None:
         srs = ew.reindex(window).ffill().dropna()
@@ -972,6 +999,79 @@ def _chart_all(d: dict, public: bool) -> str:
     fig.update_layout(height=520, yaxis_title="Index (start = 100)",
                       hovermode="x unified", margin=dict(t=20))
     return f"<div class='chart'>{fig_html(fig)}</div>"
+
+
+def _chart_since_book(d: dict, public: bool) -> str:
+    """The head-to-head the Overview owes you: every strategy, the benchmarks AND your
+    real book on ONE axis, all rebased to 100 at the date your book started. The
+    full-history chart above cannot show your book (it would rebase to a late stub);
+    restricting the window to your book's own life is what makes them comparable.
+
+    Honest about its own basis: the strategy/benchmark lines are time-weighted buy-hold
+    of a fixed capital, your book's line is cumulative ROI (contributions timed), so this
+    is the indicative view — the exact cash-flow-matched comparison is the panel below."""
+    pr = d.get("portfolio_roi")
+    if public or pr is None or getattr(pr, "empty", True):
+        return ""
+    pr = pr.dropna()
+    if len(pr) < 5:
+        return ""
+    start = pr.index[0]
+    window = _equity_window(d["res"])
+    window = window[window >= start]
+    if len(window) < 5:
+        return ""
+
+    def rebase(srs):
+        srs = srs.reindex(window).ffill().dropna()
+        return srs / srs.iloc[0] * 100.0 if len(srs) >= 2 else None
+
+    fig = go.Figure()
+    for name, curve in benchmark_curves(d["benchmarks"], window, d["capital"]).items():
+        y = rebase(curve)
+        if y is not None:
+            fig.add_trace(go.Scatter(x=y.index, y=y, name=name, line=dict(width=1.2)))
+    ew = d.get("ew_eq")
+    if ew is not None:
+        y = rebase(ew)
+        if y is not None:
+            fig.add_trace(go.Scatter(x=y.index, y=y, name="Equal-weight baseline",
+                                     line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
+    for r in sreg.family_ordered(d.get("registry") or []):
+        if r.equity is None or r.status not in ("adopted", "candidate", "variant",
+                                                "reference"):
+            continue
+        y = rebase(r.equity)
+        if y is None:
+            continue
+        infl = "inflated" in r.flags
+        lab = "lab_variant" in r.flags
+        nm = f"\u2605 {r.name}" if r.live else r.name
+        if infl:
+            nm += " \u2014 reference, inflated"
+        fig.add_trace(go.Scatter(
+            x=y.index, y=y, name=nm, visible="legendonly" if (infl or lab) else True,
+            line=dict(color=r.color, width=2.6 if r.live else 1.8,
+                      dash="dash" if infl else "solid")))
+    book = rebase(1.0 + pr / 100.0)                 # your real book, thick white, on top
+    if book is not None:
+        fig.add_trace(go.Scatter(x=book.index, y=book,
+                                 name="\u2605 Your portfolio (real)",
+                                 line=dict(color="#ffffff", width=3.0)))
+    fig.add_hline(y=100, line_dash="dash", line_color=theme.FG_DIM, line_width=1)
+    fig.update_layout(height=460, yaxis_title="Index (start = 100)",
+                      hovermode="x unified", margin=dict(t=20))
+    ds = start.strftime("%Y-%m-%d")
+    return (f"<h2>Head-to-head \u2014 every strategy, the benchmarks and your book "
+            f"(from {ds})</h2>"
+            "<p class='legend'>the same axis, all rebased to 100 on the day your book "
+            f"started ({ds}) \u2014 the only window where your real money and the "
+            "strategies are comparable. Your book is in white. <b>Basis differs by "
+            "line:</b> strategy and benchmark curves are time-weighted buy-hold of a "
+            "fixed capital; your book is cumulative ROI, so its contributions are timed "
+            "\u2014 read this as indicative, and the cash-flow-matched panel below as the "
+            "exact comparison.</p>"
+            f"<div class='chart'>{fig_html(fig)}</div>")
 
 
 def sec_portfolio_roi(d: dict, public: bool) -> str:
@@ -1014,8 +1114,12 @@ def _pane_compare_all(d: dict, public: bool) -> str:
             + sec_command(d, public) + sec_headline(d)
             + "<h2>Walk-forward equity \u2014 all strategies vs benchmarks</h2>"
             "<p class='legend'>index = 100 at common start; click legend entries to "
-            "toggle lines; pick a strategy in the menu for its detail</p>"
+            "toggle lines. Every strategy is on this axis \u2014 the lab forecaster "
+            "variants and the inflated raw reference start hidden so they cannot swamp "
+            "the picture; click them in the legend to bring them in. Pick any strategy "
+            "in the left menu for its own page.</p>"
             + _chart_all(d, public)
+            + _chart_since_book(d, public)
             + sec_portfolio_roi(d, public)
             + sec_registry(d, public)
             + sec_yearly_compare(d, public)
@@ -1111,16 +1215,53 @@ def _holdings_section(r) -> str:
             + head + latest_tbl + hist_tbl)
 
 
+_LEDGER_WHY = {
+    "killed": "Killed \u2014 it failed its pre-registered test. Kept visible on purpose: "
+              "the file-drawer is part of the evidence.",
+    "cut": "Cut \u2014 it passed nothing that justified live money.",
+    "research": "Research only \u2014 never promoted to the live book.",
+}
+
+
+def _no_curve_panel(r) -> str:
+    """The honest pane for a record with no equity curve: say plainly that no curve is
+    cached for it, why, and where the real workings live \u2014 never a blank box and never
+    an invented number. Everything the record DOES carry is shown."""
+    why = _LEDGER_WHY.get(r.status,
+                          "No equity curve is cached for this record.")
+    rows = [("Family", r.family), ("Status", r.status)]
+    for label, val in (("Since", r.since), ("Adopted", r.adopted),
+                       ("Cost model", r.cost_model), ("Gate", r.gate)):
+        if val:
+            rows.append((label, val))
+    tbl = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
+    if r.href:
+        link = (f"<p>Full workings, curves and charts live on its lab page: "
+                f"<a href='{r.href}'>{r.href} \u2197</a></p>")
+    else:
+        link = ("<p class='dim'>No lab page registered. Populate this strategy's curve "
+                "with <span class='mono'>python build_strategy_report.py "
+                "--gather-labs</span>.</p>")
+    return (f"<div class='note'>{why}<br><b>No equity curve is cached for this "
+            "strategy, so no chart, stat tiles or window metrics are shown here \u2014 "
+            f"rather than fabricated ones.</b>{link}</div>"
+            f"<table><tr><th>Field</th><th>Value</th></tr>{tbl}</table>")
+
+
 def _pane_strategy(d: dict, r, public: bool) -> str:
-    """One strategy's detail pane — the SAME uniform template for every strategy:
-    equity curve vs benchmark, key-stat tiles, the train/val/test/full windows table,
-    and a method/verdict fold. Curve-less research rows (mega-cap) show their pending
-    state instead of a chart."""
+    """One record's detail pane \u2014 the SAME uniform template for every entry in the
+    menu: equity curve vs benchmarks, key-stat tiles, the train/val/test/full windows
+    table, and a method/verdict fold. A record with metrics but no rebasable curve (your
+    real cash-flow-timed book) shows its metrics plus its own faithful chart; a record
+    with neither shows what it DOES carry and links to its lab page."""
     if r.equity is not None:
         core = _strat_curve(d, r) + _strat_stats(r) + _strat_windows(r)
+    elif r.windows:
+        # Metrics exist but the curve is not rebasable onto the strategies' multi-year
+        # axis \u2014 your real book is cash-flow-timed, so it gets its own faithful panel.
+        core = _strat_stats(r) + _strat_windows(r) + sec_portfolio_roi(d, public)
     else:
-        core = ("<div class='note warn'>" + (r.gate or "Awaiting data \u2014 no live "
-                "results yet.") + "</div>")
+        core = _no_curve_panel(r)
     method = _fold("method / verdict", r.status,
                    "<p>" + (r.verdict or r.gate or "\u2014") + "</p>")
     return (f"<section class='pane' id='pane-rec-{r.id}' hidden>"

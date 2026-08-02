@@ -16,6 +16,7 @@ automatically); ledger-only entries go to tools/strategy_registry.STATIC_RECORDS
 import argparse
 import os
 import sys
+import time
 import webbrowser
 
 import numpy as np
@@ -34,6 +35,7 @@ from tools.portfolio_tools import BENCHMARKS, parse_portfolio
 from tools.portfolio_analytics import build_roi_timeseries
 from tools.data_buffer import cached_price_history
 from tools import strategy_registry as sreg
+from tools import strategy_cache as scache
 from build_momentum_report import (
     PRICES_CSV, META_CSV, TURN_CSV, ROOT, LOOKBACK, SKIP, START, LIQ_MAX, MIN_PRICE, CAPITAL,
     FEE_EUR, COST_MULTS, TRAIN_END, VAL_END, WINSOR_CAP, EXEC_LAG, K, MIN_TURNOVER,
@@ -529,9 +531,67 @@ def build_registry(variants: list, *, ensemble=None, vol_core=None, vol_core_eq=
             "megacap", "Mega-cap PIT screen — size / growth / momentum", "mega-cap",
             "research", href="megacap.html",
             gate=mc_gate, verdict=mc_verdict, flags=mc_flags))
-    recs.extend(sreg.STATIC_RECORDS)
+    recs.extend(_ledger_records({r.id for r in recs}, train_end, val_end))
     sreg.assign_colors(recs)
     return recs
+
+
+def _ledger_records(claimed_ids: set, train_end, val_end) -> list:
+    """The ledger rows, upgraded wherever a lab left a cached curve.
+
+    STATIC_RECORDS carry a verdict and an href but no equity, so their panes have nothing
+    to draw. `build_strategy_report.py --gather-labs` runs each lab once and distils its
+    result into tools/strategy_cache; here we promote any record whose curve is cached to
+    a full curve-bearing record, so its pane renders the same uniform template
+    (curve + stat tiles + train/val/test/full windows) as the live books.
+
+    Two rules keep this honest: a record with no cached artifact passes through unchanged
+    (the pane then says plainly that no curve is cached), and every promoted record's
+    verdict is stamped with the age of the lab run behind it, so a stale curve is never
+    presented as though it were computed just now."""
+    cache = scache.load_all()
+    out = []
+    for r in sreg.STATIC_RECORDS:
+        art = cache.pop(r.id, None)
+        if not art or art.get("equity") is None:
+            out.append(r)                        # nothing cached — say so, do not invent
+            continue
+        meta = art.get("meta") or {}
+        stamp = scache.age_label(art)
+        out.append(sreg.make_record(
+            r.id, r.name, r.family, r.status,
+            equity=art["equity"], train_end=train_end, val_end=val_end,
+            variant_of=r.variant_of, gate=r.gate, href=r.href, flags=r.flags,
+            cost_model=meta.get("cost_model") or r.cost_model,
+            avg_exposure=meta.get("avg_exposure"),
+            verdict=f"{r.verdict} [curve from {art.get('source', 'lab')}, {stamp}]"))
+    # Artifacts with no matching static record are strategies the labs registered on their
+    # own (the vol-forecaster variants, the econophysics cells). They describe themselves
+    # entirely through their own metadata, so a new lab variant reaches the menu without
+    # any edit here.
+    for sid, art in sorted(cache.items()):
+        if sid in claimed_ids:                   # a live record already owns this id
+            continue
+        meta = art.get("meta") or {}
+        if not meta.get("name"):
+            continue
+        status = meta.get("status", "research")
+        if status not in sreg.STATUSES:
+            status = "research"
+        out.append(sreg.make_record(
+            sid, meta["name"], meta.get("family", "lab"), status,
+            equity=art.get("equity"), train_end=train_end, val_end=val_end,
+            gate=meta.get("gate"), href=meta.get("href"),
+            cost_model=meta.get("cost_model", ""),
+            avg_exposure=meta.get("avg_exposure"),
+            variant_of=meta.get("variant_of"),
+            # Marks a curve that came from a lab rather than from this page's own run.
+            # The comparison charts start these off (one legend click away) so that a
+            # lab with a dozen forecaster variants cannot swamp the picture.
+            flags=("lab_variant",),
+            verdict=f"{meta.get('verdict', '')} [curve from "
+                    f"{art.get('source', 'lab')}, {scache.age_label(art)}]".strip()))
+    return out
 
 
 def _delisting_stress(prices, slip, meta_df, sectors, spx, cfg, res, base_return,
@@ -1050,11 +1110,161 @@ def build(d: dict, public: bool = False) -> str:
     return ui.render(d, public)
 
 
+# ── Lab gathering: fill the cross-page strategy cache ─────────────────────────────
+#
+# Several strategies in the left menu are computed by OTHER pages, and far too slowly to
+# run inline on every strategy-page build (the pairs cointegration scan alone is ~10
+# minutes). Each function below runs one lab once and distils its result into
+# tools/strategy_cache, so the strategy page can render a real curve for that strategy in
+# milliseconds. Ordered cheapest-first in _LABS; each is independently fallible.
+
+def _lab_edge(force: bool) -> list:
+    """The tax-loss rebound sleeve and the edge stack (build_edge_report)."""
+    import build_edge_report as E
+    d = E.gather(force=force)
+    saved = []
+    seasonal = d.get("seasonal")
+    if seasonal is not None and seasonal.get("equity") is not None:
+        v = (d.get("sleeve_verdict") or {}).get("verdict", "")
+        scache.save("edge_taxloss", seasonal["equity"], source="build_edge_report",
+                    cost_model="slip + EUR1/order",
+                    gate=f"pre-registered sleeve gate: {v}" if v else None)
+        saved.append("edge_taxloss")
+    stack = d.get("stack")
+    if stack and (stack.get("overlay") or {}).get("equity") is not None:
+        scache.save("edge_stack", stack["overlay"]["equity"], source="build_edge_report",
+                    cost_model="5bp band-rebalance + EUR1",
+                    avg_exposure=stack["overlay"].get("avg_exposure"))
+        saved.append("edge_stack")
+    return saved
+
+
+def _lab_vol(force: bool) -> list:
+    """Every vol-forecaster variant on every tradeable underlying (build_vol_report).
+
+    The ^GSPC proxy is deliberately excluded: it exists to SCORE forecasts, not to be
+    presented as a strategy you could hold. The adopted ETF variant is cached under the
+    id `vol_core`, which the live registry already claims — so it is used only as a
+    fallback when this run could not compute the core itself, never as a duplicate."""
+    import build_vol_report as V
+    d = V.gather(force=force)
+    adopted = ((d.get("verdicts") or {}).get("etf") or {}).get("method")
+    saved = []
+    for ukey, u in (("etf", d.get("etf")), ("mom", d.get("mom"))):
+        if not u:
+            continue
+        for method, v in (u.get("variants") or {}).items():
+            eq = v.get("equity")
+            if eq is None:
+                continue
+            sid = "vol_core" if (ukey == "etf" and method == adopted) else f"vol_{ukey}_{method}"
+            is_adopted = sid == "vol_core"
+            scache.save(
+                sid, eq, source="build_vol_report",
+                name=f"{V.METHOD_LABEL.get(method, method)} overlay on {u['name']}",
+                family="vol-managed core",
+                status="adopted" if is_adopted else "variant",
+                variant_of=None if is_adopted else "vol_core",
+                href="vol.html", cost_model="5bp band-rebalance + EUR1",
+                avg_exposure=v.get("avg_exposure"),
+                gate=("ADOPTED by the pre-registered overlay gate" if is_adopted
+                      else f"variant scanned by the overlay gate (adopted: {adopted})"),
+                verdict=f"{method} forecast, vol-targeted to {V.TARGET_VOL:.0%}.")
+            saved.append(sid)
+    return saved
+
+
+def _lab_pairs(force: bool) -> list:
+    """The cointegration book (build_pairs_report) — the slow one, ~10 minutes."""
+    import build_pairs_report as P
+    d = P.gather(force=force)
+    runs = (d.get("bt") or {}).get("runs") or {}
+    eq = (runs.get(1.0) or {}).get("equity")
+    if eq is None:
+        return []
+    scache.save("pairs", eq, source="build_pairs_report",
+                cost_model=f"EUR{P.FEE_EUR:.0f}/order + per-leg half-spread",
+                gate=f"{len(d.get('live') or [])} live pairs of "
+                     f"{d.get('n_tested', 0)} tested")
+    return ["pairs"]
+
+
+def _lab_econo(force: bool) -> list:
+    """The econophysics cells (build_econo_report) — the most expensive lab by far, and
+    the one most likely to be missing its scraped inputs. Opt-in only."""
+    import build_econo_report as EC
+    d = EC.gather(force=force)
+    saved = []
+    for sid, keys in (("econo_leadlag", ("leadlag",)), ("econo_cluster", ("corr",)),
+                      ("econo_arthrottle", ("phase",)), ("econo_nn", ("ml",))):
+        block = d.get(keys[0])
+        if not isinstance(block, dict):
+            continue
+        # Each module reports a list of trial cells; take the cell the module itself
+        # nominates as its headline, else the first with a usable curve.
+        cells = block.get("cells") or block.get("trials") or []
+        eq = None
+        for c in cells if isinstance(cells, list) else []:
+            if isinstance(c, dict) and c.get("equity") is not None:
+                eq = c["equity"]
+                break
+        if eq is None:
+            continue
+        scache.save(sid, eq, source="build_econo_report", href="econo.html")
+        saved.append(sid)
+    return saved
+
+
+_LABS = (                      # cheapest first — a slow lab never blocks a fast one
+    dict(key="edge", label="tax-loss sleeve + edge stack", fn=_lab_edge, optin=False),
+    dict(key="vol", label="vol-forecaster variants", fn=_lab_vol, optin=False),
+    dict(key="pairs", label="pairs cointegration book (~10 min)", fn=_lab_pairs,
+         optin=False),
+    dict(key="econo", label="econophysics cells (very slow)", fn=_lab_econo, optin=True),
+)
+
+
+def gather_labs(only=None, force: bool = False) -> dict:
+    """Run the labs and fill the strategy cache. One lab failing never stops the others —
+    a lab whose inputs are missing simply leaves its strategies uncached, and the page
+    then says so rather than inventing a curve."""
+    names = [l["key"] for l in _LABS if not l["optin"]] if not only else list(only)
+    if only and "all" in only:
+        names = [l["key"] for l in _LABS]
+    out = {}
+    for lab in _LABS:
+        if lab["key"] not in names:
+            continue
+        print(f"[labs] {lab['key']}: {lab['label']} ...", flush=True)
+        t0 = time.time()
+        try:
+            ids = lab["fn"](force)
+            out[lab["key"]] = ids
+            print(f"[labs] {lab['key']}: cached {len(ids)} "
+                  f"({', '.join(ids) or 'nothing'}) in {time.time() - t0:.0f}s", flush=True)
+        except Exception as exc:
+            out[lab["key"]] = []
+            print(f"[labs] {lab['key']}: FAILED after {time.time() - t0:.0f}s "
+                  f"— {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--gather-labs", nargs="*", metavar="LAB",
+                    help="run the cross-page labs and fill the strategy cache so every "
+                         "strategy in the menu has a real curve, then exit. No argument "
+                         "= all but the opt-in ones; 'all' = everything. Labs: "
+                         + ", ".join(l["key"] for l in _LABS))
     args = ap.parse_args()
+    if args.gather_labs is not None:
+        res = gather_labs(args.gather_labs or None, force=args.refresh)
+        total = sum(len(v) for v in res.values())
+        print(f"strategy cache: {total} curve(s) across {len(res)} lab(s) -> "
+              f"{scache.CACHE_DIR}")
+        return
     d = gather(refresh=args.refresh)
     local = ROOT / "local/strategy.html"
     local.parent.mkdir(exist_ok=True)
