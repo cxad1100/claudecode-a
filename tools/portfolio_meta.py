@@ -37,6 +37,7 @@ PORTFOLIO_SECTOR_MAP: dict[str, str] = {
     "CRIN.F": "Financials",
     "IPJ1.F": "Industrials",
     "APC.F":  "Information Technology",
+    "MSF.F":  "Information Technology",
 }
 
 # VSCode Dark+ token palette — coherent with tools/theme.py

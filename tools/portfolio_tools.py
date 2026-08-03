@@ -20,6 +20,7 @@ TICKER_MAP = {
     "CRIN.F": "CRIN.F",
     "EUNL.F": "IWDA.AS",  # same ISIN, IWDA.AS has live yfinance data; EUNL.F is stale
     "IPJ1.F": "IPJ1.F",
+    "MSF.F":  "MSF.F",
 }
 
 # Tickers priced in non-EUR
@@ -53,6 +54,7 @@ COMPANY_NAMES = {
     "EUNL.F": "iShares Core MSCI World ETF",
     "WBD.MI": "Webuild S.p.A.",
     "APC.F":  "Apple Inc.",
+    "MSF.F":  "Microsoft Corporation",
 }
 
 

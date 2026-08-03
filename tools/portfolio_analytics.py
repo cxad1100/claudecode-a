@@ -42,6 +42,11 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict, dic
     not held), plus "__cash__" (running sell proceeds, NaN before the first sell,
     absent if there are none) and "__total__" (holdings + cash — the same figure that
     feeds the ROI numerator, so it reconciles to the sum of the other keys).
+
+    It also carries "__roi__" -> {ticker: ROI % series}, each position's own
+    (value + its sale proceeds) / its own buys - 1, i.e. the portfolio formula applied
+    per position, plus "__total__" for the portfolio line itself. Same index and same
+    NaN gaps as the EUR series, so the two views are swappable on one chart.
     """
     buys = [t for t in transactions if t["action"] == "buy"]
     if not buys:
@@ -116,6 +121,12 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict, dic
     cash_vals: dict[str, float] = {}
     total_vals: dict[str, float] = {}
     seen_sell = False
+    # Per-asset ROI %, on the SAME formula as the portfolio line: a position's own
+    # (value + its sale proceeds) / its own buys - 1. Rebasing the EUR curve instead
+    # (value / first value) would score buying more shares as a gain.
+    invested_tk: dict[str, float] = {}
+    cash_tk: dict[str, float] = {}
+    roi_vals: dict[str, dict[str, float]] = {}
 
     def _position_values(dt: pd.Timestamp) -> dict[str, float]:
         vals: dict[str, float] = {}
@@ -141,9 +152,11 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict, dic
                 avg_cost[tk] = (prev * avg_cost.get(tk, pps) + sh * pps) / new if new else pps
                 holdings[tk] = new
                 total_invested += float(txn["price"])
+                invested_tk[tk] = invested_tk.get(tk, 0.0) + float(txn["price"])
             elif txn["action"] == "sell":
                 holdings[tk] = max(0.0, holdings.get(tk, 0.0) - float(txn["shares"]))
                 cash_from_sells += float(txn["price"])
+                cash_tk[tk] = cash_tk.get(tk, 0.0) + float(txn["price"])
                 seen_sell = True
 
         if total_invested == 0:
@@ -155,9 +168,12 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict, dic
 
         for tk, v in pos_vals.items():
             asset_vals.setdefault(tk, {})[ds] = v
+            # Only while held, so the % line starts and ends exactly where the € one does.
+            roi_vals.setdefault(tk, {})[ds] = (v + cash_tk.get(tk, 0.0)) / invested_tk[tk] * 100 - 100
         if seen_sell:
             cash_vals[ds] = cash_from_sells      # NaN before the first sell
         total_vals[ds] = value
+        roi_vals.setdefault("__total__", {})[ds] = port_vals[ds]
 
     portfolio_series = pd.Series(port_vals)
     portfolio_series.index = pd.to_datetime(portfolio_series.index)
@@ -178,6 +194,9 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict, dic
     if cash_vals:
         asset_values["__cash__"] = _daily(cash_vals)
     asset_values["__total__"] = _daily(total_vals)
+    # Nested under a reserved key: callers iterate the top level for tickers, and
+    # every consumer already filters keys starting with "__".
+    asset_values["__roi__"] = {tk: _daily(v) for tk, v in roi_vals.items()}
 
     # ── Benchmark series ──────────────────────────────────────────────────────
     buy_events = sorted([(t["date"], float(t["price"])) for t in buys], key=lambda x: x[0])

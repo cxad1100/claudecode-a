@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from tools import theme
 from tools.report_html import fig_html, pct, card, page
@@ -503,15 +504,119 @@ def sec_positions(d: dict, public: bool) -> str:
     return f"<h2>Positions</h2><table>{head}{''.join(rows)}</table>"
 
 
-def sec_asset_value(d: dict, public: bool) -> str:
-    """Every position's EUR value over time, each line starting at its first buy."""
-    if public:
-        return ""                      # euro amounts never ship to docs/
-    av = d.get("asset_values") or {}
+def _asset_selector_figure(av: dict):
+    """One position at full size, picked from a dropdown, over the portfolio ghost.
+
+    The facet grid below answers "how did everything do at a glance"; this answers
+    "let me actually look at one of them". Same encoding as a facet panel — green up,
+    red down, grey ghost behind — given the whole width and its own y-scale.
+    """
+    roi = av.get("__roi__") or {}
+    bench_pct = roi.get("__total__")
+    series = {k: v for k, v in roi.items() if k != "__total__" and not v.dropna().empty}
+    if bench_pct is None or bench_pct.dropna().empty or not series:
+        return None
+
+    def _final(tk):
+        c = series[tk].dropna()
+        return float(c.iloc[-1]) if not c.empty else 0.0
+
+    order = sorted(series, key=lambda t: -_final(t))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bench_pct.index, y=bench_pct.values, name="Whole portfolio",
+                             line=dict(color=theme.FG_DIM, width=1.2), opacity=0.8))
+    for i, tk in enumerate(order):
+        s = series[tk]
+        fig.add_trace(go.Scatter(
+            x=s.index, y=s.values, name=NAMES.get(tk, tk), visible=(i == 0),
+            line=dict(color=theme.GREEN if _final(tk) >= 0 else theme.RED, width=2.2)))
+
+    n = len(order)
+    picks = [dict(label=f"{NAMES.get(tk, tk)}  {_final(tk):+.0f}%", method="update",
+                  # ghost always on; exactly one position alongside it
+                  args=[{"visible": [True] + [j == i for j in range(n)]}])
+             for i, tk in enumerate(order)]
+
+    fig.add_hline(y=0, line_dash="dot", line_color=theme.GRID, line_width=1)
+    fig.update_layout(
+        height=460, hovermode="x unified", margin=dict(t=64, r=20),
+        yaxis=dict(title="Return since first buy (%)", ticksuffix="%"),
+        legend=dict(x=0.01, y=0.99),
+        updatemenus=[dict(type="dropdown", showactive=True, x=0, y=1.16,
+                          xanchor="left", yanchor="top",
+                          bgcolor=theme.BG_PANEL, bordercolor=theme.GRID, borderwidth=1,
+                          font=dict(size=11), buttons=picks)])
+    return fig
+
+
+def _asset_facets_figure(av: dict, cols: int = 4):
+    """One small panel per position — the fix for 14 series in one frame.
+
+    A shared categorical palette tops out around 7-8 hues; past that, cycling colors
+    produces pairs no one can tell apart and the lines tangle anyway. Faceting drops
+    color from the job entirely: each panel holds one line, identity comes from the
+    panel title, and the portfolio ROI is repeated as a ghost in every panel so
+    "did this beat my average?" is a local comparison instead of a hunt through a legend.
+    """
+    roi = av.get("__roi__") or {}
+    bench = roi.get("__total__")
+    series = {k: v for k, v in roi.items() if k != "__total__" and not v.dropna().empty}
+    if bench is None or bench.dropna().empty or not series:
+        return None
+
+    def _final(tk):
+        c = series[tk].dropna()
+        return float(c.iloc[-1]) if not c.empty else 0.0
+
+    order = sorted(series, key=lambda t: -_final(t))
+    rows = -(-len(order) // cols)      # ceil
+    titles = [f"{tk.split('.')[0]}  {_final(tk):+.0f}%" for tk in order]
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
+                        shared_xaxes=True, shared_yaxes=True,
+                        vertical_spacing=0.07, horizontal_spacing=0.03)
+
+    for i, tk in enumerate(order):
+        r, c = i // cols + 1, i % cols + 1
+        s = series[tk]
+        # ghost portfolio first so the position's own line sits on top of it
+        fig.add_trace(go.Scatter(x=bench.index, y=bench.values, showlegend=False,
+                                 line=dict(color=theme.FG_DIM, width=1),
+                                 opacity=0.55, hoverinfo="skip"), row=r, col=c)
+        # polarity, not identity: green if the position ended up, red if down
+        col = theme.GREEN if _final(tk) >= 0 else theme.RED
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, showlegend=False,
+                                 name=NAMES.get(tk, tk),
+                                 line=dict(color=col, width=1.6),
+                                 hovertemplate="%{x|%b %Y}: %{y:+.1f}%<extra></extra>"),
+                      row=r, col=c)
+        fig.add_hline(y=0, line_dash="dot", line_color=theme.GRID, line_width=1,
+                      row=r, col=c)
+
+    fig.update_layout(height=190 * rows + 60, margin=dict(t=30, l=45, r=15, b=30),
+                      showlegend=False)
+    # shared y across every panel — otherwise each panel silently rescales and a flat
+    # position looks as dramatic as the one that doubled
+    fig.update_yaxes(ticksuffix="%", showgrid=True)
+    fig.update_xaxes(showgrid=False)
+    for ann in fig.layout.annotations:            # subplot titles
+        ann.font.size = 11
+    return fig
+
+
+def _asset_value_figure(av: dict, mode: str = "pct"):
+    """Every position overlaid on one axis, or None when there's nothing to draw.
+
+    `mode="pct"` plots each position's ROI %; `mode="eur"` plots its EUR value on a log
+    axis (the total runs ~45x the smallest position, and log would break on the negative
+    returns the % view carries). One mode per figure — the two are separate tabs.
+    """
     total = av.get("__total__")
+    roi = av.get("__roi__") or {}
     assets = {k: v for k, v in av.items() if not k.startswith("__")}
     if total is None or total.dropna().empty or not assets:
-        return ""
+        return None
+    eur = mode == "eur"
 
     def _last(s):
         # Last non-NaN value: today's value if still held, exit value if sold.
@@ -522,36 +627,134 @@ def sec_asset_value(d: dict, public: bool) -> str:
         return float(c.iloc[-1]) if not c.empty else 0.0
 
     fig = go.Figure()
+
+    def _y(tk, like):
+        if eur:
+            return like.values
+        s = roi.get(tk)
+        return s.values if s is not None else [None] * len(like)
+
     # thin per-asset lines first, biggest position first in the legend
     for i, tk in enumerate(sorted(assets, key=lambda t: -_last(assets[t]))):
         s = assets[tk]
+        nm = NAMES.get(tk)
         fig.add_trace(go.Scatter(
-            x=s.index, y=s.values, name=f"{NAMES.get(tk, tk)} ({tk})",
+            x=s.index, y=_y(tk, s), name=f"{nm} ({tk})" if nm else tk,
             line=dict(color=theme.PALETTE[i % len(theme.PALETTE)], width=1.4,
                       dash="dash" if i >= len(theme.PALETTE) else "solid"),
             opacity=0.95))
 
     cash = av.get("__cash__")
-    if cash is not None and not cash.dropna().empty:
+    if eur and cash is not None and not cash.dropna().empty:
+        # Cash has no return of its own, so it exists only in the € view.
         fig.add_trace(go.Scatter(
             x=cash.index, y=cash.values, name="Cash from sells",
             line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
 
     # total on top, thick white — the same treatment sec_roi gives the portfolio line
-    fig.add_trace(go.Scatter(x=total.index, y=total.values, name="Total portfolio",
+    fig.add_trace(go.Scatter(x=total.index, y=_y("__total__", total), name="Total portfolio",
                              line=dict(color="#ffffff", width=3.2)))
-    fig.update_layout(height=485, yaxis=dict(title="Value (€)", tickprefix="€"),
-                      hovermode="x unified", margin=dict(t=20))
 
-    start = total.dropna().index[0].strftime("%Y-%m-%d")
-    return ("<h2>Every position, side by side</h2>"
-            f"<p class='dim'>Each line begins on the day you first bought that asset, at the "
-            "amount you put in, and then follows its market value — drawn at cost basis "
-            "instead if price history isn't available. Buying more steps the line up; "
-            "selling steps it down, and a full exit ends it, rolling the proceeds into the "
-            "dim <b>cash from sells</b> line. The bold white <b>total</b> is holdings plus "
-            f"that cash, so selling never shows up as a loss. Since {start}.</p>"
-            f"<div class='chart'>{_fig_html(fig)}</div>")
+    axis = (dict(title="Value (€)", tickprefix="€", type="log") if eur else
+            dict(title="Return since first buy (%)", ticksuffix="%", type="linear"))
+    fig.update_layout(
+        height=485, hovermode="x unified", margin=dict(t=20, r=250), yaxis=axis,
+        # legend outside right — 15 traces inside the plot covered a quarter of it
+        legend=dict(x=1.02, xanchor="left", y=1, yanchor="top"))
+    return fig
+
+
+_TABS_JS = """
+<script>
+(function(){
+  var root = document.getElementById('apv');
+  if (!root) return;
+  var tabs = root.querySelectorAll('.apv-tab'),
+      panes = root.querySelectorAll('.apv-pane');
+  tabs.forEach(function(btn, i){
+    btn.addEventListener('click', function(){
+      tabs.forEach(function(b, j){ b.classList.toggle('on', i === j); });
+      panes.forEach(function(p, j){ p.hidden = (i !== j); });
+      // A plot laid out while display:none measures zero width and renders clipped,
+      // so re-measure the pane we just revealed.
+      var gd = panes[i].querySelector('.plotly-graph-div');
+      if (gd && window.Plotly) window.Plotly.Plots.resize(gd);
+    });
+  });
+})();
+</script>
+"""
+
+_TABS_CSS = f"""
+<style>
+#apv .apv-tabs {{ display:flex; gap:6px; margin:14px 0 6px; }}
+#apv .apv-tab {{ background:{theme.BG_PANEL}; color:{theme.FG_DIM};
+  border:1px solid {theme.GRID}; border-radius:4px; padding:6px 14px;
+  font:inherit; font-size:12px; cursor:pointer; }}
+#apv .apv-tab:hover {{ color:{theme.FG}; }}
+#apv .apv-tab.on {{ background:{theme.FG}; color:{theme.BG}; border-color:{theme.FG}; }}
+</style>
+"""
+
+
+def _asset_tabs(panes: list[tuple[str, str]]) -> str:
+    """Tab strip over pre-rendered chart panes — a plotly button can swap a trace's
+    data, but it cannot turn one axis into a grid of subplots, so the third view has
+    to be its own figure."""
+    tabs = "".join(f"<button class='apv-tab{' on' if i == 0 else ''}'>{label}</button>"
+                   for i, (label, _) in enumerate(panes))
+    bodies = "".join(f"<div class='apv-pane'{'' if i == 0 else ' hidden'}>{html}</div>"
+                     for i, (_, html) in enumerate(panes))
+    return (f"{_TABS_CSS}<div id='apv'><div class='apv-tabs'>{tabs}</div>"
+            f"{bodies}</div>{_TABS_JS}")
+
+
+def sec_asset_value(d: dict, public: bool) -> str:
+    """Every position's EUR value over time, each line starting at its first buy."""
+    if public:
+        return ""                      # euro amounts never ship to docs/
+    av = d.get("asset_values") or {}
+    pct = _asset_value_figure(av, "pct")
+    if pct is None:
+        return ""
+
+    start = av["__total__"].dropna().index[0].strftime("%Y-%m-%d")
+    out = ["<h2>Every position, side by side</h2>",
+           f"<p class='dim'>Each position's own return: (its value + its sale proceeds) ÷ its "
+           "own buys − 1. That's your portfolio's ROI formula applied per holding, so topping "
+           "up doesn't register as a gain. Every line starts the day you first bought and ends "
+           f"when you fully exit. Since {start}.</p>"]
+
+    picker = _asset_selector_figure(av)
+    if picker is not None:
+        out.append("<h3>One position at a time</h3>"
+                   "<p class='dim'>Pick a holding from the menu. The <b>grey ghost</b> is your "
+                   "whole portfolio on the same axes — above it beat your average, below it "
+                   "dragged. Green ended up, red ended down.</p>"
+                   f"<div class='chart'>{_fig_html(picker)}</div>")
+
+    panes = [("Return %",
+              "<p class='dim'>Every position's return in one frame, for reading levels off "
+              "against each other. The bold white line is the portfolio itself.</p>"
+              f"<div class='chart'>{_fig_html(pct)}</div>")]
+    eur = _asset_value_figure(av, "eur")
+    if eur is not None:
+        panes.append(("Value € (log)",
+                      "<p class='dim'>The same positions in euros, where height is money at "
+                      "work rather than performance. Log axis — the total runs ~45× the "
+                      "smallest position. A holding with no price history is drawn at cost "
+                      "basis, and the dim <b>cash from sells</b> line appears here only.</p>"
+                      f"<div class='chart'>{_fig_html(eur)}</div>"))
+    facets = _asset_facets_figure(av)
+    if facets is not None:
+        panes.append(("One panel each",
+                      "<p class='dim'>A panel per position, best first, each over the same "
+                      "portfolio ghost. All panels share one scale, so a flat panel really is "
+                      f"flat.</p><div class='chart'>{_fig_html(facets)}</div>"))
+
+    out.append("<h3>All of them together</h3>")
+    out.append(_asset_tabs(panes))
+    return "".join(out)
 
 
 def sec_correlation(d: dict) -> str:
