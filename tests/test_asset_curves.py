@@ -97,3 +97,26 @@ def test_roi_series_is_unchanged_by_the_new_return_value():
     assert set(av) >= {"AAA.F", "BBB.F", "__total__"}
     # flat prices => ROI is exactly 0% throughout
     assert roi.abs().max() == pytest.approx(0.0)
+
+
+def test_section_is_empty_in_the_public_build():
+    import build_report as B
+    _roi, _bms, av = pa.build_roi_timeseries(BUYS)
+    assert B.sec_asset_value({"asset_values": av}, public=True) == ""
+
+
+def test_section_is_empty_without_curve_data():
+    import build_report as B
+    assert B.sec_asset_value({"asset_values": {}}, public=False) == ""
+    assert B.sec_asset_value({}, public=False) == ""
+
+
+def test_section_renders_a_trace_per_asset_plus_total():
+    import build_report as B
+    txns = BUYS + [_txn("2026-04-01", "BBB.F", "sell", 20.0, 50.0)]
+    _roi, _bms, av = pa.build_roi_timeseries(txns)
+    html = B.sec_asset_value({"asset_values": av}, public=False)
+    assert "<h2>" in html
+    assert "Total portfolio" in html
+    assert "Cash from sells" in html
+    assert "AAA.F" in html and "BBB.F" in html

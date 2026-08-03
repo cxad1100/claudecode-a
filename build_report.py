@@ -503,6 +503,51 @@ def sec_positions(d: dict, public: bool) -> str:
     return f"<h2>Positions</h2><table>{head}{''.join(rows)}</table>"
 
 
+def sec_asset_value(d: dict, public: bool) -> str:
+    """Every position's EUR value over time, each line starting at its first buy."""
+    if public:
+        return ""                      # euro amounts never ship to docs/
+    av = d.get("asset_values") or {}
+    total = av.get("__total__")
+    assets = {k: v for k, v in av.items() if not k.startswith("__")}
+    if total is None or total.dropna().empty or not assets:
+        return ""
+
+    def _last(s):
+        c = s.dropna()
+        return float(c.iloc[-1]) if not c.empty else 0.0
+
+    fig = go.Figure()
+    # thin per-asset lines first, biggest position first in the legend
+    for i, tk in enumerate(sorted(assets, key=lambda t: -_last(assets[t]))):
+        s = assets[tk]
+        fig.add_trace(go.Scatter(
+            x=s.index, y=s.values, name=f"{NAMES.get(tk, tk)} ({tk})",
+            line=dict(color=theme.PALETTE[i % len(theme.PALETTE)], width=1.4),
+            opacity=0.95))
+
+    cash = av.get("__cash__")
+    if cash is not None and not cash.dropna().empty:
+        fig.add_trace(go.Scatter(
+            x=cash.index, y=cash.values, name="Cash from sells",
+            line=dict(color=theme.FG_DIM, width=1.4, dash="dot")))
+
+    # total on top, thick white — the same treatment sec_roi gives the portfolio line
+    fig.add_trace(go.Scatter(x=total.index, y=total.values, name="Total portfolio",
+                             line=dict(color="#ffffff", width=3.2)))
+    fig.update_layout(height=485, yaxis=dict(title="Value (€)", tickprefix="€"),
+                      hovermode="x unified", margin=dict(t=20))
+
+    start = total.dropna().index[0].strftime("%Y-%m-%d")
+    return ("<h2>Every position, side by side</h2>"
+            f"<p class='dim'>Each line begins on the day you first bought that asset, at the "
+            "amount you put in, and then follows its market value. Buying more steps the line "
+            "up; a sale ends it and rolls the proceeds into the dim <b>cash from sells</b> line. "
+            "The bold white <b>total</b> is holdings plus that cash, so selling never shows up "
+            f"as a loss. Since {start}.</p>"
+            f"<div class='chart'>{_fig_html(fig)}</div>")
+
+
 def sec_correlation(d: dict) -> str:
     corr = d["correlation"]
     if not corr:
@@ -617,6 +662,7 @@ def build(d: dict, public: bool) -> str:
         f"<a href='/strategy'>Momentum Strategy →</a></p>",
         sec_summary(d, public),
         sec_positions(d, public),
+        sec_asset_value(d, public),
         sec_roi(d),
         sec_risk(d),
         sec_risk_contrib(d),
