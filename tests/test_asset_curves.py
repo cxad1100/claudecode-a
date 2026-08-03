@@ -120,3 +120,16 @@ def test_section_renders_a_trace_per_asset_plus_total():
     assert "Total portfolio" in html
     assert "Cash from sells" in html
     assert "AAA.F" in html and "BBB.F" in html
+
+
+def test_return_arity_is_pinned():
+    """build_strategy_report.py unpacks this into 3 names inside a broad
+    `except Exception`, so an arity mismatch there would silently drop the
+    /strategy portfolio comparison instead of raising. Pin the contract here,
+    on the cheapest possible input, so a regression fails loudly in this
+    fast/no-network test instead of silently on that page.
+    """
+    roi, bms, av = pa.build_roi_timeseries([])   # no buys -> returns before any download
+    assert isinstance(roi, pd.Series) and roi.empty
+    assert bms == {}
+    assert av == {}

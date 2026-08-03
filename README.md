@@ -43,6 +43,9 @@ deploy from branch → `/docs`).
   - **B · Same-risk max-return** — keeps your current volatility, maximizes expected
     return: a pure upgrade if today's swings are acceptable
 - **Efficient frontier** — where your mix sits vs the best possible mixes
+- **Every position, side by side** — each holding's EUR value over time from its first
+  buy, a sale steps the line down (ends it on a full exit) and rolls proceeds into a
+  cash line, bold total on top so selling never reads as a loss (private build only)
 - **ROI vs benchmarks** — cash-flow matched (same euros, same dates, into each benchmark)
 - **Risk & efficiency** — Sharpe, Sortino, drawdowns, VaR/CVaR, beta, alpha
 - **Rolling backtest** — walk-forward monthly re-optimization vs equal-weight + S&P 500,
@@ -56,7 +59,7 @@ deploy from branch → `/docs`).
 input/portfolio.csv               ← trade history (gitignored)
 build_report.py                   ← orchestrates: data → optimizer → HTML
  ├─ tools/portfolio_tools.py      ← CSV → holdings, P&L; live prices
- ├─ tools/portfolio_analytics.py  ← ROI series, quant metrics, correlation
+ ├─ tools/portfolio_analytics.py  ← ROI series, per-asset EUR curves, quant metrics, correlation
  ├─ tools/optimizer.py            ← Markowitz: frontier, max-Sharpe, same-risk, backtest
  ├─ tools/portfolio_meta.py       ← sector maps, ETF decomposition
  └─ tools/theme.py                ← VSCode Dark+ palette, plotly template, CSS

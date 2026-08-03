@@ -514,6 +514,10 @@ def sec_asset_value(d: dict, public: bool) -> str:
         return ""
 
     def _last(s):
+        # Last non-NaN value: today's value if still held, exit value if sold.
+        # This reads the spec's "final value descending" literally, so a large
+        # position sold long ago can outrank a smaller one still held today —
+        # that's intended, not a bug: it's "final value" not "current value".
         c = s.dropna()
         return float(c.iloc[-1]) if not c.empty else 0.0
 
@@ -523,7 +527,8 @@ def sec_asset_value(d: dict, public: bool) -> str:
         s = assets[tk]
         fig.add_trace(go.Scatter(
             x=s.index, y=s.values, name=f"{NAMES.get(tk, tk)} ({tk})",
-            line=dict(color=theme.PALETTE[i % len(theme.PALETTE)], width=1.4),
+            line=dict(color=theme.PALETTE[i % len(theme.PALETTE)], width=1.4,
+                      dash="dash" if i >= len(theme.PALETTE) else "solid"),
             opacity=0.95))
 
     cash = av.get("__cash__")
@@ -541,10 +546,11 @@ def sec_asset_value(d: dict, public: bool) -> str:
     start = total.dropna().index[0].strftime("%Y-%m-%d")
     return ("<h2>Every position, side by side</h2>"
             f"<p class='dim'>Each line begins on the day you first bought that asset, at the "
-            "amount you put in, and then follows its market value. Buying more steps the line "
-            "up; a sale ends it and rolls the proceeds into the dim <b>cash from sells</b> line. "
-            "The bold white <b>total</b> is holdings plus that cash, so selling never shows up "
-            f"as a loss. Since {start}.</p>"
+            "amount you put in, and then follows its market value — drawn at cost basis "
+            "instead if price history isn't available. Buying more steps the line up; "
+            "selling steps it down, and a full exit ends it, rolling the proceeds into the "
+            "dim <b>cash from sells</b> line. The bold white <b>total</b> is holdings plus "
+            f"that cash, so selling never shows up as a loss. Since {start}.</p>"
             f"<div class='chart'>{_fig_html(fig)}</div>")
 
 
