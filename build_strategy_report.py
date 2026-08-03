@@ -1057,7 +1057,7 @@ def gather(force: bool = False, refresh: bool | None = None) -> dict:
         txns = None
         try:
             txns = parse_portfolio(pf_csv)["transactions"]
-            pr, pf_bench = build_roi_timeseries(txns)   # keep the cash-flow-matched benchmarks
+            pr, pf_bench, _ = build_roi_timeseries(txns)   # keep the cash-flow-matched benchmarks
             if pr is not None and not pr.empty:
                 portfolio_roi = pr
                 portfolio_bench = pf_bench or {}        # the /portfolio report's own market view

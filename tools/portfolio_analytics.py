@@ -33,14 +33,19 @@ def _price_on(h: pd.Series, date: pd.Timestamp) -> float | None:
 
 # ── Core time-series builder ──────────────────────────────────────────────────
 
-def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict]:
+def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict, dict]:
     """
-    Returns (portfolio_roi_series, {benchmark_name: roi_series}).
-    Both are pd.Series with DatetimeIndex, values = cumulative ROI %.
+    Returns (portfolio_roi_series, {benchmark_name: roi_series}, {key: eur_series}).
+
+    The first two are pd.Series with DatetimeIndex, values = cumulative ROI %.
+    The third maps each ticker to its EUR position value per business day (NaN when
+    not held), plus "__cash__" (running sell proceeds, NaN before the first sell,
+    absent if there are none) and "__total__" (holdings + cash — the same figure that
+    feeds the ROI numerator, so it reconciles to the sum of the other keys).
     """
     buys = [t for t in transactions if t["action"] == "buy"]
     if not buys:
-        return pd.Series(dtype=float), {}
+        return pd.Series(dtype=float), {}, {}
 
     start_date = min(t["date"] for t in buys)
 
@@ -104,17 +109,24 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict]:
     total_invested = 0.0
     cash_from_sells = 0.0   # sale proceeds stay in the return calc (otherwise sells look like losses)
     port_vals: dict[str, float] = {}
+    # Per-asset EUR value on each business day. Filled inside the SAME day-walk that
+    # produces the ROI line, from the same prices and the same `<=` txn pointer, so
+    # the two charts can never disagree.
+    asset_vals: dict[str, dict[str, float]] = {}
+    cash_vals: dict[str, float] = {}
+    total_vals: dict[str, float] = {}
+    seen_sell = False
 
-    def _portfolio_value(dt: pd.Timestamp) -> float:
-        v = 0.0
+    def _position_values(dt: pd.Timestamp) -> dict[str, float]:
+        vals: dict[str, float] = {}
         for tk, sh in holdings.items():
             if sh <= 0:
                 continue
             p = _price_on(port_hist[tk], dt) if tk in port_hist else avg_cost.get(tk)
             if p is None:
                 p = avg_cost.get(tk, 0.0)
-            v += sh * p
-        return v
+            vals[tk] = sh * p
+        return vals
 
     for date in biz_days:
         ds = str(date.date())
@@ -132,15 +144,40 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict]:
             elif txn["action"] == "sell":
                 holdings[tk] = max(0.0, holdings.get(tk, 0.0) - float(txn["shares"]))
                 cash_from_sells += float(txn["price"])
+                seen_sell = True
 
         if total_invested == 0:
             continue
 
-        value = _portfolio_value(date) + cash_from_sells
+        pos_vals = _position_values(date)
+        value = sum(pos_vals.values()) + cash_from_sells
         port_vals[ds] = round((value / total_invested - 1) * 100, 4)
+
+        for tk, v in pos_vals.items():
+            asset_vals.setdefault(tk, {})[ds] = v
+        if seen_sell:
+            cash_vals[ds] = cash_from_sells      # NaN before the first sell
+        total_vals[ds] = value
 
     portfolio_series = pd.Series(port_vals)
     portfolio_series.index = pd.to_datetime(portfolio_series.index)
+
+    def _daily(vals: dict[str, float]) -> pd.Series:
+        """Dict of 'YYYY-MM-DD' -> value, reindexed on every business day.
+
+        Reindexing leaves NaN where the position wasn't held, so plotly breaks the
+        line instead of drawing it along the axis — and a re-buy after a full exit
+        renders as two segments rather than one phantom stroke.
+        """
+        s = pd.Series(vals, dtype=float)
+        if not s.empty:
+            s.index = pd.to_datetime(s.index)
+        return s.reindex(biz_days)
+
+    asset_values: dict[str, pd.Series] = {tk: _daily(v) for tk, v in asset_vals.items()}
+    if cash_vals:
+        asset_values["__cash__"] = _daily(cash_vals)
+    asset_values["__total__"] = _daily(total_vals)
 
     # ── Benchmark series ──────────────────────────────────────────────────────
     buy_events = sorted([(t["date"], float(t["price"])) for t in buys], key=lambda x: x[0])
@@ -188,7 +225,7 @@ def build_roi_timeseries(transactions: list[dict]) -> tuple[pd.Series, dict]:
         s.index = pd.to_datetime(s.index)
         benchmark_series[name] = s
 
-    return portfolio_series, benchmark_series
+    return portfolio_series, benchmark_series, asset_values
 
 
 # ── Quant metrics ─────────────────────────────────────────────────────────────

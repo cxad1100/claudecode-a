@@ -113,7 +113,7 @@ def gather(force: bool = False) -> dict:
         unrealized_pnl=round(unrealized, 2), total_pnl=round(total_pnl, 2)))
 
     deployed = gross_deposits  # back-compat alias
-    roi_series, bm_series = build_roi_timeseries(txns)
+    roi_series, bm_series, asset_values = build_roi_timeseries(txns)
     metrics = compute_quant_metrics(roi_series, bm_series.get("S&P 500"))
     correlation = compute_correlation_matrix(portfolio["holdings"], TICKER_MAP)
 
@@ -172,6 +172,7 @@ def gather(force: bool = False) -> dict:
     return dict(positions=positions, summary=summary, deployed=deployed, txns=txns,
                 acct=acct,
                 roi_series=roi_series, bm_series=bm_series, metrics=metrics,
+                asset_values=asset_values,
                 correlation=correlation, universe=universe, sig=sig,
                 cov_ann=cov_ann, cur_w=cur_w, tot_val=tot_val, mkt_w=mkt_w,
                 mu_bl=mu_bl, pi=pi.values, cur_rc=cur_rc,
